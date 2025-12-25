@@ -132,6 +132,8 @@ class F1_VLA(nn.Module):
         Returns:
             (memory_kv, memory_token, should_detach) if memory enabled
             (None, None, False) if memory disabled
+            
+        Note: memory_kv is detached when should_detach=True for BPTT.
         """
         if not self.config.use_memory or self.model.memory_manager is None:
             return None, None, False
@@ -139,7 +141,15 @@ class F1_VLA(nn.Module):
         device = batch["observation.state"].device
         dtype = next(self.model.parameters()).dtype
         
-        return self.model.memory_manager.process_batch(batch, device, dtype)
+        memory_kv, memory_token, should_detach = self.model.memory_manager.process_batch(batch, device, dtype)
+        
+        # Detach memory for BPTT truncation
+        if should_detach and memory_kv is not None:
+            memory_kv = [
+                (k.detach(), v.detach()) for k, v in memory_kv
+            ]
+        
+        return memory_kv, memory_token, should_detach
     
     def _update_memory_state(
         self, 
@@ -230,6 +240,23 @@ class F1_VLA(nn.Module):
         loss_dict["wm_loss"] = gen_loss.clone()
 
         loss_dict["loss"] = loss_dict["action_loss"] + gen_out_loss_ratio * loss_dict["wm_loss"]
+
+        #########################################################
+        # Update memory step count for BPTT tracking
+        # (memory content update can be added later)
+        #########################################################
+        if self.config.use_memory and self.model.memory_manager is not None:
+            # Update step count for BPTT tracking
+            dataset_indices = batch.get("dataset_idx")
+            episode_indices = batch.get("episode_idx")
+            frame_indices = batch.get("frame_idx")
+            if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
+                for b in range(len(dataset_indices)):
+                    self.model.memory_manager.update_step_count(
+                        dataset_indices[b].item(),
+                        episode_indices[b].item(),
+                        frame_indices[b].item()
+                    )
 
         return loss_dict
 

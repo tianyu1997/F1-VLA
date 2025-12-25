@@ -85,6 +85,12 @@ class PolicyTrainerCallback(TrainerCallback):
         if self.image_transforms is not None:
             self.image_transforms.to(args.device)
 
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Reset memory at the start of each epoch for BPTT."""
+        if hasattr(self.policy, 'model') and hasattr(self.policy.model, 'memory_manager'):
+            if self.policy.model.memory_manager is not None:
+                self.policy.model.memory_manager.on_epoch_start()
+
 
 class PolicyTrainer(Trainer):
     def __init__(
