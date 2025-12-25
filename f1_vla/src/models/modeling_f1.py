@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Tuple, Dict, Any
 import math
 import torch
 from torch import Tensor, nn
@@ -96,6 +96,38 @@ class F1FlowMatching(nn.Module):
         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
         self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
         self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        # Memory module (only initialized when use_memory is True)
+        self.memory_bank = None
+        self.memory_manager = None
+        if self.config.use_memory:
+            from f1_vla.src.models.memory import KVMemoryBank, MemoryManager
+            
+            # Get model dimensions from PaliGemma config
+            text_config = config.und_expert_config.text_config
+            num_layers = text_config.num_hidden_layers
+            num_kv_heads = text_config.num_key_value_heads
+            head_dim = text_config.head_dim
+            hidden_size = text_config.hidden_size
+            
+            # Get memory config
+            memory_config = config.memory_config
+            memory_len = memory_config.memory_len
+            init_std = memory_config.init_std
+            bptt_steps = memory_config.bptt_steps
+            
+            self.memory_bank = KVMemoryBank(
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                hidden_size=hidden_size,
+                memory_len=memory_len,
+                init_std=init_std,
+            )
+            self.memory_manager = MemoryManager(
+                memory_bank=self.memory_bank,
+                bptt_steps=bptt_steps,
+            )
 
         training_args = kwargs.get("training_args", None)
 

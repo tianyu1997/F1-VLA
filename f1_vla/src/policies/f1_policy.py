@@ -125,6 +125,34 @@ class F1_VLA(nn.Module):
 
             return actions
 
+    def _get_memory_state(self, batch: dict[str, Tensor]) -> tuple:
+        """
+        Get memory state for the batch if memory is enabled.
+        
+        Returns:
+            (memory_kv, memory_token, should_detach) if memory enabled
+            (None, None, False) if memory disabled
+        """
+        if not self.config.use_memory or self.model.memory_manager is None:
+            return None, None, False
+        
+        device = batch["observation.state"].device
+        dtype = next(self.model.parameters()).dtype
+        
+        return self.model.memory_manager.process_batch(batch, device, dtype)
+    
+    def _update_memory_state(
+        self, 
+        batch: dict[str, Tensor], 
+        updated_memory, 
+        should_detach: bool
+    ) -> None:
+        """Store updated memory state after forward pass."""
+        if self.config.use_memory and self.model.memory_manager is not None:
+            self.model.memory_manager.store_updated_memory(
+                batch, updated_memory, detach=should_detach
+            )
+
     def forward_with_world_model(
         self, 
         batch: dict[str, Tensor], 

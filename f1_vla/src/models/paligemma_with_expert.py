@@ -174,6 +174,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
         cat_past_key_values: Optional[bool] = False,
+        memory_kv: Optional[List[tuple]] = None,  # Memory KV prefix per layer
     ):
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None:
             models = [self.paligemma.language_model.model, self.gemma_wm_expert.model, self.gemma_expert.model]
@@ -187,6 +188,16 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             if hidden_states is None:
                 continue
             batch_size = hidden_states.shape[0]
+
+        # Pre-process attention mask for memory prefix
+        # Memory KV will be prepended to all layers, so we extend mask once
+        if memory_kv is not None and attention_mask is not None:
+            mem_len = memory_kv[0][0].shape[1]  # All layers have same mem_len
+            seq_q = attention_mask.shape[1]
+            # All queries attend to all memory positions
+            mem_mask = torch.ones(batch_size, seq_q, mem_len,
+                                 dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask = torch.cat([mem_mask, attention_mask], dim=2)
 
         # RMSNorm
         num_layers = self.paligemma.config.text_config.num_hidden_layers
@@ -223,6 +234,15 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
             query_states = apply_rope(query_states, position_ids)
             key_states = apply_rope(key_states, position_ids)
+
+            # Prepend memory KV if provided (memory doesn't use RoPE)
+            if memory_kv is not None and layer_idx < len(memory_kv):
+                mem_k, mem_v = memory_kv[layer_idx]
+                # mem_k, mem_v: (batch, mem_len, num_kv_heads, head_dim)
+                mem_k = mem_k.to(dtype=key_states.dtype, device=key_states.device)
+                mem_v = mem_v.to(dtype=value_states.dtype, device=value_states.device)
+                key_states = torch.cat([mem_k, key_states], dim=1)
+                value_states = torch.cat([mem_v, value_states], dim=1)
 
             if use_cache and past_key_values is None:
                 past_key_values = {}
