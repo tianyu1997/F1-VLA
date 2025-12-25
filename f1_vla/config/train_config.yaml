@@ -1,4 +1,17 @@
 dataset:
+  # Use ME_KVM data format
+  use_mekvm_format: True
+  mekvm_data_dirs:
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+  mekvm_task_descriptions:
+    - "manipulate objects in clean environment"
+  mekvm_weights:
+    - 1.0
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 4
+
+  # Legacy LeRobot config (not used when use_mekvm_format=True)
   train_dir:
     # ========== libero ==========
     libero_spatial_no_noops:
@@ -88,12 +101,13 @@ exp:
       - tensorboard
 
     torch_compile: True
+    stage: stage1_pretrain_wm
 
     gen_out_loss_ratio: 0.1
-    freeze_vision_encoder: False
+    freeze_vision_encoder: True
     freeze_gen_expert: False
     train_act_expert_only: False
-    train_gen_expert_only: False
+    train_gen_expert_only: True
     train_state_proj: True
 
     image_transforms_enabled: True

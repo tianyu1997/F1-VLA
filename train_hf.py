@@ -17,7 +17,7 @@ from f1_vla.src.utils.utils import (
     set_policy_config,
 )
 from f1_vla.src.processors.data_processors.data_config import create_data_config
-from f1_vla.src.processors.data_processors.data_loader import create_data, CollateFn
+from f1_vla.src.processors.data_processors.data_loader import create_data, create_mekvm_data, CollateFn
 from f1_vla.src.processors.train_processors.policy_trainer import PolicyTrainer, PolicyTrainingArguments
 from f1_vla.src.processors.train_processors.optimizer_scheduler import create_optimizer
 
@@ -76,20 +76,41 @@ def main(args, overrides):
     #########################################################
     # Create dataset
     #########################################################
-    data_config = create_data_config(config.dataset, policy_config, config.exp)
-    (
-        training_dataset, 
-        image_transforms, 
-        training_ds_sample_weights, 
-        cur_n_obs_img_steps, 
-        cur_n_pred_img_steps
-    ) = create_data(
-        policy_config=policy_config, 
-        dataset_config=data_config, 
-        training_args=training_args, 
-        stage=config.exp.stage,
-        max_eval_samples=config.exp.max_eval_samples,
-    )
+    use_mekvm_format = config.dataset.get('use_mekvm_format', False)
+    
+    if use_mekvm_format:
+        # Use ME_KVM data format
+        from f1_vla.src.processors.data_processors.me_kvm_dataset import MEKVMCollateFn
+        (
+            training_dataset,
+            image_transforms,
+            training_ds_sample_weights,
+            cur_n_obs_img_steps,
+            cur_n_pred_img_steps
+        ) = create_mekvm_data(
+            policy_config=policy_config,
+            dataset_config=config.dataset,
+            training_args=training_args,
+            stage=config.exp.stage,
+        )
+        collate_fn = MEKVMCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
+    else:
+        # Use LeRobot data format
+        data_config = create_data_config(config.dataset, policy_config, config.exp)
+        (
+            training_dataset, 
+            image_transforms, 
+            training_ds_sample_weights, 
+            cur_n_obs_img_steps, 
+            cur_n_pred_img_steps
+        ) = create_data(
+            policy_config=policy_config, 
+            dataset_config=data_config, 
+            training_args=training_args, 
+            stage=config.exp.stage,
+            max_eval_samples=config.exp.max_eval_samples,
+        )
+        collate_fn = CollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
 
     logger.info(f"Training dataset:\n{training_dataset}")
     logger.info(f"len(training_dataset): {len(training_dataset)}")
@@ -135,7 +156,7 @@ def main(args, overrides):
         args=training_args,
         train_dataset=training_dataset,
         optimizers=(optimizer, None),
-        data_collator=CollateFn(policy_config.max_state_dim, policy_config.max_action_dim),
+        data_collator=collate_fn,
         image_transforms=image_transforms,
         use_world_model=policy_config.use_world_model,
         cur_n_obs_img_steps=cur_n_obs_img_steps,

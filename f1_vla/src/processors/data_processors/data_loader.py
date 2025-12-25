@@ -354,6 +354,53 @@ class MixtureDataset(Dataset):
         return "\n".join(lines)
 
 
+def create_mekvm_data(
+    policy_config: PretrainedConfig,
+    dataset_config,
+    training_args: PolicyTrainingArguments,
+    stage: str,
+):
+    """Create dataset from ME_KVM data format"""
+    from f1_vla.src.processors.data_processors.me_kvm_dataset import (
+        MEKVMMixtureDataset, MEKVMCollateFn
+    )
+    
+    # create image transforms
+    img_trans_cfg = ImageTransformsConfig(
+        enable=training_args.image_transforms_enabled,
+        max_num_transforms=training_args.image_transforms_max_num_transforms,
+        random_order=training_args.image_transforms_random_order,
+    )
+    filtered_tfs = {
+        name: tf for name, tf in img_trans_cfg.tfs.items() if name in training_args.image_transforms_type
+    }
+    img_trans_cfg.tfs = filtered_tfs
+    image_transforms = ImageTransforms(img_trans_cfg)
+    
+    # Get ME_KVM specific configs
+    data_dirs = dataset_config.get('mekvm_data_dirs', [])
+    task_descriptions = dataset_config.get('mekvm_task_descriptions', None)
+    weights = dataset_config.get('mekvm_weights', None)
+    n_obs_img_steps = dataset_config.get('n_obs_img_steps', 4)
+    n_pred_img_steps = dataset_config.get('n_pred_img_steps', 1)
+    chunk_size = dataset_config.get('chunk_size', policy_config.chunk_size)
+    
+    training_dataset = MEKVMMixtureDataset(
+        data_dirs=data_dirs,
+        n_obs_img_steps=n_obs_img_steps,
+        n_pred_img_steps=n_pred_img_steps,
+        chunk_size=chunk_size,
+        task_descriptions=task_descriptions,
+        weights=weights,
+        stage=stage,
+    )
+    
+    # Sample weights (uniform for now)
+    training_ds_weights = np.ones(len(training_dataset)) / len(training_dataset)
+    
+    return training_dataset, image_transforms, training_ds_weights, n_obs_img_steps, n_pred_img_steps
+
+
 def create_data(
     policy_config: PretrainedConfig, 
     dataset_config: DataConfig, 
