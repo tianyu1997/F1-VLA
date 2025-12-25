@@ -391,7 +391,8 @@ class MemoryManager:
         """
         Determine if gradients should be detached for BPTT.
         
-        Detach every bptt_steps or at frame_idx == 0.
+        Detach at frame_idx == 0 or when step_count reaches bptt_steps.
+        The check happens BEFORE update_step_count is called.
         """
         if frame_idx == 0:
             return True
@@ -399,6 +400,8 @@ class MemoryManager:
         key = (dataset_idx, episode_idx)
         step_count = self._step_counts.get(key, 0)
         
+        # Detach when we're about to exceed bptt_steps
+        # step_count is incremented in update, so check if next step would exceed
         return step_count >= self.bptt_steps
     
     def update_step_count(
@@ -407,15 +410,19 @@ class MemoryManager:
         episode_idx: int,
         frame_idx: int,
     ) -> None:
-        """Update step count for BPTT tracking."""
+        """Update step count for BPTT tracking. Called AFTER forward pass."""
         key = (dataset_idx, episode_idx)
         
         if frame_idx == 0:
-            self._step_counts[key] = 0
+            # Start of episode
+            self._step_counts[key] = 1  # First step after frame 0
         else:
-            self._step_counts[key] = self._step_counts.get(key, 0) + 1
-            if self._step_counts[key] >= self.bptt_steps:
-                self._step_counts[key] = 0
+            current = self._step_counts.get(key, 0) + 1
+            if current > self.bptt_steps:
+                # Reset after bptt_steps (detach was applied, start new segment)
+                self._step_counts[key] = 1
+            else:
+                self._step_counts[key] = current
     
     def process_batch(
         self,
