@@ -1,0 +1,116 @@
+dataset:
+  # Use ME_KVM data format
+  use_mekvm_format: True
+  mekvm_data_dirs:
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+  mekvm_task_descriptions:
+    - "manipulate objects in clean environment"
+  mekvm_weights:
+    - 1.0
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 4
+
+  # Legacy LeRobot config (not used when use_mekvm_format=True)
+  train_dir: {}
+
+  image_size:
+    height: 224
+    width: 224
+  world_model_suffix: history
+  transforms:
+    consistent_random_crop_stages:
+      - stage3_finetune_vla
+
+exp:
+  stage: stage3_finetune_vla
+  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain
+  
+  # Memory configuration - ENABLED for testing
+  use_memory: True
+  memory_config:
+    memory_len: 4      # Number of memory slots per layer
+    bptt_steps: 4      # BPTT truncation length (shorter for testing)
+    tokenizer_max_length: 512
+
+  training_args:
+    output_dir: outputs/memory_test
+    run_name: memory_test
+    do_train: True
+    do_eval: False
+    num_train_epochs: 1
+    per_device_train_batch_size: 1  # Small batch for testing
+    per_device_eval_batch_size: 1
+
+    learning_rate: !!float 1e-5
+    weight_decay: !!float 1e-10
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_epsilon: !!float 1e-8
+    lr_scheduler_type: cosine
+    gradient_accumulation_steps: 1
+
+    max_steps: 20  # Short test run
+    warmup_steps: 2
+    log_level: info
+    log_level_replica: error
+
+    seed: 42
+    bf16: True
+    logging_strategy: steps
+    logging_steps: 5
+    save_strategy: steps
+    save_steps: 50
+    eval_strategy: "no"
+    save_safetensors: True
+
+    save_total_limit: 2
+    overwrite_output_dir: True
+    dataloader_num_workers: 0  # Disable multiprocessing for debugging
+    dataloader_pin_memory: False
+    dataloader_persistent_workers: False
+    remove_unused_columns: False
+
+    label_names: 
+      - action
+    report_to: []  # Disable logging for test
+
+    torch_compile: False  # Disable for easier debugging
+    stage: stage3_finetune_vla
+
+    gen_out_loss_ratio: 0.1
+    freeze_vision_encoder: True
+    freeze_gen_expert: True
+    train_act_expert_only: False
+    train_gen_expert_only: False
+    train_state_proj: True
+
+    image_transforms_enabled: False  # Disable for testing
+
+    und_expert_lr: !!float 1e-5
+    act_expert_lr: !!float 1e-5
+    vision_encoder_lr: !!float 0
+    gen_expert_lr: !!float 0
+
+  max_eval_samples: 100
+
+policy:
+  model_name: f1
+  path: /mnt/data2/ty/F1-VLA/pi0
+  ckpt_path: f1_vla/config/f1_config.json
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  mwm_pretrained_path: null
+  chunk_size: 4
+
+  use_world_model: True
+  pn: "1_2_3_4_5_6_8_10_13_16"
+  vae_ckpt: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
+
+  temporal_conv_kernel_size: 4
+  temporal_conv_stride: 4
+  vocab_size: 4096
+  vae_dim: 32
+  num_resolutions: 4
+
+  resize_imgs_with_padding: "(224, 224)"
+  attention_implementation: eager

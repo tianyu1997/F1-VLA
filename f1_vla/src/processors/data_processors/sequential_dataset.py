@@ -217,11 +217,16 @@ class SequentialMEKVMDataset(Dataset):
         sample = {
             # Main observation image
             "observation.images.image0": head_rgb[-1],
+            "observation.images.image0_mask": torch.tensor(True),  # Valid image
             # History + prediction images for world model
             "observation.images.image0_history": history_and_pred,
             # Wrist camera
             "observation.images.image1": wrist_rgb[-1],
+            "observation.images.image1_mask": torch.tensor(True),  # Valid image
             "observation.images.image1_history": wrist_rgb,
+            # Empty image2 slot (for compatibility)
+            "observation.images.image2": torch.zeros_like(head_rgb[-1]),
+            "observation.images.image2_mask": torch.tensor(False),  # Invalid/empty
             # State
             "observation.state": state,
             # State history (n_obs_img_steps, state_dim)
@@ -390,7 +395,7 @@ def create_sequential_mekvm_data(
     stage: str,
 ):
     """Create sequential dataset for memory-based training."""
-    from f1_vla.src.processors.data_processors.image_transforms import (
+    from lerobot.datasets.transforms import (
         ImageTransforms, ImageTransformsConfig
     )
     
