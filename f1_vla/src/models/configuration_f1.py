@@ -43,6 +43,9 @@ class F1Config(PretrainedConfig):
         use_world_model=True,
         attention_implementation="eager",
         resize_imgs_with_padding="(224, 224)",
+        # Memory configuration
+        use_memory=False,  # Memory switch: if False, behavior unchanged
+        memory_config=None,  # Memory module configuration
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -61,6 +64,16 @@ class F1Config(PretrainedConfig):
         self.resize_imgs_with_padding = resize_imgs_with_padding
 
         self.num_steps = 10
+
+        # Memory configuration
+        self.use_memory = use_memory
+        if memory_config is None:
+            memory_config = {}
+        self.memory_config = DictWithAttrAccess({
+            "memory_len": memory_config.get("memory_len", 4),  # Number of memory slots
+            "bptt_steps": memory_config.get("bptt_steps", 8),  # BPTT truncation length
+            "init_std": memory_config.get("init_std", 0.02),  # Init std for memory params
+        })
 
         self.und_expert_config = und_expert_config
         if isinstance(self.und_expert_config, dict):

@@ -46,6 +46,12 @@ dataset:
 exp:
   stage: stage1_pretrain_wm
   load_ckpt: /mnt/data2/ty/F1-VLA/wm
+  
+  # Memory configuration
+  use_memory: False  # Memory switch: set to True to enable memory mechanism
+  memory_config:
+    memory_len: 4      # Number of memory slots per layer
+    bptt_steps: 8      # BPTT truncation length for gradient
 
   training_args:
     output_dir: outputs/debug_test

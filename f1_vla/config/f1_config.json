@@ -103,6 +103,12 @@
       "vocab_size": 257152
   },
   "use_world_model": true,
+  "use_memory": false,
+  "memory_config": {
+    "memory_len": 4,
+    "bptt_steps": 8,
+    "init_std": 0.02
+  },
   "chunk_size": 50,
   "max_action_dim": 32,
   "max_state_dim": 32,
