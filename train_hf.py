@@ -77,10 +77,39 @@ def main(args, overrides):
     # Create dataset
     #########################################################
     use_mekvm_format = config.dataset.get('use_mekvm_format', False)
+    use_memory = config.exp.get('use_memory', False)
     
-    if use_mekvm_format:
-        # Use ME_KVM data format
+    # Determine data loading mode
+    if use_mekvm_format and use_memory:
+        # Sequential data loading for memory-based training
+        from f1_vla.src.processors.data_processors.sequential_dataset import (
+            create_sequential_mekvm_data, SequentialCollateFn, SequentialBatchSampler
+        )
+        (
+            training_dataset,
+            image_transforms,
+            training_ds_sample_weights,
+            cur_n_obs_img_steps,
+            cur_n_pred_img_steps
+        ) = create_sequential_mekvm_data(
+            policy_config=policy_config,
+            dataset_config=config.dataset,
+            training_args=training_args,
+            stage=config.exp.stage,
+        )
+        collate_fn = SequentialCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
+        # Create sequential batch sampler
+        sequential_sampler = SequentialBatchSampler(
+            dataset=training_dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            shuffle_episodes=True,
+            drop_last=False,
+        )
+        print(f"Using SEQUENTIAL data loading for memory-based training")
+    elif use_mekvm_format:
+        # Use ME_KVM data format (standard random loading)
         from f1_vla.src.processors.data_processors.me_kvm_dataset import MEKVMCollateFn
+        sequential_sampler = None
         (
             training_dataset,
             image_transforms,
@@ -96,6 +125,7 @@ def main(args, overrides):
         collate_fn = MEKVMCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
     else:
         # Use LeRobot data format
+        sequential_sampler = None
         data_config = create_data_config(config.dataset, policy_config, config.exp)
         (
             training_dataset, 
@@ -162,6 +192,8 @@ def main(args, overrides):
         cur_n_obs_img_steps=cur_n_obs_img_steps,
         cur_n_pred_img_steps=cur_n_pred_img_steps,
         training_ds_sample_weights=training_ds_sample_weights,
+        sequential_sampler=sequential_sampler if use_memory else None,
+        use_memory=use_memory,
     )
 
     #########################################################   

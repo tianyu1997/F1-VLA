@@ -95,12 +95,16 @@ class PolicyTrainer(Trainer):
         cur_n_obs_img_steps=None, 
         cur_n_pred_img_steps=None, 
         training_ds_sample_weights=None,
+        sequential_sampler=None,  # For memory-based sequential training
+        use_memory=False,
         *args, 
         **kwargs
     ):
         self.policy = policy
         self.image_transforms = image_transforms
         self.use_world_model = use_world_model
+        self.use_memory = use_memory
+        self.sequential_sampler = sequential_sampler
         # TODO: make this configurable
         self.pred_img_keys = ["observation.images.image0_history"]
         assert len(self.pred_img_keys) == 1, "Only one image key is supported for now"
@@ -116,6 +120,21 @@ class PolicyTrainer(Trainer):
         self.local_rank_idx = int(os.environ.get('LOCAL_RANK', -1))
 
         super().__init__(model=policy, callbacks=move_callbacks, *args, **kwargs)
+    
+    def get_train_dataloader(self):
+        """Override to use sequential sampler for memory-based training."""
+        if self.sequential_sampler is not None:
+            from torch.utils.data import DataLoader
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=self.sequential_sampler,
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+                persistent_workers=self.args.dataloader_persistent_workers if self.args.dataloader_num_workers > 0 else False,
+                prefetch_factor=self.args.dataloader_prefetch_factor if self.args.dataloader_num_workers > 0 else None,
+            )
+        return super().get_train_dataloader()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # apply image transforms to the inputs of understanding expert
