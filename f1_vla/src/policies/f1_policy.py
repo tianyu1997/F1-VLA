@@ -189,9 +189,14 @@ class F1_VLA(nn.Module):
             world_model_output_embs = world_model_output_embs.reshape(B, -1, world_model_output_embs.shape[3])
 
         #########################################################
+        # Get memory state if enabled
+        #########################################################
+        memory_kv, _, should_detach = self._get_memory_state(batch)
+
+        #########################################################
         # Forward and compute the loss
         #########################################################
-        action_losses, gen_logits = self.model.forward_with_world_model(images, img_masks, lang_tokens, lang_masks, state, world_model_input_embs, world_model_output_embs, actions, noise, time)
+        action_losses, gen_logits = self.model.forward_with_world_model(images, img_masks, lang_tokens, lang_masks, state, world_model_input_embs, world_model_output_embs, actions, noise, time, memory_kv=memory_kv)
 
         gen_token_len = gen_logits.shape[1]
         gt_world_model_indices = gt_world_model_indices.reshape(B, -1)[:, :gen_token_len]

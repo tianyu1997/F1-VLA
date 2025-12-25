@@ -380,6 +380,7 @@ class F1FlowMatching(nn.Module):
         top_p: float = 0.95,
         num_samples: int = 1,
         rng: torch.Generator | None = None,
+        memory_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tensor:
         """use the world model to guide the acton generation
             step1: prepare the noise and time for the action generation
@@ -387,6 +388,10 @@ class F1FlowMatching(nn.Module):
             step3: embed the prefix, world model inputs and suffix
             step4: forward the prefix, world model inputs and suffix
             step5: compute the loss
+            
+        Args:
+            memory_kv: Optional memory KV prefix. List of (K, V) per layer.
+                Each tensor: (batch, mem_len, num_kv_heads, head_dim)
         """
         if self.train_gen_expert_only:
             gen_embs, gen_pad_masks, gen_att_masks = self.embed_wm_inputs(
@@ -415,6 +420,7 @@ class F1FlowMatching(nn.Module):
                 inputs_embeds=[und_embs, gen_embs, None],
                 use_cache=False,
                 fill_kv_cache=False,
+                memory_kv=memory_kv,
             )
             gen_out = gen_out.to(dtype=torch.float32)
             gen_out = self.wm_out_proj(self.wm_out_layer_norm(gen_out))[:, -self.L:]
@@ -469,6 +475,7 @@ class F1FlowMatching(nn.Module):
                 inputs_embeds=[und_embs, gen_embs, None],
                 use_cache=self.config.use_cache,
                 fill_kv_cache=True,
+                memory_kv=memory_kv,
             )
 
             # 4. generate world model output
@@ -576,6 +583,7 @@ class F1FlowMatching(nn.Module):
         top_p: float = 0.95,
         num_samples: int = 1,
         rng: torch.Generator | None = None,
+        memory_kv: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
     ) -> Tensor:
         bsize = state.shape[0]
         device = state.device
@@ -614,6 +622,7 @@ class F1FlowMatching(nn.Module):
             inputs_embeds=[und_embs, gen_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            memory_kv=memory_kv,
         )
 
         # 4. generate world model output
