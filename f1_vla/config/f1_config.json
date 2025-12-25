@@ -68,7 +68,7 @@
       "pn": "1_2_3_4_5_6_8_10_13_16",
       "temporal_conv_kernel_size": 4,
       "temporal_conv_stride": 4,
-      "num_resolutions": 4,
+      "num_resolutions": 10,
       "vae": {
         "vocab_size": 4096,
         "z_channels": 32,

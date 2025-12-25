@@ -214,12 +214,18 @@ class F1_VLA(nn.Module):
             if key not in batch:
                 img = torch.zeros_like(batch["observation.images.image0"])
                 mask = torch.zeros_like(batch["observation.images.image0_mask"])
+                # Take only the last frame (current observation) for understanding expert
+                if len(img.shape) == 5:
+                    img = img[:, -1]  # (b, t, c, h, w) -> (b, c, h, w)
                 if self.config.resize_imgs_with_padding is not None:
                     img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
                 images.append(img)
                 image_masks.append(mask)
                 continue
             img = batch[key]
+            # Take only the last frame (current observation) for understanding expert
+            if len(img.shape) == 5:
+                img = img[:, -1]  # (b, t, c, h, w) -> (b, c, h, w)
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -357,7 +363,13 @@ class F1_VLA(nn.Module):
                 )
                 model.to(map_location)
         else:
-            safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
+            # Use safe_open with explicit device="cpu" to avoid device mapping issues in distributed training
+            from safetensors import safe_open
+            state_dict = {}
+            with safe_open(model_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+            model.load_state_dict(state_dict, strict=strict)
         return model
 
     def _save_pretrained(self, save_directory: Path) -> None:

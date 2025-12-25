@@ -307,16 +307,28 @@ class F1FlowMatching(nn.Module):
 
         embs = world_model_embs
 
+        # Build attention masks for the full sequence length
         att_masks = [0] * (self.L - 1)
         for res_idx, pn in enumerate(self.patch_nums):
             att_masks += [1] + ([0] * (pn * pn - 1))
             # only use the first n resolution
             if res_idx == self.num_resolutions - 1:
                 break
+        
+        # Adjust att_masks to match embs length
+        embs_seq_len = embs.shape[1]
+        if len(att_masks) < embs_seq_len:
+            # Pad att_masks with 0s to match embs sequence length
+            att_masks += [0] * (embs_seq_len - len(att_masks))
+        elif len(att_masks) > embs_seq_len:
+            # Truncate att_masks to match embs sequence length
+            att_masks = att_masks[:embs_seq_len]
+        
         att_masks = torch.tensor(att_masks, device=embs.device)
         att_masks = att_masks[None, :].expand(embs.shape[0], len(att_masks))
 
-        pad_masks = torch.ones(embs.shape[0], att_masks.shape[1], dtype=torch.bool, device=embs.device)
+        # pad_masks should match embs sequence length
+        pad_masks = torch.ones(embs.shape[0], embs_seq_len, dtype=torch.bool, device=embs.device)
 
         return embs, pad_masks, att_masks
 
@@ -400,8 +412,18 @@ class F1FlowMatching(nn.Module):
             )
 
             # 2. prepare the mask and position ids
-            pad_masks = torch.cat([und_pad_masks, gen_pad_masks], dim=1)
-            att_masks = torch.cat([und_att_masks, gen_att_masks], dim=1)
+            # Calculate extra positions needed for the generation loop
+            # For num_resolutions steps, we need positions for patches at each resolution level
+            extra_positions = sum(self.patch_nums[i] ** 2 for i in range(1, self.num_resolutions))
+            
+            # Extend pad_masks and att_masks to include positions for generation loop
+            bsize = und_embs.shape[0]
+            extra_pad_masks = torch.ones(bsize, extra_positions, dtype=gen_pad_masks.dtype, device=device)
+            extra_att_masks = torch.ones(bsize, extra_positions, dtype=gen_att_masks.dtype, device=device)
+            
+            pad_masks = torch.cat([und_pad_masks, gen_pad_masks, extra_pad_masks], dim=1)
+            att_masks = torch.cat([und_att_masks, gen_att_masks, extra_att_masks], dim=1)
+            
             att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
@@ -538,8 +560,15 @@ class F1FlowMatching(nn.Module):
         )
 
         # 2. prepare the mask and position ids
-        pad_masks = torch.cat([und_pad_masks, gen_pad_masks], dim=1)
-        att_masks = torch.cat([und_att_masks, gen_att_masks], dim=1)
+        # Calculate extra positions needed for the generation loop
+        extra_positions = sum(self.patch_nums[i] ** 2 for i in range(1, self.num_resolutions))
+        
+        # Extend pad_masks and att_masks to include positions for generation loop
+        extra_pad_masks = torch.ones(bsize, extra_positions, dtype=gen_pad_masks.dtype, device=device)
+        extra_att_masks = torch.ones(bsize, extra_positions, dtype=gen_att_masks.dtype, device=device)
+        
+        pad_masks = torch.cat([und_pad_masks, gen_pad_masks, extra_pad_masks], dim=1)
+        att_masks = torch.cat([und_att_masks, gen_att_masks, extra_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 

@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Logs and outputs
+logs/
+outputs/
+*.log
+
+# Model checkpoints and weights (large files)
+F1_pretrain/
+paligemma-3b-pt-224/
+pi0/
+wm/
+var/
+checkpoints/
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+
+# Dataset (large files)
+libero_spatial_no_noops_1.0.0_lerobot/
+data/
+
+# Other projects in workspace
+ME_KVM_VLA/
+RoboTwin/
+rl/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak

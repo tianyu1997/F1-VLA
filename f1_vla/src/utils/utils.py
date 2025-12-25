@@ -31,7 +31,37 @@ def clean_overrides(override_args):
 
 def load_ckpt(policy, config):
     if config.exp.load_ckpt is not None:
-        F1_VLA._load_as_safetensor(policy, config.exp.load_ckpt, "cpu", False)
+        import os
+        from safetensors import safe_open
+        
+        ckpt_path = config.exp.load_ckpt
+        # If it's a directory, look for model.safetensors inside
+        if os.path.isdir(ckpt_path):
+            ckpt_path = os.path.join(ckpt_path, "model.safetensors")
+        
+        print(f"Loading pretrained checkpoint from: {ckpt_path}")
+        
+        # Check key compatibility before loading
+        model_keys = set(policy.state_dict().keys())
+        ckpt_keys = set()
+        with safe_open(ckpt_path, framework="pt") as f:
+            ckpt_keys = set(f.keys())
+        
+        matched = model_keys & ckpt_keys
+        missing = model_keys - ckpt_keys
+        extra = ckpt_keys - model_keys
+        
+        print(f"  Model keys: {len(model_keys)}, Checkpoint keys: {len(ckpt_keys)}")
+        print(f"  Matched: {len(matched)}, Missing in ckpt: {len(missing)}, Extra in ckpt: {len(extra)}")
+        
+        if missing:
+            print(f"  NOTE: {len(missing)} keys not in checkpoint (VAE/PaliGemma loaded separately)")
+        
+        # Load with strict=False since VAE and PaliGemma are loaded separately
+        F1_VLA._load_as_safetensor(policy, ckpt_path, "cpu", strict=False)
+        print(f"Successfully loaded {len(matched)} weights from pretrained checkpoint!")
+    else:
+        print("No pretrained checkpoint specified, training from scratch")
         
     return policy
 
