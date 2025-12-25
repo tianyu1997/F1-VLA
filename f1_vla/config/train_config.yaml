@@ -52,6 +52,7 @@ exp:
   memory_config:
     memory_len: 4      # Number of memory slots per layer
     bptt_steps: 8      # BPTT truncation length for gradient
+    tokenizer_max_length: 512  # Extended tokenizer length for history text
 
   training_args:
     output_dir: outputs/debug_test

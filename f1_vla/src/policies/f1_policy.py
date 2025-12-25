@@ -3,6 +3,7 @@ import logging
 import packaging
 from pathlib import Path
 from collections import deque
+from typing import List
 
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
@@ -255,10 +256,80 @@ class F1_VLA(nn.Module):
 
         return images[0]
 
+    def _format_history_text(self, batch) -> List[str]:
+        """
+        Format action and state history as text for PaliGemma.
+        
+        Returns list of formatted history strings, one per batch item.
+        Format: "History: [state t-3: s0,s1,...] [action t-3: a0,a1,...] ..."
+        """
+        history_texts = []
+        batch_size = batch[OBS_STATE].shape[0]
+        
+        # Check if history is available
+        has_state_history = "observation.state_history" in batch
+        has_action_history = "action_history" in batch
+        
+        if not (has_state_history or has_action_history):
+            return [""] * batch_size
+        
+        for b in range(batch_size):
+            parts = []
+            
+            # State history: (n_obs_img_steps, state_dim)
+            if has_state_history:
+                state_hist = batch["observation.state_history"][b]  # (n_steps, dim)
+                n_steps = state_hist.shape[0]
+                state_strs = []
+                for t in range(n_steps):
+                    # Format state values with 2 decimal places
+                    vals = state_hist[t].tolist()
+                    # Truncate to first 8 dims for brevity
+                    vals_str = ",".join([f"{v:.2f}" for v in vals[:8]])
+                    if len(vals) > 8:
+                        vals_str += "..."
+                    state_strs.append(f"s{t-n_steps+1}:[{vals_str}]")
+                parts.append("state:" + " ".join(state_strs))
+            
+            # Action history: (n_obs_img_steps-1, action_dim)
+            if has_action_history:
+                action_hist = batch["action_history"][b]  # (n_steps, dim)
+                if action_hist.numel() > 0:
+                    n_steps = action_hist.shape[0]
+                    action_strs = []
+                    for t in range(n_steps):
+                        vals = action_hist[t].tolist()
+                        # Truncate to first 8 dims for brevity
+                        vals_str = ",".join([f"{v:.2f}" for v in vals[:8]])
+                        if len(vals) > 8:
+                            vals_str += "..."
+                        action_strs.append(f"a{t-n_steps}:[{vals_str}]")
+                    parts.append("action:" + " ".join(action_strs))
+            
+            if parts:
+                history_texts.append("History: " + " | ".join(parts) + " ")
+            else:
+                history_texts.append("")
+        
+        return history_texts
+
     def prepare_language(self, batch) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input"""
+        """Tokenize the text input, optionally including action/state history"""
         device = batch[OBS_STATE].device
         tasks = batch["task"]
+        
+        # Determine max_length: use extended length if memory is enabled
+        if self.config.use_memory:
+            max_length = self.config.memory_config.tokenizer_max_length
+            # Get history text
+            history_texts = self._format_history_text(batch)
+            # Combine: task + history
+            tasks = [
+                f"{task} {hist}" if not task.endswith("\n") else f"{task[:-1]} {hist}\n"
+                for task, hist in zip(tasks, history_texts)
+            ]
+        else:
+            max_length = self.config.tokenizer_max_length
 
         # PaliGemma prompt has to end with a new line
         tasks = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
@@ -267,7 +338,7 @@ class F1_VLA(nn.Module):
             tasks,
             padding="max_length",
             padding_side="right",
-            max_length=self.config.tokenizer_max_length,
+            max_length=max_length,
             return_tensors="pt",
             truncation=True,
         )

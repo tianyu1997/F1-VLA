@@ -143,7 +143,9 @@ class SequentialMEKVMDataset(Dataset):
             - observation.images.image0: current frame
             - observation.images.image0_history: history + prediction frames
             - observation.state: state vector
+            - observation.state_history: state history (n_obs_img_steps)
             - action: action chunk
+            - action_history: action history (n_obs_img_steps - 1, previous actions)
             - action_is_pad: padding mask
             - task: task description
             - dataset_idx, episode_idx, frame_idx: indices for memory
@@ -157,10 +159,37 @@ class SequentialMEKVMDataset(Dataset):
         head_rgb = self._resize_to_256(head_rgb)
         wrist_rgb = self._resize_to_256(wrist_rgb)
         
-        # State
+        # Current state
         state = torch.from_numpy(obs['state']).float()
         
-        # Actions - get chunk_size future actions
+        # State history - aligned with image history (n_obs_img_steps frames)
+        # Image history has n_obs_img_steps frames, state history should match
+        state_history = []
+        for i in range(self.n_obs_img_steps):
+            hist_frame_idx = frame_idx - (self.n_obs_img_steps - 1 - i)
+            if hist_frame_idx < 0:
+                # Pad with first available state
+                hist_state = torch.from_numpy(episode[0]['obs']['state']).float()
+            else:
+                hist_state = torch.from_numpy(episode[hist_frame_idx]['obs']['state']).float()
+            state_history.append(hist_state)
+        state_history = torch.stack(state_history)  # (n_obs_img_steps, state_dim)
+        
+        # Action history - previous n_obs_img_steps-1 actions (before current frame)
+        # Note: we use n_obs_img_steps-1 because at timestep t, we have t-1 previous actions
+        action_dim = len(episode[0]['action'])  # action is a list
+        action_history = []
+        for i in range(self.n_obs_img_steps - 1):
+            hist_frame_idx = frame_idx - (self.n_obs_img_steps - 1 - i)
+            if hist_frame_idx <= 0:
+                # Pad with zeros for first frame
+                hist_action = torch.zeros(action_dim, dtype=torch.float32)
+            else:
+                hist_action = torch.tensor(episode[hist_frame_idx - 1]['action'], dtype=torch.float32)
+            action_history.append(hist_action)
+        action_history = torch.stack(action_history) if action_history else torch.zeros(0, action_dim)  # (n_obs_img_steps-1, action_dim)
+        
+        # Future actions - get chunk_size future actions
         actions = []
         for i in range(self.chunk_size):
             if frame_idx + i < len(episode):
@@ -195,9 +224,13 @@ class SequentialMEKVMDataset(Dataset):
             "observation.images.image1_history": wrist_rgb,
             # State
             "observation.state": state,
+            # State history (n_obs_img_steps, state_dim)
+            "observation.state_history": state_history,
             # Actions
             "action": actions,
             "action_is_pad": action_is_pad,
+            # Action history (n_obs_img_steps-1, action_dim)
+            "action_history": action_history,
             # Task
             "task": self.task_description,
             # Prediction target
@@ -326,12 +359,26 @@ class SequentialCollateFn:
                 pad_size = self.max_state_dim - state.shape[-1]
                 result["observation.state"] = F.pad(state, (0, pad_size), value=0)
         
+        # Pad state history if needed
+        if "observation.state_history" in result:
+            state_hist = result["observation.state_history"]
+            if state_hist.shape[-1] < self.max_state_dim:
+                pad_size = self.max_state_dim - state_hist.shape[-1]
+                result["observation.state_history"] = F.pad(state_hist, (0, pad_size), value=0)
+        
         # Pad action if needed
         if "action" in result:
             action = result["action"]
             if action.shape[-1] < self.max_action_dim:
                 pad_size = self.max_action_dim - action.shape[-1]
                 result["action"] = F.pad(action, (0, pad_size), value=0)
+        
+        # Pad action history if needed
+        if "action_history" in result:
+            action_hist = result["action_history"]
+            if action_hist.shape[-1] < self.max_action_dim:
+                pad_size = self.max_action_dim - action_hist.shape[-1]
+                result["action_history"] = F.pad(action_hist, (0, pad_size), value=0)
         
         return result
 

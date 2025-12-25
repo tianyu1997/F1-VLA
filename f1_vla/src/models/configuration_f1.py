@@ -73,6 +73,7 @@ class F1Config(PretrainedConfig):
             "memory_len": memory_config.get("memory_len", 4),  # Number of memory slots
             "bptt_steps": memory_config.get("bptt_steps", 8),  # BPTT truncation length
             "init_std": memory_config.get("init_std", 0.02),  # Init std for memory params
+            "tokenizer_max_length": memory_config.get("tokenizer_max_length", 512),  # Extended tokenizer length for history
         })
 
         self.und_expert_config = und_expert_config
