@@ -82,6 +82,7 @@ class EpisodeProgressCallback(TrainerCallback):
     """Custom progress callback that displays progress by epoch/episode with real-time loss/acc.
     
     Also handles episode-based logging, saving, and evaluation.
+    Implements state persistence for proper checkpoint resume.
     """
     
     def __init__(self, num_episodes: int = 0, total_steps: int = 0, batch_size: int = 4, num_epochs: int = 1,
@@ -106,21 +107,68 @@ class EpisodeProgressCallback(TrainerCallback):
         self.last_save_episode = 0
         self.last_eval_episode = 0
         
+        # Flag to track if we've been restored from checkpoint
+        self._restored_from_checkpoint = False
+        
         # Real-time metrics (updated every step from compute_loss)
         self.current_loss = 0.0
         self.current_wm_loss = 0.0
         self.current_wm_acc = 0.0
         self.current_action_loss = 0.0
+    
+    def state(self) -> dict:
+        """Return state to be saved in trainer_state.json for checkpoint resume."""
+        return {
+            "current_epoch": self.current_epoch,
+            "total_episode_count": self.total_episode_count,
+            "epoch_episode_count": self.epoch_episode_count,
+            "last_log_episode": self.last_log_episode,
+            "last_save_episode": self.last_save_episode,
+            "last_eval_episode": self.last_eval_episode,
+            "seen_episodes": list(self.seen_episodes),
+        }
+    
+    def load_state(self, state: dict):
+        """Load state from trainer_state.json when resuming from checkpoint."""
+        self.current_epoch = state.get("current_epoch", 0)
+        self.total_episode_count = state.get("total_episode_count", 0)
+        self.epoch_episode_count = state.get("epoch_episode_count", 0)
+        self.last_log_episode = state.get("last_log_episode", 0)
+        self.last_save_episode = state.get("last_save_episode", 0)
+        self.last_eval_episode = state.get("last_eval_episode", 0)
+        self.seen_episodes = set(state.get("seen_episodes", []))
+        self._restored_from_checkpoint = True
+        logger.info(f"[EpisodeProgressCallback] Restored state: epoch={self.current_epoch}, "
+                   f"total_episodes={self.total_episode_count}, epoch_episodes={self.epoch_episode_count}")
         
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize progress bar at training start."""
         from tqdm import tqdm
         if state.is_local_process_zero:
+            # Calculate epoch from total_episode_count (more reliable than state.epoch for resume)
+            if not self._restored_from_checkpoint:
+                # Fresh start - calculate from state.epoch if available
+                if state.epoch:
+                    self.current_epoch = int(state.epoch)
+                    # Also estimate episode counts from global_step
+                    if state.global_step > 0 and self.num_episodes > 0:
+                        # Estimate total episodes = global_step * batch_size
+                        self.total_episode_count = state.global_step * self.batch_size
+                        self.epoch_episode_count = self.total_episode_count % self.num_episodes
+                        self.last_log_episode = self.total_episode_count
+                        self.last_save_episode = self.total_episode_count
+                        logger.info(f"[EpisodeProgressCallback] Estimated from state: epoch={self.current_epoch}, "
+                                   f"total_episodes={self.total_episode_count}")
+            
+            # Initial progress within current epoch
+            initial_progress = self.epoch_episode_count
+            
             # Show epoch and episode progress
-            desc = f"Epoch 1/{self.num_epochs} [Ep: 0/{self.num_episodes}]"
+            desc = f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: {initial_progress}/{self.num_episodes}]"
             # Use num_episodes as total (per epoch)
             self.pbar = tqdm(
                 total=self.num_episodes,
+                initial=initial_progress,
                 desc=desc,
                 dynamic_ncols=True,
                 leave=True,
@@ -133,13 +181,20 @@ class EpisodeProgressCallback(TrainerCallback):
             })
     
     def on_epoch_begin(self, args, state, control, **kwargs):
-        """Reset episode counter at epoch start."""
-        self.current_epoch = int(state.epoch) if state.epoch else 0
-        self.seen_episodes.clear()
-        self.epoch_episode_count = 0
-        if self.pbar is not None and state.is_local_process_zero:
-            self.pbar.reset()
-            self.pbar.set_description(f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: 0/{self.num_episodes}]")
+        """Reset episode counter at epoch start.
+        
+        Note: We track epochs ourselves instead of relying on state.epoch 
+        because HuggingFace's state.epoch calculation can differ after resume.
+        """
+        # Only increment epoch if we actually completed the previous one
+        # (detected by epoch_episode_count reaching num_episodes)
+        if self.epoch_episode_count >= self.num_episodes:
+            self.current_epoch += 1
+            self.seen_episodes.clear()
+            self.epoch_episode_count = 0
+            if self.pbar is not None and state.is_local_process_zero:
+                self.pbar.reset()
+                self.pbar.set_description(f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: 0/{self.num_episodes}]")
     
     def on_step_end(self, args, state, control, **kwargs):
         """Update progress bar after each step."""
