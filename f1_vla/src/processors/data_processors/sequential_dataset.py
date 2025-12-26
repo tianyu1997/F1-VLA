@@ -9,6 +9,7 @@ When use_memory=True, data is loaded sequentially:
 import os
 import glob
 import json
+import logging
 import random
 from typing import List, Dict, Any, Optional, Tuple, Iterator
 
@@ -16,6 +17,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
+
+logger = logging.getLogger(__name__)
 
 
 class SequentialMEKVMDataset(Dataset):
@@ -85,7 +88,7 @@ class SequentialMEKVMDataset(Dataset):
         for dir_idx, data_dir in enumerate(data_dirs):
             ep_files = sorted(glob.glob(os.path.join(data_dir, "episode_*.pt")))
             if not ep_files:
-                print(f"Warning: No episode files found in {data_dir}")
+                logger.warning(f"No episode files found in {data_dir}")
                 continue
             for ep_file in ep_files:
                 all_episode_files.append(ep_file)
@@ -108,7 +111,7 @@ class SequentialMEKVMDataset(Dataset):
                 self.global_episode_idx.append(global_idx)
         
         if world_size > 1:
-            print(f"[Rank {rank}] Assigned {len(self.episode_files)}/{total_episodes} episodes")
+            logger.info(f"[Rank {rank}] Assigned {len(self.episode_files)}/{total_episodes} episodes")
         
         # Load episode lengths only for this rank's episodes
         self._episode_lengths = self._load_episode_lengths()
@@ -123,7 +126,7 @@ class SequentialMEKVMDataset(Dataset):
         self._cache = {}
         self._cache_max_size = 10
         
-        print(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
+        logger.info(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
     
     def _load_episode_lengths(self) -> List[int]:
         """Load episode lengths for this rank's episodes, using cache when possible"""
@@ -384,7 +387,7 @@ class SequentialBatchSampler(Sampler):
         self.local_num_episodes = len(self.local_episode_ids)
         
         if self.world_size > 1:
-            print(f"[Rank {self.rank}] SequentialBatchSampler: {self.local_num_episodes}/{self.num_episodes} episodes assigned to this rank")
+            logger.info(f"[Rank {self.rank}] SequentialBatchSampler: {self.local_num_episodes}/{self.num_episodes} episodes assigned to this rank")
     
     def __iter__(self) -> Iterator[List[int]]:
         """

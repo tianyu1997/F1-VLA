@@ -556,7 +556,7 @@ class F1_VLA(nn.Module):
             model_id = "/".join(model_id.split("/")[:-1])
 
         if os.path.isdir(model_id):
-            print(f"Loading weights from local directory: {model_id}")
+            logger.info(f"Loading weights from local directory: {model_id}")
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
             policy = cls._load_as_safetensor(instance, model_file, "cpu", strict)
         else:

@@ -1,4 +1,5 @@
 import os
+import logging
 from pathlib import Path
 from omegaconf import OmegaConf
 
@@ -9,6 +10,8 @@ import torch
 from torch.utils.data import Sampler
 
 from f1_vla.src.policies.f1_policy import F1_VLA
+
+logger = logging.getLogger(__name__)
 
 
 def save_training_args(training_args, policy_config, config):
@@ -39,7 +42,7 @@ def load_ckpt(policy, config):
         if os.path.isdir(ckpt_path):
             ckpt_path = os.path.join(ckpt_path, "model.safetensors")
         
-        print(f"Loading pretrained checkpoint from: {ckpt_path}")
+        logger.info(f"Loading pretrained checkpoint from: {ckpt_path}")
         
         # Check key compatibility before loading
         model_keys = set(policy.state_dict().keys())
@@ -51,17 +54,17 @@ def load_ckpt(policy, config):
         missing = model_keys - ckpt_keys
         extra = ckpt_keys - model_keys
         
-        print(f"  Model keys: {len(model_keys)}, Checkpoint keys: {len(ckpt_keys)}")
-        print(f"  Matched: {len(matched)}, Missing in ckpt: {len(missing)}, Extra in ckpt: {len(extra)}")
+        logger.info(f"  Model keys: {len(model_keys)}, Checkpoint keys: {len(ckpt_keys)}")
+        logger.info(f"  Matched: {len(matched)}, Missing in ckpt: {len(missing)}, Extra in ckpt: {len(extra)}")
         
         if missing:
-            print(f"  NOTE: {len(missing)} keys not in checkpoint (VAE/PaliGemma loaded separately)")
+            logger.info(f"  NOTE: {len(missing)} keys not in checkpoint (VAE/PaliGemma loaded separately)")
         
         # Load with strict=False since VAE and PaliGemma are loaded separately
         F1_VLA._load_as_safetensor(policy, ckpt_path, "cpu", strict=False)
-        print(f"Successfully loaded {len(matched)} weights from pretrained checkpoint!")
+        logger.info(f"Successfully loaded {len(matched)} weights from pretrained checkpoint!")
     else:
-        print("No pretrained checkpoint specified, training from scratch")
+        logger.info("No pretrained checkpoint specified, training from scratch")
         
     return policy
 

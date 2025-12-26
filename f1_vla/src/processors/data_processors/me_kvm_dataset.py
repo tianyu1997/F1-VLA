@@ -6,11 +6,14 @@ obs keys: ['action_history', 'head_rgb', 'state', 'wrist_rgb']
 import os
 import glob
 import json
+import logging
 import numpy as np
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
@@ -48,13 +51,13 @@ class MEKVMDataset(Dataset):
         # Try to load cached index
         cache_file = os.path.join(data_dir, ".mekvm_index_cache.json")
         if os.path.exists(cache_file):
-            print(f"Loading cached index from {cache_file}...")
+            logger.info(f"Loading cached index from {cache_file}...")
             with open(cache_file, 'r') as f:
                 cache = json.load(f)
             self._episode_lengths = cache['episode_lengths']
             # Verify cache is still valid
             if len(self._episode_lengths) != len(self.episode_files):
-                print("Cache invalid, re-indexing...")
+                logger.warning("Cache invalid, re-indexing...")
                 self._build_index(cache_file)
         else:
             self._build_index(cache_file)
@@ -69,22 +72,22 @@ class MEKVMDataset(Dataset):
         self._cache = {}
         self._cache_max_size = 10  # Keep only 10 episodes in memory
         
-        print(f"Dataset ready: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
+        logger.info(f"Dataset ready: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
     
     def _build_index(self, cache_file: str):
         """Build and cache episode lengths"""
         self._episode_lengths = []
-        print(f"Indexing {len(self.episode_files)} episodes from {self.data_dir}...")
+        logger.info(f"Indexing {len(self.episode_files)} episodes from {self.data_dir}...")
         
         for ep_idx, ep_file in enumerate(self.episode_files):
             if (ep_idx + 1) % 100 == 0:
-                print(f"  Indexed {ep_idx + 1}/{len(self.episode_files)} episodes...")
+                logger.info(f"  Indexed {ep_idx + 1}/{len(self.episode_files)} episodes...")
             episode = torch.load(ep_file, weights_only=False)
             self._episode_lengths.append(len(episode))
             del episode
         
         # Save cache
-        print(f"Saving index cache to {cache_file}...")
+        logger.info(f"Saving index cache to {cache_file}...")
         cache = {'episode_lengths': self._episode_lengths}
         with open(cache_file, 'w') as f:
             json.dump(cache, f)
@@ -246,7 +249,7 @@ class MEKVMMixtureDataset(Dataset):
         total_weight = sum(weights)
         self.weights = [w / total_weight for w in weights]
         
-        print(f"MEKVMMixtureDataset: {len(self.datasets)} datasets, {len(self)} total samples")
+        logger.info(f"MEKVMMixtureDataset: {len(self.datasets)} datasets, {len(self)} total samples")
     
     def __len__(self):
         return self.cumulative_lengths[-1]

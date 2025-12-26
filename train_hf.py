@@ -50,7 +50,7 @@ def main(args, overrides):
     local_rank_idx = int(os.environ.get('LOCAL_RANK', -1))
     if worker_idx == 0 and local_rank_idx in [-1, 0]:
         save_training_args(training_args, policy_config, config)
-        print(f"saved training args on worker {worker_idx}, local rank {local_rank_idx}") 
+        logger.info(f"saved training args on worker {worker_idx}, local rank {local_rank_idx}") 
 
     #########################################################
     # Log on each process summary
@@ -118,7 +118,7 @@ def main(args, overrides):
             rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
             world_size=1,
         )
-        print(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
+        logger.info(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
     elif use_mekvm_format:
         # Use ME_KVM data format (standard random loading)
         from f1_vla.src.processors.data_processors.me_kvm_dataset import MEKVMCollateFn
@@ -235,7 +235,7 @@ def main(args, overrides):
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        print(f"Training from checkpoint: {checkpoint}")
+        logger.info(f"Training from checkpoint: {checkpoint}")
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()

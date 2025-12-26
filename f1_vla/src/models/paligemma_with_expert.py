@@ -13,8 +13,11 @@
 # limitations under the License.
 
 from typing import List, Optional, Union
+import logging
 
 import torch
+
+logger = logging.getLogger(__name__)
 from torch import nn
 from transformers import (
     GemmaForCausalLM,
@@ -98,10 +101,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.train_gen_expert_only = train_gen_expert_only
         self.freeze_gen_expert = freeze_gen_expert
 
-        print(f"\033[93mFreeze vision encoder: {freeze_vision_encoder}\033[0m")
-        print(f"\033[93mFreeze gen expert: {freeze_gen_expert}\033[0m")
-        print(f"\033[93mTrain act expert only: {train_act_expert_only}\033[0m")
-        print(f"\033[93mTrain gen expert only: {train_gen_expert_only}\033[0m")
+        logger.info(f"Freeze vision encoder: {freeze_vision_encoder}")
+        logger.info(f"Freeze gen expert: {freeze_gen_expert}")
+        logger.info(f"Train act expert only: {train_act_expert_only}")
+        logger.info(f"Train gen expert only: {train_gen_expert_only}")
 
         if freeze_vision_encoder:
             self.paligemma.vision_tower.eval()
@@ -120,7 +123,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None \
             and train_gen_expert_only:
-            print("\033[93mTraining World Model Expert only\033[0m")
+            logger.info("Training World Model Expert only")
             self.paligemma.eval()
             self.gemma_expert.eval()
             for params in self.paligemma.parameters():
