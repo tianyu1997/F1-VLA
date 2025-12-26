@@ -46,9 +46,13 @@ echo "Training started with PID: $PID"
 echo "PID saved to: ${LOG_DIR}/train_pid.txt"
 echo $PID > ${LOG_DIR}/train_pid.txt
 
+# Create latest_log symlink
+ln -sf "train_${TIMESTAMP}.log" "${LOG_DIR}/latest_log.log"
+echo "Latest log link: ${LOG_DIR}/latest_log.log"
+
 echo ""
 echo "To monitor training:"
-echo "  tail -f $LOG_FILE"
+echo "  tail -f ${LOG_DIR}/latest_log.log"
 echo ""
 echo "To stop training:"
 echo "  kill $PID"

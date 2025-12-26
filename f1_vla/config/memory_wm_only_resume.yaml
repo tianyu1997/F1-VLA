@@ -39,6 +39,7 @@ exp:
   training_args:
     output_dir: outputs/memory_wm_only_v2
     run_name: memory_wm_only_v2
+    resume_from_checkpoint: /mnt/data2/ty/F1-VLA/outputs/memory_wm_only_v2/checkpoint-episode-1000
     do_train: True
     do_eval: False
     num_train_epochs: 100

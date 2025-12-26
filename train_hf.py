@@ -15,6 +15,7 @@ from f1_vla.src.utils.utils import (
     clean_overrides,
     save_training_args, 
     set_policy_config,
+    set_camera_config,
 )
 from f1_vla.src.processors.data_processors.data_config import create_data_config
 from f1_vla.src.processors.data_processors.data_loader import create_data, create_mekvm_data, CollateFn
@@ -36,6 +37,7 @@ def main(args, overrides):
  
     policy_config = F1Config.from_pretrained(f"{config.policy.ckpt_path}")
     policy_config = set_policy_config(policy_config, config.policy)
+    policy_config = set_camera_config(policy_config, config.exp)
 
     parser_training_args = HfArgumentParser((PolicyTrainingArguments))
     training_args = OmegaConf.to_container(config.exp.training_args, resolve=True)
@@ -85,6 +87,12 @@ def main(args, overrides):
         from f1_vla.src.processors.data_processors.sequential_dataset import (
             create_sequential_mekvm_data, SequentialCollateFn, SequentialBatchSampler
         )
+        
+        # Get distributed training info FIRST
+        rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        
+        # Create dataset with distributed support - each rank loads only its portion
         (
             training_dataset,
             image_transforms,
@@ -96,16 +104,21 @@ def main(args, overrides):
             dataset_config=config.dataset,
             training_args=training_args,
             stage=config.exp.stage,
+            rank=rank,
+            world_size=world_size,
         )
         collate_fn = SequentialCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
-        # Create sequential batch sampler
+        
+        # Create sequential batch sampler (no longer needs rank/world_size since dataset is already sharded)
         sequential_sampler = SequentialBatchSampler(
             dataset=training_dataset,
             batch_size=training_args.per_device_train_batch_size,
             shuffle_episodes=True,
             drop_last=False,
+            rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
+            world_size=1,
         )
-        print(f"Using SEQUENTIAL data loading for memory-based training")
+        print(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
     elif use_mekvm_format:
         # Use ME_KVM data format (standard random loading)
         from f1_vla.src.processors.data_processors.me_kvm_dataset import MEKVMCollateFn
@@ -181,6 +194,18 @@ def main(args, overrides):
     #########################################################
     # Create trainer
     #########################################################
+    # Get number of episodes for progress display
+    num_episodes = 0
+    if hasattr(training_dataset, 'get_num_episodes'):
+        num_episodes = training_dataset.get_num_episodes()
+    elif hasattr(training_dataset, 'num_episodes'):
+        num_episodes = training_dataset.num_episodes
+    
+    # Get episode-based settings from config
+    logging_episodes = config.exp.training_args.get("logging_episodes", 100)
+    save_episodes = config.exp.training_args.get("save_episodes", 500)
+    eval_episodes = config.exp.training_args.get("eval_episodes", 500)
+    
     trainer = PolicyTrainer(
         policy=policy,
         args=training_args,
@@ -194,6 +219,11 @@ def main(args, overrides):
         training_ds_sample_weights=training_ds_sample_weights,
         sequential_sampler=sequential_sampler if use_memory else None,
         use_memory=use_memory,
+        num_episodes=num_episodes,
+        logging_episodes=logging_episodes,
+        save_episodes=save_episodes,
+        eval_episodes=eval_episodes,
+        eval_dataset=training_dataset,  # Use same dataset for eval (can be changed)
     )
 
     #########################################################   

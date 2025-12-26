@@ -67,10 +67,169 @@ class PolicyTrainingArguments(TrainingArguments):
     act_expert_lr: float = 0.0
     gen_expert_lr: float = 0.0
     vision_encoder_lr: float = 0.0
+    
+    # Episode-based logging and saving
+    logging_episodes: int = 10  # Log every N episodes
+    save_episodes: int = 100    # Save every N episodes
+    eval_episodes: int = 50     # Eval every N episodes (0 to disable)
 
     def __post_init__(self):
         super().__post_init__()
         random.seed(self.seed)
+
+
+class EpisodeProgressCallback(TrainerCallback):
+    """Custom progress callback that displays progress by epoch/episode with real-time loss/acc.
+    
+    Also handles episode-based logging, saving, and evaluation.
+    """
+    
+    def __init__(self, num_episodes: int = 0, total_steps: int = 0, batch_size: int = 4, num_epochs: int = 1,
+                 logging_episodes: int = 10, save_episodes: int = 100, eval_episodes: int = 50):
+        self.num_episodes = num_episodes
+        self.total_steps = total_steps
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.logging_episodes = logging_episodes
+        self.save_episodes = save_episodes
+        self.eval_episodes = eval_episodes
+        
+        # Number of episode batches (groups of batch_size episodes)
+        self.num_episode_batches = (num_episodes + batch_size - 1) // batch_size
+        self.pbar = None
+        self.current_epoch = 0
+        self.current_episode_batch = 0
+        self.seen_episodes = set()  # Track all seen episode indices
+        self.epoch_episode_count = 0  # Episodes seen in current epoch
+        self.total_episode_count = 0  # Total episodes across all epochs
+        self.last_log_episode = 0
+        self.last_save_episode = 0
+        self.last_eval_episode = 0
+        
+        # Real-time metrics (updated every step from compute_loss)
+        self.current_loss = 0.0
+        self.current_wm_loss = 0.0
+        self.current_wm_acc = 0.0
+        self.current_action_loss = 0.0
+        
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Initialize progress bar at training start."""
+        from tqdm import tqdm
+        if state.is_local_process_zero:
+            # Show epoch and episode progress
+            desc = f"Epoch 1/{self.num_epochs} [Ep: 0/{self.num_episodes}]"
+            # Use num_episodes as total (per epoch)
+            self.pbar = tqdm(
+                total=self.num_episodes,
+                desc=desc,
+                dynamic_ncols=True,
+                leave=True,
+                unit="ep",
+            )
+            self.pbar.set_postfix({
+                'loss': 0,
+                'wm_loss': 0,
+                'wm_acc': '0.00%',
+            })
+    
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Reset episode counter at epoch start."""
+        self.current_epoch = int(state.epoch) if state.epoch else 0
+        self.seen_episodes.clear()
+        self.epoch_episode_count = 0
+        if self.pbar is not None and state.is_local_process_zero:
+            self.pbar.reset()
+            self.pbar.set_description(f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: 0/{self.num_episodes}]")
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Update progress bar after each step."""
+        if self.pbar is not None and state.is_local_process_zero:
+            # Update display with real-time metrics (no step update, only episode-based)
+            self.pbar.set_postfix({
+                'loss': f"{self.current_loss:.4f}",
+                'wm_loss': f"{self.current_wm_loss:.4f}",
+                'wm_acc': f"{self.current_wm_acc:.2%}",
+            })
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Update metrics display when logging (for logged metrics)."""
+        if self.pbar is not None and state.is_local_process_zero and logs is not None:
+            postfix = {}
+            if 'loss' in logs:
+                postfix['loss'] = f"{logs['loss']:.4f}"
+            if 'wm_out_loss' in logs:
+                postfix['wm_loss'] = f"{logs['wm_out_loss']:.4f}"
+            if 'wm_acc_mean' in logs:
+                postfix['wm_acc'] = f"{logs['wm_acc_mean']:.2%}"
+            if 'action_loss' in logs:
+                postfix['act_loss'] = f"{logs['action_loss']:.4f}"
+            if postfix:
+                self.pbar.set_postfix(postfix)
+    
+    def update_metrics(self, loss: float, wm_loss: float = 0.0, wm_acc: float = 0.0, action_loss: float = 0.0):
+        """Update real-time metrics from compute_loss."""
+        self.current_loss = loss
+        self.current_wm_loss = wm_loss
+        self.current_wm_acc = wm_acc
+        self.current_action_loss = action_loss
+    
+    def update_episode(self, episode_indices: list):
+        """Update episode counter with all episode indices in the current batch."""
+        # Track all unique episodes seen in this epoch
+        new_episodes_count = 0
+        for ep_idx in episode_indices:
+            if ep_idx not in self.seen_episodes:
+                self.seen_episodes.add(ep_idx)
+                new_episodes_count += 1
+        
+        if new_episodes_count > 0:
+            self.epoch_episode_count = len(self.seen_episodes)
+            self.total_episode_count += new_episodes_count
+            
+            if self.pbar is not None:
+                # Update progress bar by number of new episodes
+                self.pbar.update(new_episodes_count)
+                self.pbar.set_description(
+                    f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: {self.epoch_episode_count}/{self.num_episodes}]"
+                )
+        
+        return new_episodes_count
+    
+    def should_log(self) -> bool:
+        """Check if should log based on episode count."""
+        if self.logging_episodes <= 0:
+            return False
+        episodes_since_log = self.total_episode_count - self.last_log_episode
+        return episodes_since_log >= self.logging_episodes
+    
+    def should_save(self) -> bool:
+        """Check if should save based on episode count."""
+        if self.save_episodes <= 0:
+            return False
+        episodes_since_save = self.total_episode_count - self.last_save_episode
+        return episodes_since_save >= self.save_episodes
+    
+    def should_eval(self) -> bool:
+        """Check if should eval based on episode count."""
+        if self.eval_episodes <= 0:
+            return False
+        episodes_since_eval = self.total_episode_count - self.last_eval_episode
+        return episodes_since_eval >= self.eval_episodes
+    
+    def mark_logged(self):
+        self.last_log_episode = self.total_episode_count
+    
+    def mark_saved(self):
+        self.last_save_episode = self.total_episode_count
+    
+    def mark_evaled(self):
+        self.last_eval_episode = self.total_episode_count
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Close progress bar at training end."""
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
 
 
 class PolicyTrainerCallback(TrainerCallback):
@@ -103,6 +262,11 @@ class PolicyTrainer(Trainer):
         training_ds_sample_weights=None,
         sequential_sampler=None,  # For memory-based sequential training
         use_memory=False,
+        num_episodes=0,  # Total number of episodes for progress display
+        logging_episodes=10,  # Log every N episodes
+        save_episodes=100,  # Save every N episodes  
+        eval_episodes=50,  # Eval every N episodes
+        eval_dataset=None,  # Dataset for evaluation
         *args, 
         **kwargs
     ):
@@ -111,6 +275,8 @@ class PolicyTrainer(Trainer):
         self.use_world_model = use_world_model
         self.use_memory = use_memory
         self.sequential_sampler = sequential_sampler
+        self.num_episodes = num_episodes
+        self.eval_dataset = eval_dataset
         # TODO: make this configurable
         self.pred_img_keys = ["observation.images.image0_history"]
         assert len(self.pred_img_keys) == 1, "Only one image key is supported for now"
@@ -118,7 +284,24 @@ class PolicyTrainer(Trainer):
         self.cur_n_obs_img_steps = cur_n_obs_img_steps
         self.cur_n_pred_img_steps = cur_n_pred_img_steps
 
+        # Create callbacks
         move_callbacks = [PolicyTrainerCallback(policy=policy, image_transforms=image_transforms)]
+        
+        # Add episode progress callback if using memory
+        training_args = kwargs.get('args')
+        total_steps = training_args.max_steps if training_args else 0
+        batch_size = training_args.per_device_train_batch_size if training_args else 4
+        num_epochs = int(training_args.num_train_epochs) if training_args else 1
+        self.episode_progress_callback = EpisodeProgressCallback(
+            num_episodes=num_episodes,
+            total_steps=total_steps,
+            batch_size=batch_size,
+            num_epochs=num_epochs,
+            logging_episodes=logging_episodes,
+            save_episodes=save_episodes,
+            eval_episodes=eval_episodes,
+        )
+        move_callbacks.append(self.episode_progress_callback)
 
         self.training_ds_sample_weights = training_ds_sample_weights
 
@@ -126,6 +309,7 @@ class PolicyTrainer(Trainer):
         self.local_rank_idx = int(os.environ.get('LOCAL_RANK', -1))
 
         super().__init__(model=policy, callbacks=move_callbacks, *args, **kwargs)
+    
     
     def get_train_dataloader(self):
         """Override to use sequential sampler for memory-based training."""
@@ -143,6 +327,12 @@ class PolicyTrainer(Trainer):
         return super().get_train_dataloader()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # Update episode progress if available
+        if hasattr(self, 'episode_progress_callback') and 'episode_idx' in inputs:
+            # Get all episode indices in the current batch
+            episode_indices = inputs['episode_idx'].cpu().tolist()
+            self.episode_progress_callback.update_episode(episode_indices)
+        
         # apply image transforms to the inputs of understanding expert
         if self.image_transforms is not None:
             for key, value in inputs.items():
@@ -160,14 +350,31 @@ class PolicyTrainer(Trainer):
         )
 
         loss = outputs["loss"]
+        
+        # Update real-time metrics for progress bar (every step)
+        if hasattr(self, 'episode_progress_callback') and self.state.is_local_process_zero:
+            wm_loss = outputs.get("wm_loss", torch.tensor(0)).cpu().item()
+            wm_acc = outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item()
+            action_loss = outputs.get("action_loss", torch.tensor(0)).cpu().item()
+            self.episode_progress_callback.update_metrics(
+                loss=loss.cpu().item(),
+                wm_loss=wm_loss,
+                wm_acc=wm_acc,
+                action_loss=action_loss
+            )
 
+        # Episode-based logging (instead of step-based)
         if self.state.is_local_process_zero and self.state.is_world_process_zero:
-            if self.state.global_step % self.state.logging_steps == 0 and self.state.global_step != 0:
+            if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_log():
                 action_lr_log = {
                     "action_learning_rate": self.optimizer.param_groups[-1]["lr"],
                 }
                 action_log = {
                     "action_loss": outputs.get("action_loss", torch.tensor(0)).cpu().item(),
+                }
+                episode_log = {
+                    "episode": self.episode_progress_callback.total_episode_count,
+                    "epoch": self.episode_progress_callback.current_epoch + 1,
                 }
                 if self.policy.use_world_model:
                     wm_log = {
@@ -180,15 +387,162 @@ class PolicyTrainer(Trainer):
                         "vit_learning_rate": self.optimizer.param_groups[0]["lr"],
                     }
                     if self.policy.model.train_gen_expert_only:
-                        loss_dict = {**wm_log, **vit_log}
+                        loss_dict = {**episode_log, **wm_log, **vit_log}
                     else:
-                        loss_dict = {**wm_log, **vit_log, **action_lr_log, **action_log}
+                        loss_dict = {**episode_log, **wm_log, **vit_log, **action_lr_log, **action_log}
                 else:
-                    loss_dict = {**action_lr_log, **action_log}
+                    loss_dict = {**episode_log, **action_lr_log, **action_log}
 
                 self.log(loss_dict)
+                self.episode_progress_callback.mark_logged()
+        
+        # Episode-based saving
+        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_save():
+            if self.state.is_world_process_zero:
+                episode_count = self.episode_progress_callback.total_episode_count
+                save_dir = os.path.join(self.args.output_dir, f"checkpoint-episode-{episode_count}")
+                self._save(save_dir)
+                logger.info(f"Saved checkpoint at episode {episode_count}")
+            self.episode_progress_callback.mark_saved()
+        
+        # Episode-based evaluation with video generation
+        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_eval():
+            if self.state.is_world_process_zero and self.eval_dataset is not None:
+                episode_count = self.episode_progress_callback.total_episode_count
+                self._run_eval_with_video(episode_count)
+            self.episode_progress_callback.mark_evaled()
 
         return (loss, outputs) if return_outputs else loss
+    
+    @torch.no_grad()
+    def _run_eval_with_video(self, episode_count: int, num_samples: int = 4):
+        """Run evaluation and generate ground truth vs prediction comparison video."""
+        import random
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+        
+        if self.eval_dataset is None or len(self.eval_dataset) == 0:
+            logger.warning("No eval dataset provided, skipping video generation")
+            return
+        
+        # Create output directory
+        eval_dir = os.path.join(self.args.output_dir, "eval_videos")
+        os.makedirs(eval_dir, exist_ok=True)
+        
+        # Sample random indices
+        indices = random.sample(range(len(self.eval_dataset)), min(num_samples, len(self.eval_dataset)))
+        
+        self.policy.eval()
+        frames_list = []  # List of (gt_frames, pred_frames) tuples
+        
+        for idx in indices:
+            sample = self.eval_dataset[idx]
+            
+            # Prepare batch (add batch dimension)
+            batch = {}
+            for key, value in sample.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.unsqueeze(0).to(self.args.device)
+                else:
+                    batch[key] = value
+            
+            # Apply image transforms if needed
+            if self.image_transforms is not None:
+                for key, value in batch.items():
+                    if "history" in key or "mask" in key:
+                        continue
+                    if key.startswith("observation.images"):
+                        batch[key] = self.image_transforms(value)
+            
+            # Get model predictions
+            try:
+                outputs = self.policy.forward_with_world_model(
+                    batch,
+                    cur_n_obs_img_steps=self.cur_n_obs_img_steps,
+                    cur_n_pred_img_steps=self.cur_n_pred_img_steps,
+                    train_gen_expert_only=True,
+                    gen_out_loss_ratio=1.0,
+                    return_images=True,  # Request image outputs for visualization
+                )
+                
+                # Get ground truth and predicted images
+                # Assuming wm_pred_img and wm_gt_img are in outputs
+                if 'wm_pred_img' in outputs and 'wm_gt_img' in outputs:
+                    pred_img = outputs['wm_pred_img']  # [B, T, C, H, W] or [B, C, H, W]
+                    gt_img = outputs['wm_gt_img']
+                    frames_list.append((gt_img.cpu(), pred_img.cpu()))
+            except Exception as e:
+                logger.warning(f"Error during eval forward: {e}")
+                continue
+        
+        if not frames_list:
+            logger.warning("No frames generated for video")
+            return
+        
+        # Create comparison video
+        video_path = os.path.join(eval_dir, f"eval_episode_{episode_count}.mp4")
+        self._create_comparison_video(frames_list, video_path)
+        logger.info(f"Saved evaluation video to {video_path}")
+        
+        self.policy.train()
+    
+    def _create_comparison_video(self, frames_list, output_path: str, fps: int = 5):
+        """Create side-by-side comparison video of ground truth and predictions."""
+        try:
+            import cv2
+            import numpy as np
+            
+            all_frames = []
+            
+            for gt_tensor, pred_tensor in frames_list:
+                # Handle different tensor shapes
+                if gt_tensor.dim() == 5:  # [B, T, C, H, W]
+                    gt_tensor = gt_tensor[0]  # [T, C, H, W]
+                    pred_tensor = pred_tensor[0]
+                elif gt_tensor.dim() == 4:  # [B, C, H, W]
+                    gt_tensor = gt_tensor.unsqueeze(0)  # [1, C, H, W]
+                    pred_tensor = pred_tensor.unsqueeze(0)
+                
+                for t in range(gt_tensor.shape[0]):
+                    gt_frame = gt_tensor[t]  # [C, H, W]
+                    pred_frame = pred_tensor[t]
+                    
+                    # Convert to numpy and denormalize
+                    gt_np = gt_frame.permute(1, 2, 0).numpy()  # [H, W, C]
+                    pred_np = pred_frame.permute(1, 2, 0).numpy()
+                    
+                    # Normalize to 0-255 range
+                    gt_np = ((gt_np - gt_np.min()) / (gt_np.max() - gt_np.min() + 1e-8) * 255).astype(np.uint8)
+                    pred_np = ((pred_np - pred_np.min()) / (pred_np.max() - pred_np.min() + 1e-8) * 255).astype(np.uint8)
+                    
+                    # Add labels
+                    gt_labeled = cv2.putText(gt_np.copy(), "GT", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    pred_labeled = cv2.putText(pred_np.copy(), "Pred", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    
+                    # Concatenate side by side
+                    combined = np.concatenate([gt_labeled, pred_labeled], axis=1)
+                    all_frames.append(combined)
+            
+            if not all_frames:
+                return
+            
+            # Write video
+            h, w = all_frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            
+            for frame in all_frames:
+                # Convert RGB to BGR for OpenCV
+                if frame.shape[-1] == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                writer.write(frame)
+            
+            writer.release()
+            
+        except ImportError:
+            logger.warning("cv2 not available, skipping video generation. Install with: pip install opencv-python")
+        except Exception as e:
+            logger.warning(f"Error creating video: {e}")
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.

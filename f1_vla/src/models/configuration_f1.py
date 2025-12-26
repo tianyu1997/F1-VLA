@@ -46,6 +46,8 @@ class F1Config(PretrainedConfig):
         # Memory configuration
         use_memory=False,  # Memory switch: if False, behavior unchanged
         memory_config=None,  # Memory module configuration
+        # Multi-camera configuration
+        camera_config=None,  # Camera settings for multi-camera support
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -65,15 +67,37 @@ class F1Config(PretrainedConfig):
 
         self.num_steps = 10
 
+        # Camera configuration for multi-camera support
+        if camera_config is None:
+            camera_config = {}
+        und_camera_keys = camera_config.get("und_camera_keys", ["head_rgb", "wrist_rgb"])
+        wm_camera_key = camera_config.get("wm_camera_key", "head_rgb")
+        
+        # Convert to native Python types (omegaconf ListConfig -> list)
+        if hasattr(und_camera_keys, '_content'):  # OmegaConf ListConfig
+            und_camera_keys = list(und_camera_keys)
+        wm_camera_idx = und_camera_keys.index(wm_camera_key) if wm_camera_key in und_camera_keys else 0
+        
+        # Auto-generate observation image keys from camera list
+        # World model always uses image0 naming (dataset convention)
+        self.camera_config = DictWithAttrAccess({
+            "und_camera_keys": list(und_camera_keys),  # Ensure plain list
+            "wm_camera_key": str(wm_camera_key),
+            "wm_camera_idx": int(wm_camera_idx),
+            "understanding_image_keys": [f"observation.images.image{i}" for i in range(len(und_camera_keys))],
+            "world_model_input_key": "observation.images.image0_history",
+            "world_model_target_key": "observation.images.image0_target",
+        })
+
         # Memory configuration
         self.use_memory = use_memory
         if memory_config is None:
             memory_config = {}
         self.memory_config = DictWithAttrAccess({
-            "memory_len": memory_config.get("memory_len", 4),  # Number of memory slots
-            "bptt_steps": memory_config.get("bptt_steps", 8),  # BPTT truncation length
-            "init_std": memory_config.get("init_std", 0.02),  # Init std for memory params
-            "tokenizer_max_length": memory_config.get("tokenizer_max_length", 512),  # Extended tokenizer length for history
+            "memory_len": int(memory_config.get("memory_len", 4)),  # Number of memory slots
+            "bptt_steps": int(memory_config.get("bptt_steps", 8)),  # BPTT truncation length
+            "init_std": float(memory_config.get("init_std", 0.02)),  # Init std for memory params
+            "tokenizer_max_length": int(memory_config.get("tokenizer_max_length", 512)),  # Extended tokenizer length for history
         })
 
         self.und_expert_config = und_expert_config

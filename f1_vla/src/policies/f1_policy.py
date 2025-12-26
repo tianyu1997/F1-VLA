@@ -134,6 +134,7 @@ class F1_VLA(nn.Module):
             (None, None, False) if memory disabled
             
         Note: memory_kv is detached when should_detach=True for BPTT.
+              With per-sample detach, we detach if ANY sample needs detach.
         """
         if not self.config.use_memory or self.model.memory_manager is None:
             return None, None, False
@@ -141,7 +142,11 @@ class F1_VLA(nn.Module):
         device = batch["observation.state"].device
         dtype = next(self.model.parameters()).dtype
         
-        memory_kv, memory_token, should_detach = self.model.memory_manager.process_batch(batch, device, dtype)
+        memory_kv, memory_token, should_detach_list = self.model.memory_manager.process_batch(batch, device, dtype)
+        
+        # Detach if ANY sample needs detach (conservative for BPTT correctness)
+        # This may detach more than necessary, but ensures gradient flow is correct
+        should_detach = any(should_detach_list)
         
         # Detach memory for BPTT truncation
         if should_detach and memory_kv is not None:
@@ -171,7 +176,8 @@ class F1_VLA(nn.Module):
         cur_n_obs_img_steps: int | None = None, 
         cur_n_pred_img_steps: int | None = None,  
         train_gen_expert_only: bool = False, 
-        gen_out_loss_ratio: float = 0.1
+        gen_out_loss_ratio: float = 0.1,
+        return_images: bool = False,  # Return gt/pred images for eval visualization
     ) -> dict[str, Tensor]:
 
         #########################################################
@@ -221,6 +227,20 @@ class F1_VLA(nn.Module):
         if train_gen_expert_only:
             loss_dict["loss"] = gen_loss
             loss_dict["wm_loss"] = gen_loss
+            
+            # Generate images for eval visualization if requested (for gen_expert_only mode)
+            if return_images:
+                # Get predicted indices from logits
+                pred_indices = gen_logits.argmax(dim=-1)  # [B, gen_token_len]
+                
+                # Decode ground truth images
+                gt_images = self._decode_indices_to_images(gt_world_model_indices, B, cur_n_pred_img_steps)
+                # Decode predicted images
+                pred_images = self._decode_indices_to_images(pred_indices, B, cur_n_pred_img_steps)
+                
+                loss_dict["wm_gt_img"] = gt_images
+                loss_dict["wm_pred_img"] = pred_images
+            
             return loss_dict
 
         loss_dict["action_losses_after_forward"] = action_losses.clone()
@@ -258,18 +278,86 @@ class F1_VLA(nn.Module):
                         frame_indices[b].item()
                     )
 
+        #########################################################
+        # Generate images for eval visualization if requested
+        #########################################################
+        if return_images:
+            # Get predicted indices from logits
+            pred_indices = gen_logits.argmax(dim=-1)  # [B, gen_token_len]
+            
+            # Decode ground truth images
+            gt_images = self._decode_indices_to_images(gt_world_model_indices, B, cur_n_pred_img_steps)
+            # Decode predicted images
+            pred_images = self._decode_indices_to_images(pred_indices, B, cur_n_pred_img_steps)
+            
+            loss_dict["wm_gt_img"] = gt_images
+            loss_dict["wm_pred_img"] = pred_images
+
         return loss_dict
+    
+    def _decode_indices_to_images(self, indices: Tensor, batch_size: int, num_frames: int) -> Tensor:
+        """Decode VAE indices back to images.
+        
+        Args:
+            indices: [B, num_tokens] VAE token indices where num_tokens = tokens_per_frame * num_frames
+            batch_size: Batch size
+            num_frames: Number of frames to decode
+            
+        Returns:
+            images: [B, T, C, H, W] decoded images (256x256)
+        """
+        try:
+            # VAE uses multi-scale patches: v_patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+            # tokens_per_scale = [1, 4, 9, 16, 25, 36, 64, 100, 169, 256] = 680 total per frame
+            v_patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+            tokens_per_scale = [pn**2 for pn in v_patch_nums]
+            tokens_per_frame = sum(tokens_per_scale)  # 680
+            
+            # Reshape indices for each frame: [B, T*680] -> [B*T, 680]
+            indices = indices.view(batch_size * num_frames, tokens_per_frame)
+            
+            # Split into multi-scale list for idxBl_to_img
+            # idxBl_to_img expects: List[Tensor] where each tensor is [B, l] and l = pn^2
+            ms_idx_Bl = []
+            start_idx = 0
+            for num_tokens in tokens_per_scale:
+                ms_idx_Bl.append(indices[:, start_idx:start_idx + num_tokens])
+                start_idx += num_tokens
+            
+            # Decode using VAE
+            with torch.no_grad():
+                # idxBl_to_img returns [B*T, C, H, W] when same_shape=True, last_one=True
+                images = self.model.vae.idxBl_to_img(ms_idx_Bl, same_shape=True, last_one=True)
+            
+            # Reshape to [B, T, C, H, W]
+            # Output is 256x256 (16x16 patches * 16 = 256)
+            if images.dim() == 4:  # [B*T, C, H, W]
+                images = images.view(batch_size, num_frames, *images.shape[1:])
+            
+            # Convert from [-1, 1] to [0, 1] range
+            images = (images + 1) / 2
+            
+            return images
+        except Exception as e:
+            logger.warning(f"Error decoding indices to images: {e}")
+            import traceback
+            traceback.print_exc()
+            return torch.zeros(batch_size, num_frames, 3, 256, 256, device=indices.device)
 
     def prepare_mix_images(self, batch):
         images = []
         image_masks = []
 
-        # Hack
-        img_keys = [
-            "observation.images.image0",
-            "observation.images.image1",
-            "observation.images.image2",
-        ]
+        # Use camera config if available, otherwise fall back to default keys
+        if hasattr(self.config, 'camera_config') and self.config.camera_config:
+            img_keys = self.config.camera_config.get('understanding_image_keys', 
+                ["observation.images.image0", "observation.images.image1"])
+        else:
+            img_keys = [
+                "observation.images.image0",
+                "observation.images.image1",
+                "observation.images.image2",
+            ]
 
         for key in img_keys:
             if key not in batch:
@@ -304,17 +392,28 @@ class F1_VLA(nn.Module):
         return images, image_masks
 
     def prepare_mix_history_images(self, batch):
-        images = []
-        img_keys = ["observation.images.image0_history"]
+        """Prepare history images + target images for world model training."""
+        # Use camera config if available
+        if hasattr(self.config, 'camera_config') and self.config.camera_config:
+            wm_input_key = self.config.camera_config.get('world_model_input_key', 
+                "observation.images.image0_history")
+            wm_target_key = self.config.camera_config.get('world_model_target_key',
+                "observation.images.image0_target")
+        else:
+            wm_input_key = "observation.images.image0_history"
+            wm_target_key = "observation.images.image0_target"
+        
+        # Get history images (n_obs_img_steps frames)
+        hist_img = batch[wm_input_key]  # (B, n_obs, C, H, W)
+        
+        # Get target images (n_pred_img_steps frames)
+        target_img = batch[wm_target_key]  # (B, n_pred, C, H, W)
+        
+        # Concatenate history and target along time dimension
+        # Result: (B, n_obs + n_pred, C, H, W)
+        combined = torch.cat([hist_img, target_img], dim=1)
 
-        # Preprocess image features present in the batch
-        for key in img_keys:
-            hist_img = batch[key]
-
-            # assert len(hist_img.shape) == 5
-            images.append(hist_img)
-
-        return images[0]
+        return combined
 
     def _format_history_text(self, batch) -> List[str]:
         """
@@ -351,7 +450,7 @@ class F1_VLA(nn.Module):
                     state_strs.append(f"s{t-n_steps+1}:[{vals_str}]")
                 parts.append("state:" + " ".join(state_strs))
             
-            # Action history: (n_obs_img_steps-1, action_dim)
+            # Action history: (n_obs_img_steps, action_dim) - now aligned with state_history
             if has_action_history:
                 action_hist = batch["action_history"][b]  # (n_steps, dim)
                 if action_hist.numel() > 0:
@@ -363,7 +462,8 @@ class F1_VLA(nn.Module):
                         vals_str = ",".join([f"{v:.2f}" for v in vals[:8]])
                         if len(vals) > 8:
                             vals_str += "..."
-                        action_strs.append(f"a{t-n_steps}:[{vals_str}]")
+                        # Use same indexing as state: t-n_steps+1 means a{t-3}, a{t-2}, a{t-1}, a{0}
+                        action_strs.append(f"a{t-n_steps+1}:[{vals_str}]")
                     parts.append("action:" + " ".join(action_strs))
             
             if parts:

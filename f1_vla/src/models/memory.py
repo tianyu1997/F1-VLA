@@ -429,7 +429,7 @@ class MemoryManager:
         batch: Dict[str, Any],
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, bool]:
+    ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, List[bool]]:
         """
         Process batch to get previous memory and memory token.
         
@@ -441,7 +441,7 @@ class MemoryManager:
         Returns:
             - previous_memory: Memory state for this batch
             - memory_token: Token to append to input
-            - should_detach: Whether to detach gradients
+            - should_detach_list: List of per-sample detach flags
         """
         dataset_indices = batch["dataset_idx"]
         episode_indices = batch["episode_idx"]
@@ -457,15 +457,18 @@ class MemoryManager:
         # Get memory token
         memory_token = self.memory_bank.get_memory_token(batch_size, device, dtype)
         
-        # Determine if we should detach (check first sample as proxy)
-        # In sequential batching, all samples in batch have same frame_idx
-        should_detach = self.should_detach(
-            dataset_indices[0].item(),
-            episode_indices[0].item(),
-            frame_indices[0].item()
-        )
+        # Determine detach flag for EACH sample in batch
+        # Different samples may have different frame_idx or bptt step counts
+        should_detach_list = []
+        for b in range(batch_size):
+            should_detach = self.should_detach(
+                dataset_indices[b].item(),
+                episode_indices[b].item(),
+                frame_indices[b].item()
+            )
+            should_detach_list.append(should_detach)
         
-        return previous_memory, memory_token, should_detach
+        return previous_memory, memory_token, should_detach_list
     
     def store_updated_memory(
         self,

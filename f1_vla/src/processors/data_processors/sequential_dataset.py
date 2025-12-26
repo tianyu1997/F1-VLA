@@ -26,81 +26,143 @@ class SequentialMEKVMDataset(Dataset):
     1. Returns (dataset_idx, episode_idx, frame_idx) for memory management
     2. Episodes are processed sequentially within batches
     3. Designed for BPTT training with memory
+    4. Supports multiple data directories
+    5. Supports distributed training - each rank loads only its portion
+    6. Supports configurable multi-camera input
     """
     
     def __init__(
         self,
-        data_dir: str,
+        data_dirs: List[str],
         dataset_idx: int = 0,
         n_obs_img_steps: int = 4,
         n_pred_img_steps: int = 1,
         chunk_size: int = 4,
-        task_description: str = "perform the task",
+        task_descriptions: Optional[List[str]] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        camera_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Args:
-            data_dir: Directory containing episode_*.pt files
+            data_dirs: List of directories containing episode_*.pt files
             dataset_idx: Index of this dataset (for multi-dataset setup)
             n_obs_img_steps: Number of observation image steps (history)
             n_pred_img_steps: Number of prediction image steps
             chunk_size: Action chunk size
-            task_description: Default task description
+            task_descriptions: Task descriptions for each data directory
+            rank: Current process rank for distributed training
+            world_size: Total number of processes
+            camera_config: Camera configuration dict with keys:
+                - mekvm_camera_keys: list of camera keys in ME_KVM format (e.g., ["head_rgb", "wrist_rgb"])
+                - world_model_camera: camera key for world model (e.g., "head_rgb")
         """
-        self.data_dir = data_dir
+        if isinstance(data_dirs, str):
+            data_dirs = [data_dirs]
+        
+        self.data_dirs = data_dirs
         self.dataset_idx = dataset_idx
         self.n_obs_img_steps = n_obs_img_steps
         self.n_pred_img_steps = n_pred_img_steps
         self.chunk_size = chunk_size
-        self.task_description = task_description
+        self.rank = rank
+        self.world_size = world_size
         
-        # Find all episode files
-        self.episode_files = sorted(glob.glob(os.path.join(data_dir, "episode_*.pt")))
-        if not self.episode_files:
-            raise ValueError(f"No episode files found in {data_dir}")
+        # Camera configuration
+        if camera_config is None:
+            camera_config = {}
+        self.camera_keys = camera_config.get("und_camera_keys", ["head_rgb", "wrist_rgb"])
+        self.world_model_camera = camera_config.get("wm_camera_key", "head_rgb")
         
-        # Load or build episode length index
-        cache_file = os.path.join(data_dir, ".mekvm_index_cache.json")
-        if os.path.exists(cache_file):
-            print(f"Loading cached index from {cache_file}...")
-            with open(cache_file, 'r') as f:
-                cache = json.load(f)
-            self._episode_lengths = cache['episode_lengths']
-            if len(self._episode_lengths) != len(self.episode_files):
-                print("Cache invalid, re-indexing...")
-                self._build_index(cache_file)
-        else:
-            self._build_index(cache_file)
+        if task_descriptions is None:
+            task_descriptions = ["perform the task"] * len(data_dirs)
+        self.task_descriptions = task_descriptions
         
-        # Build sample index: (episode_idx, frame_idx)
-        # For sequential dataset, we keep track of valid frame ranges
+        # Find all episode files from all directories (just paths, no loading)
+        all_episode_files = []
+        all_episode_dir_idx = []
+        
+        for dir_idx, data_dir in enumerate(data_dirs):
+            ep_files = sorted(glob.glob(os.path.join(data_dir, "episode_*.pt")))
+            if not ep_files:
+                print(f"Warning: No episode files found in {data_dir}")
+                continue
+            for ep_file in ep_files:
+                all_episode_files.append(ep_file)
+                all_episode_dir_idx.append(dir_idx)
+        
+        if not all_episode_files:
+            raise ValueError(f"No episode files found in any of: {data_dirs}")
+        
+        total_episodes = len(all_episode_files)
+        
+        # Distribute episodes across ranks - each rank gets a subset
+        self.episode_files = []
+        self.episode_dir_idx = []
+        self.global_episode_idx = []  # Map local idx -> global idx
+        
+        for global_idx in range(total_episodes):
+            if global_idx % world_size == rank:
+                self.episode_files.append(all_episode_files[global_idx])
+                self.episode_dir_idx.append(all_episode_dir_idx[global_idx])
+                self.global_episode_idx.append(global_idx)
+        
+        if world_size > 1:
+            print(f"[Rank {rank}] Assigned {len(self.episode_files)}/{total_episodes} episodes")
+        
+        # Load episode lengths only for this rank's episodes
+        self._episode_lengths = self._load_episode_lengths()
+        
+        # Build sample index: (local_episode_idx, frame_idx)
         self.sample_index = []
-        for ep_idx, num_steps in enumerate(self._episode_lengths):
-            # Valid frames: need n_obs_img_steps-1 history and chunk_size future
+        for local_ep_idx, num_steps in enumerate(self._episode_lengths):
             for frame_idx in range(n_obs_img_steps - 1, num_steps - chunk_size):
-                self.sample_index.append((ep_idx, frame_idx))
+                self.sample_index.append((local_ep_idx, frame_idx))
         
         # Episode cache (LRU style)
         self._cache = {}
         self._cache_max_size = 10
         
-        print(f"SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
+        print(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
     
-    def _build_index(self, cache_file: str):
-        """Build and cache episode lengths"""
-        self._episode_lengths = []
-        print(f"Indexing {len(self.episode_files)} episodes from {self.data_dir}...")
+    def _load_episode_lengths(self) -> List[int]:
+        """Load episode lengths for this rank's episodes, using cache when possible"""
+        episode_lengths = []
         
-        for ep_idx, ep_file in enumerate(self.episode_files):
-            if (ep_idx + 1) % 100 == 0:
-                print(f"  Indexed {ep_idx + 1}/{len(self.episode_files)} episodes...")
+        # Group episodes by directory for efficient cache loading
+        dir_caches = {}
+        for dir_idx, data_dir in enumerate(self.data_dirs):
+            cache_file = os.path.join(data_dir, ".mekvm_index_cache.json")
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    dir_caches[data_dir] = json.load(f)['episode_lengths']
+            else:
+                dir_caches[data_dir] = None
+        
+        for local_idx, ep_file in enumerate(self.episode_files):
+            dir_idx = self.episode_dir_idx[local_idx]
+            data_dir = self.data_dirs[dir_idx]
+            
+            # Try to get from cache
+            cache = dir_caches.get(data_dir)
+            if cache is not None:
+                # Extract episode number from filename
+                ep_num = int(os.path.basename(ep_file).split('_')[1].split('.')[0])
+                if ep_num < len(cache):
+                    episode_lengths.append(cache[ep_num])
+                    continue
+            
+            # Fallback: load the episode to get length
             episode = torch.load(ep_file, weights_only=False)
-            self._episode_lengths.append(len(episode))
+            episode_lengths.append(len(episode))
             del episode
         
-        print(f"Saving index cache to {cache_file}...")
-        cache = {'episode_lengths': self._episode_lengths}
-        with open(cache_file, 'w') as f:
-            json.dump(cache, f)
+        return episode_lengths
+    
+    def _get_task_description(self, ep_idx: int) -> str:
+        """Get task description for episode"""
+        dir_idx = self.episode_dir_idx[ep_idx]
+        return self.task_descriptions[dir_idx]
     
     def _load_episode(self, ep_idx: int):
         """Load episode with caching"""
@@ -140,8 +202,9 @@ class SequentialMEKVMDataset(Dataset):
         Get a single frame with all necessary data.
         
         Returns dict with:
-            - observation.images.image0: current frame
-            - observation.images.image0_history: history + prediction frames
+            - observation.images.image{i}: current frame for each camera
+            - observation.images.image{i}_history: history frames for each camera
+            - observation.images.image0_history: history + prediction frames for WM
             - observation.state: state vector
             - observation.state_history: state history (n_obs_img_steps)
             - action: action chunk
@@ -153,41 +216,48 @@ class SequentialMEKVMDataset(Dataset):
         episode = self._load_episode(ep_idx)
         obs = episode[frame_idx]['obs']
         
-        # Images - convert and resize
-        head_rgb = torch.from_numpy(obs['head_rgb']).float() / 255.0
-        wrist_rgb = torch.from_numpy(obs['wrist_rgb']).float() / 255.0
-        head_rgb = self._resize_to_256(head_rgb)
-        wrist_rgb = self._resize_to_256(wrist_rgb)
+        # Process all configured cameras
+        camera_images = {}  # camera_key -> (history_tensor, current_frame)
+        for cam_key in self.camera_keys:
+            if cam_key in obs:
+                cam_data = torch.from_numpy(obs[cam_key]).float() / 255.0
+                cam_data = self._resize_to_256(cam_data)
+                camera_images[cam_key] = cam_data
+        
+        # Get world model camera images (for history + prediction)
+        wm_cam_key = self.world_model_camera
+        if wm_cam_key not in camera_images:
+            # Fallback to first available camera
+            wm_cam_key = self.camera_keys[0] if self.camera_keys else "head_rgb"
+        wm_history = camera_images.get(wm_cam_key, torch.zeros(self.n_obs_img_steps, 3, 256, 256))
         
         # Current state
         state = torch.from_numpy(obs['state']).float()
         
         # State history - aligned with image history (n_obs_img_steps frames)
-        # Image history has n_obs_img_steps frames, state history should match
         state_history = []
         for i in range(self.n_obs_img_steps):
             hist_frame_idx = frame_idx - (self.n_obs_img_steps - 1 - i)
             if hist_frame_idx < 0:
-                # Pad with first available state
                 hist_state = torch.from_numpy(episode[0]['obs']['state']).float()
             else:
                 hist_state = torch.from_numpy(episode[hist_frame_idx]['obs']['state']).float()
             state_history.append(hist_state)
         state_history = torch.stack(state_history)  # (n_obs_img_steps, state_dim)
         
-        # Action history - previous n_obs_img_steps-1 actions (before current frame)
-        # Note: we use n_obs_img_steps-1 because at timestep t, we have t-1 previous actions
-        action_dim = len(episode[0]['action'])  # action is a list
+        # Action history - n_obs_img_steps actions aligned with state_history (a_{t-n+1}, ..., a_{t-1}, a_t)
+        # This mirrors state_history so both have same temporal alignment
+        # a_t is needed because we predict image at t+1 after executing action a_t
+        action_dim = len(episode[0]['action'])
         action_history = []
-        for i in range(self.n_obs_img_steps - 1):
+        for i in range(self.n_obs_img_steps):
             hist_frame_idx = frame_idx - (self.n_obs_img_steps - 1 - i)
-            if hist_frame_idx <= 0:
-                # Pad with zeros for first frame
+            if hist_frame_idx < 0:
                 hist_action = torch.zeros(action_dim, dtype=torch.float32)
             else:
-                hist_action = torch.tensor(episode[hist_frame_idx - 1]['action'], dtype=torch.float32)
+                hist_action = torch.tensor(episode[hist_frame_idx]['action'], dtype=torch.float32)
             action_history.append(hist_action)
-        action_history = torch.stack(action_history) if action_history else torch.zeros(0, action_dim)  # (n_obs_img_steps-1, action_dim)
+        action_history = torch.stack(action_history)  # (n_obs_img_steps, action_dim)
         
         # Future actions - get chunk_size future actions
         actions = []
@@ -201,50 +271,60 @@ class SequentialMEKVMDataset(Dataset):
         actions = torch.tensor(actions, dtype=torch.float32)
         action_is_pad = torch.zeros(self.chunk_size, dtype=torch.bool)
         
-        # Prediction images for world model
+        # Prediction images for world model (from world_model_camera)
         pred_images = []
         for i in range(self.n_pred_img_steps):
             next_step = min(frame_idx + 1 + i, len(episode) - 1)
             next_obs = episode[next_step]['obs']
-            next_img = torch.from_numpy(next_obs['head_rgb'][-1]).float() / 255.0
+            if wm_cam_key in next_obs:
+                next_img = torch.from_numpy(next_obs[wm_cam_key][-1]).float() / 255.0
+            else:
+                next_img = torch.from_numpy(next_obs['head_rgb'][-1]).float() / 255.0
             next_img = self._resize_to_256(next_img)
             pred_images.append(next_img)
         pred_images = torch.stack(pred_images)
         
         # Combine history and prediction for world model
-        history_and_pred = torch.cat([head_rgb, pred_images], dim=0)
+        history_and_pred = torch.cat([wm_history, pred_images], dim=0)
         
+        # Build sample dict with all cameras
         sample = {
-            # Main observation image
-            "observation.images.image0": head_rgb[-1],
-            "observation.images.image0_mask": torch.tensor(True),  # Valid image
-            # History + prediction images for world model
-            "observation.images.image0_history": history_and_pred,
-            # Wrist camera
-            "observation.images.image1": wrist_rgb[-1],
-            "observation.images.image1_mask": torch.tensor(True),  # Valid image
-            "observation.images.image1_history": wrist_rgb,
-            # Empty image2 slot (for compatibility)
-            "observation.images.image2": torch.zeros_like(head_rgb[-1]),
-            "observation.images.image2_mask": torch.tensor(False),  # Invalid/empty
             # State
             "observation.state": state,
-            # State history (n_obs_img_steps, state_dim)
             "observation.state_history": state_history,
             # Actions
             "action": actions,
             "action_is_pad": action_is_pad,
-            # Action history (n_obs_img_steps-1, action_dim)
             "action_history": action_history,
             # Task
-            "task": self.task_description,
-            # Prediction target
+            "task": self._get_task_description(ep_idx),
+            # World model specific (always use image0 naming for WM)
+            "observation.images.image0_history": history_and_pred,
             "observation.images.image0_target": pred_images,
             # Memory indices
             "dataset_idx": torch.tensor(self.dataset_idx, dtype=torch.int64),
-            "episode_idx": torch.tensor(ep_idx, dtype=torch.int64),
+            "episode_idx": torch.tensor(self.global_episode_idx[ep_idx], dtype=torch.int64),
             "frame_idx": torch.tensor(frame_idx, dtype=torch.int64),
         }
+        
+        # Add each camera's images with standard naming
+        for i, cam_key in enumerate(self.camera_keys):
+            if cam_key in camera_images:
+                cam_data = camera_images[cam_key]
+                sample[f"observation.images.image{i}"] = cam_data[-1]  # Current frame
+                sample[f"observation.images.image{i}_mask"] = torch.tensor(True)
+                sample[f"observation.images.image{i}_history"] = cam_data  # All history frames
+            else:
+                # Empty placeholder
+                sample[f"observation.images.image{i}"] = torch.zeros(3, 256, 256)
+                sample[f"observation.images.image{i}_mask"] = torch.tensor(False)
+                sample[f"observation.images.image{i}_history"] = torch.zeros(self.n_obs_img_steps, 3, 256, 256)
+        
+        # Add empty image2 slot for compatibility if only 2 cameras
+        if len(self.camera_keys) < 3:
+            for i in range(len(self.camera_keys), 3):
+                sample[f"observation.images.image{i}"] = torch.zeros(3, 256, 256)
+                sample[f"observation.images.image{i}_mask"] = torch.tensor(False)
         
         return sample
     
@@ -258,11 +338,12 @@ class SequentialMEKVMDataset(Dataset):
 
 class SequentialBatchSampler(Sampler):
     """
-    Sampler for sequential episode processing.
+    Sampler for sequential episode processing with distributed training support.
     
     - Shuffles episode order (not frame order within episodes)
     - Yields batches of parallel episodes at the same timestep
     - Handles variable episode lengths
+    - Supports distributed training: each rank gets a subset of episodes
     
     Yields: List of global indices into the dataset
     """
@@ -273,11 +354,15 @@ class SequentialBatchSampler(Sampler):
         batch_size: int,
         shuffle_episodes: bool = True,
         drop_last: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle_episodes = shuffle_episodes
         self.drop_last = drop_last
+        self.rank = rank
+        self.world_size = world_size
         
         # Build episode to sample mapping
         # episode_samples[ep_idx] = list of global sample indices for that episode
@@ -289,6 +374,17 @@ class SequentialBatchSampler(Sampler):
         
         self.num_episodes = len(self.episode_samples)
         self.episode_ids = list(self.episode_samples.keys())
+        
+        # Distribute episodes across ranks
+        # Each rank gets every world_size-th episode
+        self.local_episode_ids = [
+            ep_id for i, ep_id in enumerate(self.episode_ids)
+            if i % self.world_size == self.rank
+        ]
+        self.local_num_episodes = len(self.local_episode_ids)
+        
+        if self.world_size > 1:
+            print(f"[Rank {self.rank}] SequentialBatchSampler: {self.local_num_episodes}/{self.num_episodes} episodes assigned to this rank")
     
     def __iter__(self) -> Iterator[List[int]]:
         """
@@ -298,14 +394,14 @@ class SequentialBatchSampler(Sampler):
         - Episodes are processed in parallel
         - Frames within episodes are sequential
         """
-        # Optionally shuffle episode order
-        episode_order = self.episode_ids.copy()
+        # Optionally shuffle episode order (use same seed across ranks for consistency)
+        episode_order = self.local_episode_ids.copy()
         if self.shuffle_episodes:
             random.shuffle(episode_order)
         
         # Process episodes in batches
-        for batch_start in range(0, self.num_episodes, self.batch_size):
-            batch_end = min(batch_start + self.batch_size, self.num_episodes)
+        for batch_start in range(0, self.local_num_episodes, self.batch_size):
+            batch_end = min(batch_start + self.batch_size, self.local_num_episodes)
             batch_episodes = episode_order[batch_start:batch_end]
             
             if self.drop_last and len(batch_episodes) < self.batch_size:
@@ -326,8 +422,8 @@ class SequentialBatchSampler(Sampler):
                     yield batch_indices
     
     def __len__(self) -> int:
-        # Total number of batches (approximate)
-        return len(self.dataset) // self.batch_size
+        # Total number of batches for this rank (approximate)
+        return len(self.local_episode_ids) * 40 // self.batch_size  # ~40 frames per episode
 
 
 class SequentialCollateFn:
@@ -393,8 +489,10 @@ def create_sequential_mekvm_data(
     dataset_config,
     training_args,
     stage: str,
+    rank: int = 0,
+    world_size: int = 1,
 ):
-    """Create sequential dataset for memory-based training."""
+    """Create sequential dataset for memory-based training with distributed support."""
     from lerobot.datasets.transforms import (
         ImageTransforms, ImageTransformsConfig
     )
@@ -422,17 +520,22 @@ def create_sequential_mekvm_data(
     if task_descriptions is None:
         task_descriptions = ["perform the task"] * len(data_dirs)
     
-    # Create datasets - use first one for simplicity (extend for multiple later)
-    if len(data_dirs) > 1:
-        raise NotImplementedError("Multiple data directories not yet supported for sequential")
+    # Get camera configuration from policy_config
+    camera_config = None
+    if hasattr(policy_config, 'camera_config'):
+        camera_config = dict(policy_config.camera_config)
     
+    # Create dataset with distributed support - each rank loads only its portion
     dataset = SequentialMEKVMDataset(
-        data_dir=data_dirs[0],
+        data_dirs=data_dirs,
         dataset_idx=0,
         n_obs_img_steps=n_obs_img_steps,
         n_pred_img_steps=n_pred_img_steps,
         chunk_size=chunk_size,
-        task_description=task_descriptions[0],
+        task_descriptions=task_descriptions,
+        rank=rank,
+        world_size=world_size,
+        camera_config=camera_config,
     )
     
     # Sample weights (uniform)

@@ -93,6 +93,53 @@ def set_policy_config(policy_config, src_config):
     return policy_config
 
 
+def set_camera_config(policy_config, exp_config):
+    """
+    Set camera configuration from exp config.
+    
+    Config format:
+        und_camera_keys: list of camera keys for understanding expert (PaliGemma)
+        wm_camera_key: camera key for world model prediction
+    
+    Args:
+        policy_config: The policy config to update
+        exp_config: The exp config from yaml
+    """
+    from f1_vla.src.models.configuration_f1 import DictWithAttrAccess
+    
+    if hasattr(exp_config, 'camera_config') and exp_config.camera_config:
+        cam_cfg = exp_config.camera_config
+        
+        # Get camera keys from config
+        und_camera_keys = cam_cfg.get("und_camera_keys", ["head_rgb", "wrist_rgb"])
+        wm_camera_key = cam_cfg.get("wm_camera_key", "head_rgb")
+        
+        # Convert to native Python types (omegaconf ListConfig -> list)
+        if hasattr(und_camera_keys, '_content'):  # OmegaConf ListConfig
+            und_camera_keys = list(und_camera_keys)
+        und_camera_keys = [str(k) for k in und_camera_keys]  # Ensure all are strings
+        wm_camera_key = str(wm_camera_key)
+        
+        # Find wm_camera index in und_camera_keys (for image key naming)
+        wm_camera_idx = und_camera_keys.index(wm_camera_key) if wm_camera_key in und_camera_keys else 0
+        
+        # Auto-generate observation image keys
+        understanding_image_keys = [f"observation.images.image{i}" for i in range(len(und_camera_keys))]
+        # World model always uses image0 naming (dataset convention)
+        world_model_input_key = "observation.images.image0_history"
+        world_model_target_key = "observation.images.image0_target"
+        
+        policy_config.camera_config = DictWithAttrAccess({
+            "und_camera_keys": und_camera_keys,
+            "wm_camera_key": wm_camera_key,
+            "wm_camera_idx": int(wm_camera_idx),
+            "understanding_image_keys": understanding_image_keys,
+            "world_model_input_key": world_model_input_key,
+            "world_model_target_key": world_model_target_key,
+        })
+    return policy_config
+
+
 class LargeScaleWeightedRandomSampler(Sampler):
     def __init__(
         self, 
