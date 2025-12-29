@@ -1,0 +1,152 @@
+dataset:
+  # Use ME_KVM data format
+  use_mekvm_format: True
+  mekvm_data_dirs:
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/complex_texture
+  mekvm_task_descriptions:
+    - "在赶紧环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "在复杂纹理环境中,探索环境,根据动作和状态预测下一帧观测。"
+  mekvm_weights:
+    - 1.0
+    - 1.0
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 4
+
+  # Legacy LeRobot config (not used when use_mekvm_format=True)
+  train_dir: {}
+
+  image_size:
+    height: 224
+    width: 224
+  world_model_suffix: history
+  transforms:
+    consistent_random_crop_stages:
+      - stage1_pretrain_wm
+
+exp:
+  stage: stage1_pretrain_wm
+  load_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wm_only_v2/checkpoint-episode-2516
+  
+  # Memory configuration - ENABLED
+  use_memory: True
+  memory_config:
+    memory_len: 128     # Number of memory slots per layer (increased)
+    bptt_steps: 8      # BPTT truncation length (increased)
+    tokenizer_max_length: 512
+
+  training_args:
+    output_dir: outputs/memory_wm_only_v2
+    run_name: memory_wm_only_v2
+    do_train: True
+    do_eval: False
+    num_train_epochs: 100
+    
+    # Increased batch size for better stability (was 4)
+    per_device_train_batch_size: 6
+    per_device_eval_batch_size: 1
+
+    learning_rate: !!float 5e-5
+    weight_decay: !!float 1e-10
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_epsilon: !!float 1e-8
+    lr_scheduler_type: cosine
+    
+    # Increased gradient accumulation for effective bs=24 (was 2)
+    gradient_accumulation_steps: 4
+
+    # Use num_train_epochs to control training (not max_steps)
+    # max_steps: -1 means use num_train_epochs
+    max_steps: -1
+    warmup_steps: 200
+    log_level: info
+    log_level_replica: error
+
+    seed: 42
+    bf16: True
+    # Disable step-based logging/saving (use episode-based instead)
+    logging_strategy: "no"
+    logging_steps: 999999
+    save_strategy: "no"
+    save_steps: 999999
+    eval_strategy: "no"
+    save_safetensors: True
+    disable_tqdm: True  # Use custom episode progress bar instead
+
+    save_total_limit: 3
+    overwrite_output_dir: True
+    dataloader_num_workers: 4
+    dataloader_pin_memory: False
+    dataloader_persistent_workers: True
+    dataloader_prefetch_factor: 4
+    remove_unused_columns: False
+
+    # Episode-based logging/saving/eval (instead of step-based)
+    # These override step-based settings when using memory training
+    logging_episodes: 10  # Log every N episodes
+    save_episodes: 500      # Save checkpoint every N episodes
+    eval_episodes: 500      # Run eval and generate video every N episodes
+
+    label_names: 
+      - action
+    report_to: 
+      - tensorboard
+
+    torch_compile: False
+    stage: stage1_pretrain_wm
+
+    # World Model Only Training
+    gen_out_loss_ratio: 1.0  # Full weight on WM loss
+    freeze_vision_encoder: True
+    freeze_gen_expert: False  # Train gen expert (WM)
+    train_act_expert_only: False
+    train_gen_expert_only: True  # ONLY train world model
+    train_state_proj: True
+
+    image_transforms_enabled: True
+    image_transforms_type:
+      - brightness
+      - contrast
+      - saturation
+      - random_crop
+    image_transforms_max_num_transforms: 3
+    image_transforms_random_order: True
+
+    und_expert_lr: !!float 5e-5
+    act_expert_lr: !!float 0  # Freeze action expert
+    vision_encoder_lr: !!float 0  # Freeze vision encoder
+    gen_expert_lr: !!float 5e-5  # Train gen expert
+
+  max_eval_samples: 1000
+  
+  # Camera configuration for multi-camera support
+  camera_config:
+    # Camera keys for understanding expert (PaliGemma) - all cameras
+    und_camera_keys:
+      - head_rgb
+      - wrist_rgb
+    # Camera key for world model prediction
+    wm_camera_key: wrist_rgb
+
+policy:
+  model_name: f1
+  path: /mnt/data2/ty/F1-VLA/pi0
+  ckpt_path: f1_vla/config/f1_config.json
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  mwm_pretrained_path: null
+  chunk_size: 4
+
+  use_world_model: True
+  pn: "1_2_3_4_5_6_8_10_13_16"
+  vae_ckpt: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
+
+  temporal_conv_kernel_size: 4
+  temporal_conv_stride: 4
+  vocab_size: 4096
+  vae_dim: 32
+  num_resolutions: 10
+
+  resize_imgs_with_padding: "(224, 224)"
+  attention_implementation: eager

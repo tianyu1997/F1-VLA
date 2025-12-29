@@ -181,16 +181,17 @@ class F1Config(PretrainedConfig):
             if hasattr(self.gen_expert_config, 'vae') and isinstance(self.gen_expert_config.vae, dict):
                 vae_dict = self.gen_expert_config.vae
                 self.gen_expert_config.vae = DictWithAttrAccess(vae_dict)
-
-            vae_dict = {
-                "vae_ckpt": None,
-                "vocab_size": 4096,
-                "z_channels": 32,
-                "ch": 160,
-                "test_mode": True,
-                "share_quant_resi": 4,
-            }
-            self.gen_expert_config.vae = DictWithAttrAccess(vae_dict)
+            elif not hasattr(self.gen_expert_config, 'vae'):
+                # Only set default vae_dict if vae doesn't exist
+                vae_dict = {
+                    "vae_ckpt": None,
+                    "vocab_size": 4096,
+                    "z_channels": 32,
+                    "ch": 160,
+                    "test_mode": True,
+                    "share_quant_resi": 4,
+                }
+                self.gen_expert_config.vae = DictWithAttrAccess(vae_dict)
 
         self.act_expert_config = act_expert_config
         if isinstance(self.act_expert_config, dict):

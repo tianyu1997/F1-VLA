@@ -285,6 +285,10 @@ class MEKVMCollateFn:
         batch["observation.images.image0_mask"] = torch.ones(len(items), dtype=torch.bool)
         batch["observation.images.image0_history"] = torch.stack([x["observation.images.image0_history"] for x in items])
         
+        # Target images for world model
+        if "observation.images.image0_target" in items[0]:
+            batch["observation.images.image0_target"] = torch.stack([x["observation.images.image0_target"] for x in items])
+        
         if "observation.images.image1" in items[0]:
             batch["observation.images.image1"] = torch.stack([x["observation.images.image1"] for x in items])
             batch["observation.images.image1_mask"] = torch.ones(len(items), dtype=torch.bool)

@@ -157,6 +157,7 @@ class EpisodeProgressCallback(TrainerCallback):
                         self.epoch_episode_count = self.total_episode_count % self.num_episodes
                         self.last_log_episode = self.total_episode_count
                         self.last_save_episode = self.total_episode_count
+                        self.last_eval_episode = self.total_episode_count  # Also set eval marker
                         logger.info(f"[EpisodeProgressCallback] Estimated from state: epoch={self.current_epoch}, "
                                    f"total_episodes={self.total_episode_count}")
             
@@ -269,7 +270,11 @@ class EpisodeProgressCallback(TrainerCallback):
         if self.eval_episodes <= 0:
             return False
         episodes_since_eval = self.total_episode_count - self.last_eval_episode
-        return episodes_since_eval >= self.eval_episodes
+        should = episodes_since_eval >= self.eval_episodes
+        if should:
+            logger.info(f"[EpisodeProgressCallback] should_eval=True: total={self.total_episode_count}, "
+                       f"last_eval={self.last_eval_episode}, since_eval={episodes_since_eval}, threshold={self.eval_episodes}")
+        return should
     
     def mark_logged(self):
         self.last_log_episode = self.total_episode_count
@@ -332,6 +337,7 @@ class PolicyTrainer(Trainer):
         self.sequential_sampler = sequential_sampler
         self.num_episodes = num_episodes
         self.eval_dataset = eval_dataset
+        logger.info(f"[PolicyTrainer] eval_dataset received: {eval_dataset is not None}, type: {type(eval_dataset)}")
         # TODO: make this configurable
         self.pred_img_keys = ["observation.images.image0_history"]
         assert len(self.pred_img_keys) == 1, "Only one image key is supported for now"
@@ -363,7 +369,14 @@ class PolicyTrainer(Trainer):
         self.worker_idx = int(os.environ.get("MLP_ROLE_INDEX", 0))
         self.local_rank_idx = int(os.environ.get('LOCAL_RANK', -1))
 
+        # Store eval_dataset before calling super().__init__() since Trainer may override it
+        self._custom_eval_dataset = eval_dataset
+        
         super().__init__(model=policy, callbacks=move_callbacks, *args, **kwargs)
+        
+        # Restore our custom eval_dataset after Trainer.__init__()
+        self.eval_dataset = self._custom_eval_dataset
+        logger.info(f"[PolicyTrainer] eval_dataset after init: {self.eval_dataset is not None}")
     
     
     def get_train_dataloader(self):
@@ -462,30 +475,70 @@ class PolicyTrainer(Trainer):
         
         # Episode-based evaluation with video generation
         if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_eval():
+            logger.info(f"[Eval] Triggering evaluation at episode {self.episode_progress_callback.total_episode_count}")
             if self.state.is_world_process_zero and self.eval_dataset is not None:
                 episode_count = self.episode_progress_callback.total_episode_count
-                self._run_eval_with_video(episode_count)
+                try:
+                    self._run_eval_with_video(episode_count)
+                except Exception as e:
+                    logger.warning(f"[Eval] Error during video generation: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif self.eval_dataset is None:
+                logger.warning("[Eval] eval_dataset is None, skipping video generation")
             self.episode_progress_callback.mark_evaled()
 
         return (loss, outputs) if return_outputs else loss
     
     @torch.no_grad()
     def _run_eval_with_video(self, episode_count: int, num_samples: int = 4):
-        """Run evaluation and generate ground truth vs prediction comparison video."""
+        """Run evaluation and generate ground truth vs prediction comparison video for a full episode."""
         import random
         from PIL import Image
         import torchvision.transforms.functional as TF
+        
+        logger.info(f"[Eval] Starting video generation for episode {episode_count}")
         
         if self.eval_dataset is None or len(self.eval_dataset) == 0:
             logger.warning("No eval dataset provided, skipping video generation")
             return
         
+        logger.info(f"[Eval] eval_dataset size: {len(self.eval_dataset)}")
+        
         # Create output directory
         eval_dir = os.path.join(self.args.output_dir, "eval_videos")
         os.makedirs(eval_dir, exist_ok=True)
+        logger.info(f"[Eval] Output directory: {eval_dir}")
         
-        # Sample random indices
-        indices = random.sample(range(len(self.eval_dataset)), min(num_samples, len(self.eval_dataset)))
+        # Sample ALL frames from ONE complete episode
+        total_samples = len(self.eval_dataset)
+        
+        # Pick a random starting point and find which episode it belongs to
+        random_idx = random.randint(0, total_samples - 1)
+        sample = self.eval_dataset[random_idx]
+        target_episode = sample['episode_idx'].item() if isinstance(sample['episode_idx'], torch.Tensor) else sample['episode_idx']
+        
+        # Search backwards to find episode start
+        start_idx = random_idx
+        while start_idx > 0:
+            prev_sample = self.eval_dataset[start_idx - 1]
+            prev_episode = prev_sample['episode_idx'].item() if isinstance(prev_sample['episode_idx'], torch.Tensor) else prev_sample['episode_idx']
+            if prev_episode != target_episode:
+                break
+            start_idx -= 1
+        
+        # Search forwards to find episode end
+        end_idx = random_idx
+        while end_idx < total_samples - 1:
+            next_sample = self.eval_dataset[end_idx + 1]
+            next_episode = next_sample['episode_idx'].item() if isinstance(next_sample['episode_idx'], torch.Tensor) else next_sample['episode_idx']
+            if next_episode != target_episode:
+                break
+            end_idx += 1
+        
+        # Get all indices for this episode
+        indices = list(range(start_idx, end_idx + 1))
+        logger.info(f"[Eval] Sampling full episode {target_episode}: {len(indices)} frames (indices {start_idx} to {end_idx})")
         
         self.policy.eval()
         frames_list = []  # List of (gt_frames, pred_frames) tuples
@@ -493,13 +546,22 @@ class PolicyTrainer(Trainer):
         for idx in indices:
             sample = self.eval_dataset[idx]
             
-            # Prepare batch (add batch dimension)
-            batch = {}
-            for key, value in sample.items():
+            # Use data_collator to properly batch the sample (handles tokenization etc.)
+            if self.data_collator is not None:
+                batch = self.data_collator([sample])
+            else:
+                # Fallback: manual batching
+                batch = {}
+                for key, value in sample.items():
+                    if isinstance(value, torch.Tensor):
+                        batch[key] = value.unsqueeze(0)
+                    else:
+                        batch[key] = [value]
+            
+            # Move to device
+            for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
-                    batch[key] = value.unsqueeze(0).to(self.args.device)
-                else:
-                    batch[key] = value
+                    batch[key] = value.to(self.args.device)
             
             # Apply image transforms if needed
             if self.image_transforms is not None:
@@ -511,6 +573,7 @@ class PolicyTrainer(Trainer):
             
             # Get model predictions
             try:
+                logger.info(f"[Eval] Running forward pass for sample {idx}")
                 outputs = self.policy.forward_with_world_model(
                     batch,
                     cur_n_obs_img_steps=self.cur_n_obs_img_steps,
@@ -520,28 +583,35 @@ class PolicyTrainer(Trainer):
                     return_images=True,  # Request image outputs for visualization
                 )
                 
+                logger.info(f"[Eval] Forward pass output keys: {outputs.keys()}")
+                
                 # Get ground truth and predicted images
                 # Assuming wm_pred_img and wm_gt_img are in outputs
                 if 'wm_pred_img' in outputs and 'wm_gt_img' in outputs:
                     pred_img = outputs['wm_pred_img']  # [B, T, C, H, W] or [B, C, H, W]
                     gt_img = outputs['wm_gt_img']
+                    logger.info(f"[Eval] Got images: gt_shape={gt_img.shape}, pred_shape={pred_img.shape}")
                     frames_list.append((gt_img.cpu(), pred_img.cpu()))
+                else:
+                    logger.warning(f"[Eval] Missing image keys. Available: {outputs.keys()}")
             except Exception as e:
                 logger.warning(f"Error during eval forward: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         if not frames_list:
             logger.warning("No frames generated for video")
             return
         
-        # Create comparison video
-        video_path = os.path.join(eval_dir, f"eval_episode_{episode_count}.mp4")
-        self._create_comparison_video(frames_list, video_path)
+        # Create comparison video with episode info in filename
+        video_path = os.path.join(eval_dir, f"eval_step_{episode_count}_ep{target_episode}.mp4")
+        self._create_comparison_video(frames_list, video_path, indices=indices)
         logger.info(f"Saved evaluation video to {video_path}")
         
         self.policy.train()
     
-    def _create_comparison_video(self, frames_list, output_path: str, fps: int = 5):
+    def _create_comparison_video(self, frames_list, output_path: str, fps: int = 5, indices=None):
         """Create side-by-side comparison video of ground truth and predictions."""
         try:
             import cv2
@@ -562,13 +632,13 @@ class PolicyTrainer(Trainer):
                     gt_frame = gt_tensor[t]  # [C, H, W]
                     pred_frame = pred_tensor[t]
                     
-                    # Convert to numpy and denormalize
+                    # Convert to numpy - data is already in 0-1 range
                     gt_np = gt_frame.permute(1, 2, 0).numpy()  # [H, W, C]
                     pred_np = pred_frame.permute(1, 2, 0).numpy()
                     
-                    # Normalize to 0-255 range
-                    gt_np = ((gt_np - gt_np.min()) / (gt_np.max() - gt_np.min() + 1e-8) * 255).astype(np.uint8)
-                    pred_np = ((pred_np - pred_np.min()) / (pred_np.max() - pred_np.min() + 1e-8) * 255).astype(np.uint8)
+                    # Scale from 0-1 to 0-255 directly (don't use per-frame min/max normalization)
+                    gt_np = (gt_np * 255).clip(0, 255).astype(np.uint8)
+                    pred_np = (pred_np * 255).clip(0, 255).astype(np.uint8)
                     
                     # Add labels
                     gt_labeled = cv2.putText(gt_np.copy(), "GT", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -581,18 +651,61 @@ class PolicyTrainer(Trainer):
             if not all_frames:
                 return
             
-            # Write video
+            # Save frames as temporary images, then use ffmpeg to create H.264 video
             h, w = all_frames[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            mp4_output_path = output_path if output_path.endswith('.mp4') else output_path.replace('.avi', '.mp4')
             
-            for frame in all_frames:
-                # Convert RGB to BGR for OpenCV
-                if frame.shape[-1] == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                writer.write(frame)
+            # Create temp directory for frames
+            import tempfile
+            import subprocess
+            temp_dir = tempfile.mkdtemp()
             
-            writer.release()
+            try:
+                # Save all frames as temporary PNG files
+                for i, frame in enumerate(all_frames):
+                    if frame.shape[-1] == 3:
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    else:
+                        frame_bgr = frame
+                    cv2.imwrite(os.path.join(temp_dir, f"frame_{i:04d}.png"), frame_bgr)
+                
+                # Use ffmpeg to create H.264 encoded MP4 (VS Code compatible)
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',
+                    '-framerate', str(fps),
+                    '-i', os.path.join(temp_dir, 'frame_%04d.png'),
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-crf', '23',
+                    mp4_output_path
+                ]
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.warning(f"ffmpeg error: {result.stderr}")
+                    # Fallback to OpenCV mp4v
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(mp4_output_path, fourcc, fps, (w, h))
+                    for frame in all_frames:
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.shape[-1] == 3 else frame
+                        writer.write(frame_bgr)
+                    writer.release()
+            finally:
+                # Clean up temp directory
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # Also save some sample frames as PNG for easy viewing
+            frame_dir = os.path.dirname(output_path)
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            num_frames_to_save = min(5, len(all_frames))
+            for i in range(num_frames_to_save):
+                # Include sample index info if available
+                idx_info = f"_sample{indices[i]}" if indices and i < len(indices) else ""
+                frame_path = os.path.join(frame_dir, f"{base_name}_frame_{i:03d}{idx_info}.png")
+                cv2.imwrite(frame_path, cv2.cvtColor(all_frames[i], cv2.COLOR_RGB2BGR))
+            
+            logger.info(f"Video saved to {mp4_output_path} ({len(all_frames)} frames)")
+            logger.info(f"Saved {num_frames_to_save} sample frames as PNG")
             
         except ImportError:
             logger.warning("cv2 not available, skipping video generation. Install with: pip install opencv-python")
