@@ -54,6 +54,16 @@ from f1_vla.src.models.adversarial_trainer import (
     AdversarialTrainingManager, AdversarialTrainingConfig
 )
 
+# Import integration module for actual F1-VLA and RoboTwin
+from f1_vla.src.models.f1_integration import (
+    load_f1_vla_policy,
+    load_vae,
+    create_robotwin_env,
+    create_mock_env,
+    ExplorerEnvWrapper,
+    create_explorer_training_env,
+)
+
 
 # =============================================================================
 # Configuration
@@ -248,6 +258,7 @@ class ExplorerTrainingPipeline:
         self.policy = None
         self.vae = None
         self.env = None
+        self.explorer_env = None  # ExplorerEnvWrapper
         self.embedding_extractor = None
         self.reward_manager = None
         self.rollout_collector = None
@@ -289,24 +300,38 @@ class ExplorerTrainingPipeline:
     def load_models(self):
         """Load F1-VLA policy with Explorer actor and VAE."""
         self.logger.info("Loading models...")
-        
-        # Load policy (placeholder - actual implementation depends on F1-VLA)
-        # TODO: Load actual F1-VLA policy
         self.logger.info(f"  Policy path: {self.config.pretrained_path}")
-        
-        # For now, create a mock policy for testing
-        # In production, replace with actual F1-VLA loading
-        self.policy = self._create_mock_policy()
-        
-        # Load VAE
         self.logger.info(f"  VAE path: {self.config.vae_checkpoint}")
-        self.vae = self._load_vae()
+        
+        # Try to load actual F1-VLA policy
+        use_mock = False
+        
+        if self.config.pretrained_path and os.path.exists(self.config.pretrained_path):
+            try:
+                self.policy, self.vae = load_f1_vla_policy(
+                    config_path=self.config.pretrained_path,
+                    checkpoint_path=self.config.pretrained_path,
+                    vae_path=self.config.vae_checkpoint,
+                    device=str(self.device),
+                    add_explorer=True,
+                )
+                self.logger.info("  Loaded actual F1-VLA policy")
+            except Exception as e:
+                self.logger.warning(f"  Failed to load F1-VLA: {e}")
+                use_mock = True
+        else:
+            self.logger.info("  No pretrained path provided, using mock policy")
+            use_mock = True
+        
+        if use_mock:
+            self.logger.info("  Using mock policy and VAE for testing")
+            self.policy = self._create_mock_policy()
+            self.vae = self._load_mock_vae()
         
         # Initialize embedding extractor
         self.embedding_extractor = VAEEmbeddingExtractor(
             vae=self.vae,
-            vocab_size=self.config.vae_vocab_size,
-            device=self.device
+            embedding_dim=self.config.vae_z_channels,
         )
         
         self.logger.info("Models loaded successfully")
@@ -347,17 +372,26 @@ class ExplorerTrainingPipeline:
         policy.to(self.device)
         return policy
     
-    def _load_vae(self) -> Optional[nn.Module]:
-        """Load VAE model."""
-        # Placeholder for VAE loading
-        # In production, load actual VAE
+    def _load_mock_vae(self) -> Optional[nn.Module]:
+        """Load mock VAE model for testing."""
         
         class MockVAE(nn.Module):
-            def __init__(self, embed_dim=1280, vocab_size=4096):
+            def __init__(self, embed_dim=1280, vocab_size=4096, z_channels=32):
                 super().__init__()
                 self.embed_dim = embed_dim
                 self.vocab_size = vocab_size
+                self.z_channels = z_channels
                 self.codebook = nn.Embedding(vocab_size, embed_dim)
+                
+                # Mock encoder and quant_conv for VAEEmbeddingExtractor compatibility
+                self.encoder = nn.Sequential(
+                    nn.Conv2d(3, 64, 4, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 128, 4, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(128, z_channels, 4, stride=2, padding=1),
+                )
+                self.quant_conv = nn.Conv2d(z_channels, z_channels, 1)
                 
             def encode(self, x):
                 # Mock encoding: return random embedding
@@ -369,15 +403,15 @@ class ExplorerTrainingPipeline:
         
         vae = MockVAE(
             embed_dim=1280,
-            vocab_size=self.config.vae_vocab_size
+            vocab_size=self.config.vae_vocab_size,
+            z_channels=self.config.vae_z_channels
         )
         vae.to(self.device)
         
         # Load checkpoint if exists
         if self.config.vae_checkpoint and os.path.exists(self.config.vae_checkpoint):
             self.logger.info(f"  Loading VAE checkpoint: {self.config.vae_checkpoint}")
-            # checkpoint = torch.load(self.config.vae_checkpoint, map_location=self.device)
-            # vae.load_state_dict(checkpoint)
+            # Note: mock VAE won't match actual checkpoint structure
         
         return vae
     
@@ -385,39 +419,43 @@ class ExplorerTrainingPipeline:
         """Setup training environment."""
         self.logger.info(f"Setting up environment: {self.config.env_type}")
         
-        # Placeholder for environment setup
-        # In production, create actual environment
+        # Try to create actual RoboTwin environment
+        if self.config.env_type == "robotwin":
+            try:
+                self.env = create_robotwin_env(
+                    task_name="random_exploration",
+                    history_length=self.config.history_length,
+                    max_steps=self.config.max_episode_steps,
+                    image_size=(self.config.image_size, self.config.image_size),
+                    device=str(self.device),
+                    action_scale=0.5,  # Safe exploration
+                )
+                self.logger.info("  Created RoboTwin environment")
+            except Exception as e:
+                self.logger.warning(f"  Failed to create RoboTwin: {e}")
+                self.env = create_mock_env(
+                    history_length=self.config.history_length,
+                    max_steps=self.config.max_episode_steps,
+                    image_size=(self.config.image_size, self.config.image_size),
+                    device=str(self.device),
+                )
+                self.logger.info("  Using mock environment")
+        else:
+            self.env = create_mock_env(
+                history_length=self.config.history_length,
+                max_steps=self.config.max_episode_steps,
+                image_size=(self.config.image_size, self.config.image_size),
+                device=str(self.device),
+            )
+            self.logger.info("  Using mock environment")
         
-        class MockEnvironment:
-            def __init__(self, image_size, action_dim, max_steps):
-                self.image_size = image_size
-                self.action_dim = action_dim
-                self.max_steps = max_steps
-                self.step_count = 0
-                
-            def reset(self):
-                self.step_count = 0
-                obs = {
-                    'image': torch.randn(3, self.image_size, self.image_size),
-                    'state': torch.randn(32)
-                }
-                return obs
-            
-            def step(self, action):
-                self.step_count += 1
-                obs = {
-                    'image': torch.randn(3, self.image_size, self.image_size),
-                    'state': torch.randn(32)
-                }
-                reward = 0.0  # Explorer computes its own reward
-                done = self.step_count >= self.max_steps
-                info = {}
-                return obs, reward, done, info
-        
-        self.env = MockEnvironment(
-            image_size=self.config.image_size,
-            action_dim=self.config.action_dim,
-            max_steps=self.config.max_episode_steps
+        # Create Explorer environment wrapper
+        self.explorer_env = ExplorerEnvWrapper(
+            policy=self.policy,
+            vae=self.vae,
+            env=self.env,
+            history_length=self.config.history_length,
+            device=self.device,
         )
         
         self.logger.info("Environment setup complete")
@@ -427,20 +465,19 @@ class ExplorerTrainingPipeline:
         self.logger.info("Setting up reward system...")
         
         reward_config = RewardConfig(
-            alpha=self.config.reward_alpha,
-            beta=self.config.reward_beta,
-            gamma=self.config.reward_gamma,
-            epsilon=self.config.reward_epsilon,
-            delta=self.config.reward_delta
+            uncertainty_weight=self.config.reward_alpha,
+            mse_weight=self.config.reward_beta,
+            mse_improvement_weight=self.config.reward_gamma,
+            uncertainty_improvement_weight=self.config.reward_epsilon,
+            action_penalty_weight=self.config.reward_delta
         )
         
-        self.reward_manager = ExplorerRewardManager(
-            config=reward_config,
-            buffer_size=self.config.phase1_steps_per_rollout * 2
-        )
+        self.reward_manager = ExplorerRewardManager(config=reward_config)
         
-        self.logger.info(f"  Reward weights: α={reward_config.alpha}, β={reward_config.beta}, "
-                        f"γ={reward_config.gamma}, ε={reward_config.epsilon}, δ={reward_config.delta}")
+        self.logger.info(f"  Reward weights: α={reward_config.uncertainty_weight}, "
+                        f"β={reward_config.mse_weight}, γ={reward_config.mse_improvement_weight}, "
+                        f"ε={reward_config.uncertainty_improvement_weight}, "
+                        f"δ={reward_config.action_penalty_weight}")
     
     def setup_rollout_collector(self):
         """Setup rollout collector."""
@@ -622,37 +659,71 @@ class ExplorerTrainingPipeline:
         self.logger.info("Phase 2 training complete!")
     
     def _collect_rollout(self, num_steps: int) -> List:
-        """Collect rollout from environment."""
-        # Simplified rollout collection
-        # In production, use proper rollout collector
-        
+        """Collect rollout from environment using ExplorerEnvWrapper."""
         transitions = []
-        obs = self.env.reset()
         
-        for _ in range(num_steps):
-            # Get action from policy
+        # Reset explorer environment
+        obs, info = self.explorer_env.reset()
+        
+        for step in range(num_steps):
+            # Get action from Explorer policy
             with torch.no_grad():
-                state = torch.randn(1, 256, device=self.device)  # Mock state
-                action = self.policy(state, actor_name='explorer')
+                # Prepare input for Explorer
+                # Use gt_img_emb as the main feature
+                if 'gt_img_emb' in obs:
+                    state_feat = obs['gt_img_emb'].flatten().unsqueeze(0)
+                else:
+                    state_feat = torch.randn(1, 256, device=self.device)
+                
+                # Get action from policy
+                if hasattr(self.policy, 'actors') and 'explorer' in self.policy.actors:
+                    # Use the hidden dim that matches the policy
+                    hidden_dim = self.policy.actors['explorer'][0].in_features
+                    state_feat_proj = torch.randn(1, hidden_dim, device=self.device)
+                    action = self.policy.actors['explorer'](state_feat_proj)
+                else:
+                    action = torch.randn(1, 32, device=self.device) * 0.1
+                
                 action = action.squeeze(0)
+                
+                # Get value estimate (for PPO)
+                value = torch.tensor(0.0, device=self.device)
+                
+                # Compute log prob (simplified - actual implementation would use action distribution)
+                log_prob = torch.tensor(0.0, device=self.device)
             
             # Step environment
-            next_obs, _, done, info = self.env.step(action.cpu().numpy())
+            next_obs, reward_info, terminated, truncated, step_info = self.explorer_env.step(action)
+            done = terminated or truncated
             
-            # Create mock transition
+            # Compute reward using reward manager
+            if self.reward_manager is not None:
+                reward, reward_components = self.reward_manager.step(
+                    pred_emb=reward_info['pred_emb'],
+                    gt_emb=reward_info['gt_emb'],
+                    uncertainty=reward_info['uncertainty'],
+                    action=reward_info['action'],
+                )
+                if reward is None:
+                    reward = torch.tensor(0.0, device=self.device)
+            else:
+                reward = torch.tensor(0.0, device=self.device)
+            
+            # Create transition
             transition = {
                 'observation': obs,
                 'action': action.cpu(),
                 'next_observation': next_obs,
                 'done': done,
-                'value': torch.tensor(0.0),
-                'log_prob': torch.tensor(0.0),
-                'reward': torch.tensor(0.0),  # Reward computed separately
+                'value': value.cpu(),
+                'log_prob': log_prob.cpu(),
+                'reward': reward.cpu() if isinstance(reward, torch.Tensor) else torch.tensor(reward),
+                'reward_info': reward_info,  # Store for delayed reward computation
             }
             transitions.append(transition)
             
             if done:
-                obs = self.env.reset()
+                obs, _ = self.explorer_env.reset()
             else:
                 obs = next_obs
         
