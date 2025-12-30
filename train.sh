@@ -27,7 +27,7 @@ set -e
 # ============================================
 # Default values
 # ============================================
-CONFIG_FILE="f1_vla/config/train_config.yaml"
+CONFIG_FILE="f1_vla/config/memory_wm_clean_only.yaml"
 GPU_IDS=""
 NUM_GPUS=""
 AUTO_MODE=false

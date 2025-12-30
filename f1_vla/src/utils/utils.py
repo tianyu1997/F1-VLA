@@ -93,6 +93,12 @@ def set_policy_config(policy_config, src_config):
     policy_config.attention_implementation = src_config.attention_implementation
     policy_config.chunk_size = src_config.chunk_size
 
+    # Episode-internal loss warmup configuration
+    if hasattr(src_config, 'loss_warmup_frames'):
+        policy_config.loss_warmup_frames = src_config.loss_warmup_frames
+    if hasattr(src_config, 'loss_warmup_min_weight'):
+        policy_config.loss_warmup_min_weight = src_config.loss_warmup_min_weight
+
     return policy_config
 
 

@@ -164,8 +164,8 @@ class EpisodeProgressCallback(TrainerCallback):
             # Initial progress within current epoch
             initial_progress = self.epoch_episode_count
             
-            # Show epoch and episode progress
-            desc = f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: {initial_progress}/{self.num_episodes}]"
+            # Show epoch and episode progress (compact format)
+            desc = f"E{self.current_epoch + 1}/{self.num_epochs}"
             # Use num_episodes as total (per epoch)
             self.pbar = tqdm(
                 total=self.num_episodes,
@@ -174,12 +174,10 @@ class EpisodeProgressCallback(TrainerCallback):
                 dynamic_ncols=True,
                 leave=True,
                 unit="ep",
+                ncols=80,  # Fixed width for cleaner output
+                bar_format='{desc}|{bar:20}|{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]'
             )
-            self.pbar.set_postfix({
-                'loss': 0,
-                'wm_loss': 0,
-                'wm_acc': '0.00%',
-            })
+            self.pbar.set_postfix_str('loss=0 acc=0%')
     
     def on_epoch_begin(self, args, state, control, **kwargs):
         """Reset episode counter at epoch start.
@@ -195,32 +193,21 @@ class EpisodeProgressCallback(TrainerCallback):
             self.epoch_episode_count = 0
             if self.pbar is not None and state.is_local_process_zero:
                 self.pbar.reset()
-                self.pbar.set_description(f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: 0/{self.num_episodes}]")
+                self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
     
     def on_step_end(self, args, state, control, **kwargs):
         """Update progress bar after each step."""
         if self.pbar is not None and state.is_local_process_zero:
-            # Update display with real-time metrics (no step update, only episode-based)
-            self.pbar.set_postfix({
-                'loss': f"{self.current_loss:.4f}",
-                'wm_loss': f"{self.current_wm_loss:.4f}",
-                'wm_acc': f"{self.current_wm_acc:.2%}",
-            })
+            # Update display with real-time metrics (compact format)
+            self.pbar.set_postfix_str(f'L={self.current_wm_loss:.3f} A={self.current_wm_acc:.1%}')
     
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Update metrics display when logging (for logged metrics)."""
         if self.pbar is not None and state.is_local_process_zero and logs is not None:
-            postfix = {}
-            if 'loss' in logs:
-                postfix['loss'] = f"{logs['loss']:.4f}"
-            if 'wm_out_loss' in logs:
-                postfix['wm_loss'] = f"{logs['wm_out_loss']:.4f}"
-            if 'wm_acc_mean' in logs:
-                postfix['wm_acc'] = f"{logs['wm_acc_mean']:.2%}"
-            if 'action_loss' in logs:
-                postfix['act_loss'] = f"{logs['action_loss']:.4f}"
-            if postfix:
-                self.pbar.set_postfix(postfix)
+            # Compact postfix format
+            loss = logs.get('wm_out_loss', logs.get('loss', 0))
+            acc = logs.get('wm_acc_mean', 0)
+            self.pbar.set_postfix_str(f'L={loss:.3f} A={acc:.1%}')
     
     def update_metrics(self, loss: float, wm_loss: float = 0.0, wm_acc: float = 0.0, action_loss: float = 0.0):
         """Update real-time metrics from compute_loss."""
@@ -245,9 +232,7 @@ class EpisodeProgressCallback(TrainerCallback):
             if self.pbar is not None:
                 # Update progress bar by number of new episodes
                 self.pbar.update(new_episodes_count)
-                self.pbar.set_description(
-                    f"Epoch {self.current_epoch + 1}/{self.num_epochs} [Ep: {self.epoch_episode_count}/{self.num_episodes}]"
-                )
+                self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
         
         return new_episodes_count
     
@@ -449,13 +434,30 @@ class PolicyTrainer(Trainer):
                         "wm_out_loss": outputs.get("wm_loss", torch.tensor(0)).cpu().item(),
                         "wm_acc_mean": outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item(),
                         "wm_acc_tail": outputs.get("wm_acc_tail", torch.tensor(0)).cpu().item(),
-                        "wm_learning_rate": self.optimizer.param_groups[4]["lr"],
                     }
-                    vit_log = {
-                        "vit_learning_rate": self.optimizer.param_groups[0]["lr"],
-                    }
-                    if self.policy.model.train_gen_expert_only:
-                        loss_dict = {**episode_log, **wm_log, **vit_log}
+                    # Add learning rate logging if optimizer has enough param groups
+                    if len(self.optimizer.param_groups) > 4:
+                        wm_log["wm_learning_rate"] = self.optimizer.param_groups[4]["lr"]
+                        vit_log = {"vit_learning_rate": self.optimizer.param_groups[0]["lr"]}
+                    else:
+                        vit_log = {"learning_rate": self.optimizer.param_groups[0]["lr"]}
+                    
+                    # Add teacher-student specific logging
+                    ts_log = {}
+                    if "gt_loss" in outputs:
+                        ts_log["gt_loss"] = outputs["gt_loss"].cpu().item() if hasattr(outputs["gt_loss"], "cpu") else outputs["gt_loss"]
+                    if "memory_loss" in outputs:
+                        ts_log["memory_loss"] = outputs["memory_loss"].cpu().item() if hasattr(outputs["memory_loss"], "cpu") else outputs["memory_loss"]
+                    if "teacher_wm_acc" in outputs:
+                        ts_log["teacher_wm_acc"] = outputs["teacher_wm_acc"].cpu().item() if hasattr(outputs["teacher_wm_acc"], "cpu") else outputs["teacher_wm_acc"]
+                    
+                    # Check if policy is teacher-student or has train_gen_expert_only attribute
+                    is_gen_expert_only = (hasattr(self.policy, 'model') and 
+                                         hasattr(self.policy.model, 'train_gen_expert_only') and 
+                                         self.policy.model.train_gen_expert_only)
+                    
+                    if is_gen_expert_only or ts_log:  # Teacher-student mode or gen_expert_only
+                        loss_dict = {**episode_log, **wm_log, **vit_log, **ts_log}
                     else:
                         loss_dict = {**episode_log, **wm_log, **vit_log, **action_lr_log, **action_log}
                 else:
@@ -563,13 +565,10 @@ class PolicyTrainer(Trainer):
                 if isinstance(value, torch.Tensor):
                     batch[key] = value.to(self.args.device)
             
-            # Apply image transforms if needed
-            if self.image_transforms is not None:
-                for key, value in batch.items():
-                    if "history" in key or "mask" in key:
-                        continue
-                    if key.startswith("observation.images"):
-                        batch[key] = self.image_transforms(value)
+            # NOTE: Do NOT apply image_transforms during eval video generation!
+            # Random brightness/contrast/saturation transforms would cause flickering
+            # between frames since each frame gets different random augmentation.
+            # The model should be robust to un-augmented images during evaluation.
             
             # Get model predictions
             try:
@@ -720,6 +719,10 @@ class PolicyTrainer(Trainer):
 
         self.accelerator.unwrap_model(self.model)._save_pretrained(Path(output_dir))
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+        
+        # Save trainer_state.json for resume support
+        self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+        logger.info(f"Saved trainer_state.json to {output_dir}")
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
 
