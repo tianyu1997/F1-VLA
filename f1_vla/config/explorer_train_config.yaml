@@ -1,0 +1,184 @@
+# Explorer Actor RL Training Configuration
+# 两阶段训练：Phase 1 (冻结WM) + Phase 2 (对抗训练)
+
+# =============================================================================
+# 模型配置
+# =============================================================================
+model:
+  # F1-VLA模型路径
+  pretrained_path: "/mnt/data2/ty/F1-VLA/F1_pretrain"
+  
+  # VAE配置
+  vae:
+    checkpoint_path: "/mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth"
+    vocab_size: 4096
+    z_channels: 32
+    ch: 160
+    
+  # World Model配置
+  world_model:
+    checkpoint_path: "/mnt/data2/ty/F1-VLA/wm"
+    
+  # Actor配置
+  actors:
+    # 原始Actor (用于对比)
+    actor:
+      checkpoint_path: null  # 使用预训练权重
+      trainable: false
+    # Explorer Actor (随机初始化)
+    explorer:
+      checkpoint_path: null  # 随机初始化
+      trainable: true
+      
+  # 当前使用的actor
+  active_actor: "explorer"
+
+# =============================================================================
+# 环境配置
+# =============================================================================
+environment:
+  # 环境类型
+  type: "robotwin"  # robotwin, libero, simpler
+  
+  # RoboTwin环境配置
+  robotwin:
+    task: "block_hammer_beat"
+    headless: true
+    num_envs: 1
+    
+  # 观测配置
+  observation:
+    image_size: 224
+    history_length: 4  # L=4
+    
+  # 动作配置
+  action:
+    dim: 14  # 机器人动作维度
+    max_episode_steps: 200
+
+# =============================================================================
+# Reward配置
+# =============================================================================
+reward:
+  # Reward权重
+  alpha: 1.0      # r1: uncertainty权重
+  beta: 1.0       # r2: MSE权重
+  gamma: 0.5      # r3: MSE improvement权重 (延迟)
+  epsilon: 0.1    # r4: uncertainty improvement权重 (延迟)
+  delta: 0.01     # action penalty权重
+  
+  # Reward裁剪
+  clip_reward: true
+  reward_clip_range: [-10.0, 10.0]
+  
+  # Reward归一化
+  normalize_reward: true
+  reward_scale: 1.0
+
+# =============================================================================
+# Phase 1: RL训练 (冻结WM)
+# =============================================================================
+phase1:
+  enabled: true
+  
+  # PPO超参数
+  ppo:
+    learning_rate: 3.0e-4
+    gamma: 0.99           # 折扣因子
+    gae_lambda: 0.95      # GAE参数
+    clip_epsilon: 0.2     # PPO裁剪
+    value_coef: 0.5       # Value loss权重
+    entropy_coef: 0.01    # Entropy bonus权重
+    max_grad_norm: 0.5    # 梯度裁剪
+    
+  # 训练配置
+  training:
+    total_timesteps: 100000
+    num_envs: 4
+    steps_per_rollout: 256    # 每次rollout的步数
+    num_epochs: 4             # 每次更新的epoch数
+    batch_size: 64
+    
+  # Value Head配置
+  value_head:
+    hidden_dim: 256
+    
+  # 学习率调度
+  lr_schedule:
+    type: "cosine"  # cosine, linear, constant
+    warmup_steps: 1000
+    min_lr: 1.0e-5
+    
+  # 保存配置
+  checkpoint:
+    save_freq: 10000        # 每N步保存
+    save_best: true         # 保存最佳模型
+    max_checkpoints: 5      # 最多保留N个checkpoint
+
+# =============================================================================
+# Phase 2: 对抗训练 (WM vs Explorer)
+# =============================================================================
+phase2:
+  enabled: true
+  
+  # 从Phase 1加载
+  load_phase1_checkpoint: true
+  phase1_checkpoint_path: null  # null表示使用最新的
+  
+  # 对抗训练配置
+  adversarial:
+    # WM训练配置
+    wm_learning_rate: 1.0e-4
+    wm_updates_per_iter: 10     # 每iteration WM更新次数
+    
+    # Explorer训练配置  
+    explorer_learning_rate: 1.0e-4
+    explorer_updates_per_iter: 1  # 每iteration Explorer更新次数
+    
+    # Warmup阶段 (只训练WM)
+    warmup_iterations: 100
+    
+    # Mode collapse防止
+    collapse_threshold: 0.1     # WM loss低于此值时停止Explorer奖励
+    
+  # 训练配置
+  training:
+    total_iterations: 1000
+    steps_per_iteration: 256
+    num_epochs: 4
+    batch_size: 64
+    
+  # 保存配置
+  checkpoint:
+    save_freq: 100
+    save_best: true
+
+# =============================================================================
+# 日志和输出
+# =============================================================================
+logging:
+  # 输出目录
+  output_dir: "/mnt/data2/ty/F1-VLA/outputs/explorer_training"
+  
+  # 日志配置
+  log_freq: 100           # 每N步打印日志
+  tensorboard: true       # 使用TensorBoard
+  wandb: false            # 使用W&B
+  wandb_project: "f1-vla-explorer"
+  
+  # 视频录制
+  record_video: true
+  video_freq: 10000       # 每N步录制视频
+
+# =============================================================================
+# 硬件配置
+# =============================================================================
+hardware:
+  device: "cuda"
+  mixed_precision: true   # 使用FP16
+  num_workers: 4          # DataLoader workers
+  
+# =============================================================================
+# 随机种子
+# =============================================================================
+seed: 42
