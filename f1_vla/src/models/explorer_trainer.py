@@ -1,0 +1,705 @@
+"""
+Explorer Phase 1 RL Training Module
+
+This module implements Phase 1 of Explorer training:
+- Freeze World Model and policy actor
+- Train only Explorer actor with PPO
+- Reward based on WM uncertainty and prediction error
+
+Key Features:
+- PPO algorithm with GAE
+- Value head for baseline
+- Gradient isolation (only Explorer trainable)
+- Compatible with F1_VLA multi-actor architecture
+"""
+
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass
+from collections import deque
+from pathlib import Path
+import json
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExplorerTrainingConfig:
+    """Configuration for Explorer training."""
+    # Episode settings
+    num_episodes: int = 1000
+    max_steps_per_episode: int = 100
+    
+    # PPO hyperparameters
+    ppo_epochs: int = 4
+    mini_batch_size: int = 32
+    clip_epsilon: float = 0.2
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.01
+    
+    # GAE parameters
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    
+    # Optimization
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    
+    # Learning rate schedule
+    use_lr_schedule: bool = True
+    lr_schedule_type: str = "cosine"  # "cosine" or "linear"
+    warmup_episodes: int = 50
+    
+    # Reward normalization
+    normalize_rewards: bool = True
+    normalize_advantages: bool = True
+    clip_rewards: Optional[float] = 10.0
+    
+    # Action settings
+    action_dim: int = 7
+    action_scale: float = 1.0
+    init_log_std: float = -1.0  # Initial action std = exp(-1) ≈ 0.37
+    
+    # Logging and saving
+    log_every: int = 10
+    save_every: int = 100
+    output_dir: str = "./outputs/explorer_rl"
+    
+    # Phase 1 specific
+    freeze_world_model: bool = True
+    freeze_policy_actor: bool = True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            'num_episodes': self.num_episodes,
+            'max_steps_per_episode': self.max_steps_per_episode,
+            'ppo_epochs': self.ppo_epochs,
+            'mini_batch_size': self.mini_batch_size,
+            'clip_epsilon': self.clip_epsilon,
+            'value_loss_coef': self.value_loss_coef,
+            'entropy_coef': self.entropy_coef,
+            'gamma': self.gamma,
+            'gae_lambda': self.gae_lambda,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'max_grad_norm': self.max_grad_norm,
+            'normalize_rewards': self.normalize_rewards,
+            'normalize_advantages': self.normalize_advantages,
+            'action_dim': self.action_dim,
+            'action_scale': self.action_scale,
+            'freeze_world_model': self.freeze_world_model,
+            'freeze_policy_actor': self.freeze_policy_actor,
+        }
+
+
+class PPOValueHead(nn.Module):
+    """Value head for PPO baseline."""
+    
+    def __init__(self, input_dim: int = 1024, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+    
+    def forward(self, state_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Compute value estimate.
+        
+        Args:
+            state_emb: State embedding (B, D)
+            
+        Returns:
+            Value estimates (B,)
+        """
+        return self.net(state_emb).squeeze(-1)
+
+
+class ExplorerRLTrainer:
+    """
+    PPO trainer for Explorer actor.
+    
+    Phase 1: Freeze WM and policy actor, train only Explorer.
+    """
+    
+    def __init__(
+        self,
+        policy,  # F1_VLA policy
+        vae_extractor,  # VAEEmbeddingExtractor
+        reward_manager,  # ExplorerRewardManager
+        config: Optional[ExplorerTrainingConfig] = None,
+        device: str = "cuda",
+    ):
+        """
+        Initialize trainer.
+        
+        Args:
+            policy: F1_VLA policy with Explorer actor
+            vae_extractor: VAE embedding extractor
+            reward_manager: Reward computation manager
+            config: Training configuration
+            device: Device
+        """
+        self.policy = policy
+        self.vae_extractor = vae_extractor
+        self.reward_manager = reward_manager
+        self.config = config or ExplorerTrainingConfig()
+        self.device = device
+        
+        # Ensure explorer exists
+        if 'explorer' not in policy.list_actors():
+            raise ValueError("Explorer actor not found in policy. Call initialize_explorer() first.")
+        
+        # Setup training
+        self._setup_training()
+        
+        # Metrics tracking
+        self.metrics = {
+            'episode_rewards': deque(maxlen=100),
+            'episode_lengths': deque(maxlen=100),
+            'policy_loss': deque(maxlen=100),
+            'value_loss': deque(maxlen=100),
+            'entropy': deque(maxlen=100),
+            'total_loss': deque(maxlen=100),
+            'r1_uncertainty': deque(maxlen=100),
+            'r2_mse': deque(maxlen=100),
+            'r3_mse_improvement': deque(maxlen=100),
+            'r4_uncertainty_improvement': deque(maxlen=100),
+        }
+        
+        # Training state
+        self.global_step = 0
+        self.current_episode = 0
+        
+        # Output directory
+        self.output_dir = Path(self.config.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _setup_training(self):
+        """Setup training components."""
+        # Set explorer as active
+        self.policy.active_actor = 'explorer'
+        
+        # Freeze non-explorer components
+        if self.config.freeze_world_model:
+            self._freeze_world_model()
+        if self.config.freeze_policy_actor:
+            self._freeze_policy_actor()
+        
+        # Make only explorer trainable
+        self.policy.set_trainable_actors(['explorer'])
+        
+        # Get explorer parameters
+        explorer = self.policy.get_actor('explorer')
+        explorer_params = list(explorer.parameters())
+        
+        # Value head
+        # Get input dimension from policy config
+        proj_width = getattr(self.policy.model.config, 'proj_width', 1024)
+        self.value_head = PPOValueHead(input_dim=proj_width).to(self.device)
+        
+        # Action log std (learnable)
+        self.log_std = nn.Parameter(
+            torch.ones(self.config.action_dim, device=self.device) * self.config.init_log_std
+        )
+        
+        # Optimizer
+        self.optimizer = torch.optim.AdamW(
+            [
+                {'params': explorer_params, 'lr': self.config.learning_rate},
+                {'params': self.value_head.parameters(), 'lr': self.config.learning_rate},
+                {'params': [self.log_std], 'lr': self.config.learning_rate * 0.1},
+            ],
+            weight_decay=self.config.weight_decay,
+        )
+        
+        # Learning rate scheduler
+        if self.config.use_lr_schedule:
+            if self.config.lr_schedule_type == "cosine":
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.config.num_episodes,
+                    eta_min=1e-6,
+                )
+            else:
+                self.scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=1.0,
+                    end_factor=0.01,
+                    total_iters=self.config.num_episodes,
+                )
+        else:
+            self.scheduler = None
+        
+        # Log setup
+        trainable_params = sum(p.numel() for p in explorer_params if p.requires_grad)
+        value_params = sum(p.numel() for p in self.value_head.parameters())
+        logger.info(f"Explorer RL trainer setup:")
+        logger.info(f"  Explorer trainable params: {trainable_params:,}")
+        logger.info(f"  Value head params: {value_params:,}")
+        logger.info(f"  Learning rate: {self.config.learning_rate}")
+    
+    def _freeze_world_model(self):
+        """Freeze World Model parameters."""
+        if hasattr(self.policy.model, 'paligemma_with_expert'):
+            pwm = self.policy.model.paligemma_with_expert
+            
+            # Freeze WM expert
+            if hasattr(pwm, 'gemma_wm_expert'):
+                for param in pwm.gemma_wm_expert.parameters():
+                    param.requires_grad = False
+            
+            # Freeze VAE
+            if hasattr(self.policy.model, 'vae'):
+                for param in self.policy.model.vae.parameters():
+                    param.requires_grad = False
+            
+            # Freeze vision tower
+            if hasattr(pwm, 'paligemma'):
+                for param in pwm.paligemma.vision_tower.parameters():
+                    param.requires_grad = False
+                
+                # Freeze language model embeddings
+                for param in pwm.paligemma.language_model.parameters():
+                    param.requires_grad = False
+        
+        logger.info("Froze World Model and shared components")
+    
+    def _freeze_policy_actor(self):
+        """Freeze the main policy actor."""
+        if 'actor' in self.policy.list_actors():
+            actor = self.policy.get_actor('actor')
+            for param in actor.parameters():
+                param.requires_grad = False
+            logger.info("Froze policy actor")
+    
+    def forward_explorer(
+        self,
+        batch: Dict[str, torch.Tensor],
+        actions: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through Explorer.
+        
+        Args:
+            batch: Input batch
+            actions: Optional actions to evaluate
+            deterministic: If True, use mean action
+            
+        Returns:
+            actions: Sampled or provided actions (B, action_dim)
+            log_probs: Log probabilities (B,)
+            values: Value estimates (B,)
+        """
+        # Forward through policy with explorer actor
+        output = self.policy.forward_with_actor(
+            batch,
+            actor_name='explorer',
+            return_action_stats=True,
+        )
+        
+        # Get action mean
+        action_mean = output['action']  # (B, action_dim)
+        
+        # Get std
+        std = torch.exp(self.log_std)
+        
+        # Create distribution
+        dist = torch.distributions.Normal(action_mean, std)
+        
+        if actions is not None:
+            # Evaluate provided actions
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+        elif deterministic:
+            actions = action_mean
+            log_probs = torch.zeros(action_mean.shape[0], device=self.device)
+        else:
+            # Sample actions
+            actions = dist.rsample()
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+        
+        # Clamp actions
+        actions = torch.clamp(actions, -1.0, 1.0) * self.config.action_scale
+        
+        # Value estimate
+        state_emb = output.get('state_emb')
+        if state_emb is None:
+            # Fallback: use state from batch
+            state_emb = self.policy.model.state_proj(batch['observation.state'])
+        values = self.value_head(state_emb)
+        
+        return actions, log_probs, values
+    
+    def compute_gae(
+        self,
+        rewards: List[float],
+        values: List[float],
+        dones: List[bool],
+        next_value: float = 0.0,
+    ) -> Tuple[List[float], List[float]]:
+        """
+        Compute GAE advantages and returns.
+        
+        Args:
+            rewards: List of rewards
+            values: List of value estimates
+            dones: List of done flags
+            next_value: Bootstrap value
+            
+        Returns:
+            advantages: GAE advantages
+            returns: Target returns
+        """
+        advantages = []
+        gae = 0.0
+        
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_val = next_value
+                next_done = 1.0
+            else:
+                next_val = values[t + 1]
+                next_done = 1.0 - float(dones[t + 1])
+            
+            delta = rewards[t] + self.config.gamma * next_val * (1.0 - float(dones[t])) - values[t]
+            gae = delta + self.config.gamma * self.config.gae_lambda * (1.0 - float(dones[t])) * gae
+            advantages.insert(0, gae)
+        
+        returns = [adv + val for adv, val in zip(advantages, values)]
+        
+        return advantages, returns
+    
+    def build_ppo_batch(
+        self,
+        transitions: List[Dict[str, Any]],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build PPO training batch from transitions.
+        
+        Args:
+            transitions: List of transition dicts
+            
+        Returns:
+            Batch dict with tensors
+        """
+        # Extract data
+        actions = torch.stack([t['action'] for t in transitions]).to(self.device)
+        old_log_probs = torch.tensor([t['log_prob'] for t in transitions], device=self.device)
+        values = [t['value'] for t in transitions]
+        rewards = [t['reward'] for t in transitions]
+        dones = [t['done'] for t in transitions]
+        
+        # Normalize rewards if enabled
+        if self.config.normalize_rewards and len(rewards) > 1:
+            rewards_tensor = torch.tensor(rewards)
+            rewards_mean = rewards_tensor.mean()
+            rewards_std = rewards_tensor.std() + 1e-8
+            rewards = ((rewards_tensor - rewards_mean) / rewards_std).tolist()
+        
+        # Clip rewards if enabled
+        if self.config.clip_rewards is not None:
+            rewards = [max(-self.config.clip_rewards, min(self.config.clip_rewards, r)) for r in rewards]
+        
+        # Compute GAE
+        next_value = 0.0 if dones[-1] else values[-1]
+        advantages, returns = self.compute_gae(rewards, values, dones, next_value)
+        
+        advantages = torch.tensor(advantages, device=self.device)
+        returns = torch.tensor(returns, device=self.device)
+        old_values = torch.tensor(values, device=self.device)
+        
+        # Build observation batch
+        # This depends on how transitions store observations
+        batch = {
+            'actions': actions,
+            'old_log_probs': old_log_probs,
+            'old_values': old_values,
+            'advantages': advantages,
+            'returns': returns,
+        }
+        
+        # Add observations if stored in transitions
+        if 'batch' in transitions[0]:
+            # Concatenate stored batches
+            obs_keys = transitions[0]['batch'].keys()
+            for key in obs_keys:
+                tensors = [t['batch'][key] for t in transitions]
+                batch[key] = torch.cat(tensors, dim=0)
+        
+        return batch
+    
+    def train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Execute one PPO training step with mini-batching.
+        
+        Args:
+            batch: Training batch
+            
+        Returns:
+            Loss dict
+        """
+        batch_size = batch['actions'].shape[0]
+        mini_batch_size = min(self.config.mini_batch_size, batch_size)
+        
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_loss = 0.0
+        num_batches = 0
+        
+        # Shuffle indices
+        indices = torch.randperm(batch_size, device=self.device)
+        
+        for start in range(0, batch_size, mini_batch_size):
+            end = min(start + mini_batch_size, batch_size)
+            mb_indices = indices[start:end]
+            
+            # Create mini-batch
+            mb_actions = batch['actions'][mb_indices]
+            mb_old_log_probs = batch['old_log_probs'][mb_indices]
+            mb_old_values = batch['old_values'][mb_indices]
+            mb_advantages = batch['advantages'][mb_indices]
+            mb_returns = batch['returns'][mb_indices]
+            
+            # Create observation mini-batch
+            mb_batch = {}
+            for key in batch:
+                if key not in ['actions', 'old_log_probs', 'old_values', 'advantages', 'returns']:
+                    mb_batch[key] = batch[key][mb_indices]
+            
+            self.optimizer.zero_grad()
+            
+            # Forward pass
+            _, log_probs, values = self.forward_explorer(mb_batch, actions=mb_actions)
+            
+            # Normalize advantages
+            if self.config.normalize_advantages and mb_advantages.numel() > 1:
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+            
+            # Policy loss (clipped)
+            ratio = torch.exp(log_probs - mb_old_log_probs)
+            surr1 = ratio * mb_advantages
+            surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * mb_advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Value loss (clipped)
+            values_clipped = mb_old_values + torch.clamp(
+                values - mb_old_values,
+                -self.config.clip_epsilon,
+                self.config.clip_epsilon
+            )
+            value_loss_unclipped = F.mse_loss(values, mb_returns, reduction='none')
+            value_loss_clipped = F.mse_loss(values_clipped, mb_returns, reduction='none')
+            value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            
+            # Entropy bonus
+            std = torch.exp(self.log_std)
+            entropy = 0.5 * (1 + torch.log(2 * np.pi * std ** 2)).sum()
+            
+            # Total loss
+            loss = (
+                policy_loss
+                + self.config.value_loss_coef * value_loss
+                - self.config.entropy_coef * entropy
+            )
+            
+            # Backward
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.get_actor('explorer').parameters(),
+                self.config.max_grad_norm
+            )
+            torch.nn.utils.clip_grad_norm_(
+                self.value_head.parameters(),
+                self.config.max_grad_norm
+            )
+            
+            self.optimizer.step()
+            
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_entropy += entropy.item()
+            total_loss += loss.item()
+            num_batches += 1
+        
+        return {
+            'policy_loss': total_policy_loss / num_batches,
+            'value_loss': total_value_loss / num_batches,
+            'entropy': total_entropy / num_batches,
+            'total_loss': total_loss / num_batches,
+        }
+    
+    def save_checkpoint(self, episode: int):
+        """Save training checkpoint."""
+        checkpoint_dir = self.output_dir / f"checkpoint_{episode:06d}"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save explorer actor
+        self.policy.save_actor('explorer', str(checkpoint_dir / 'explorer.pt'))
+        
+        # Save value head
+        torch.save(self.value_head.state_dict(), checkpoint_dir / 'value_head.pt')
+        
+        # Save optimizer
+        torch.save(self.optimizer.state_dict(), checkpoint_dir / 'optimizer.pt')
+        
+        # Save scheduler
+        if self.scheduler is not None:
+            torch.save(self.scheduler.state_dict(), checkpoint_dir / 'scheduler.pt')
+        
+        # Save log_std
+        torch.save(self.log_std.data, checkpoint_dir / 'log_std.pt')
+        
+        # Save training state
+        state = {
+            'episode': episode,
+            'global_step': self.global_step,
+            'config': self.config.to_dict(),
+            'metrics': {k: list(v) for k, v in self.metrics.items()},
+        }
+        with open(checkpoint_dir / 'training_state.json', 'w') as f:
+            json.dump(state, f, indent=2)
+        
+        logger.info(f"Saved checkpoint at episode {episode}")
+    
+    def load_checkpoint(self, checkpoint_dir: str) -> int:
+        """
+        Load training checkpoint.
+        
+        Args:
+            checkpoint_dir: Path to checkpoint directory
+            
+        Returns:
+            Starting episode number
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # Load explorer actor
+        explorer_path = checkpoint_dir / 'explorer.pt'
+        if explorer_path.exists():
+            self.policy.load_actor('explorer', str(explorer_path))
+        
+        # Load value head
+        value_head_path = checkpoint_dir / 'value_head.pt'
+        if value_head_path.exists():
+            self.value_head.load_state_dict(torch.load(value_head_path, map_location=self.device))
+        
+        # Load optimizer
+        optimizer_path = checkpoint_dir / 'optimizer.pt'
+        if optimizer_path.exists():
+            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+        
+        # Load scheduler
+        scheduler_path = checkpoint_dir / 'scheduler.pt'
+        if scheduler_path.exists() and self.scheduler is not None:
+            self.scheduler.load_state_dict(torch.load(scheduler_path, map_location=self.device))
+        
+        # Load log_std
+        log_std_path = checkpoint_dir / 'log_std.pt'
+        if log_std_path.exists():
+            self.log_std.data = torch.load(log_std_path, map_location=self.device)
+        
+        # Load training state
+        state_path = checkpoint_dir / 'training_state.json'
+        if state_path.exists():
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+            self.global_step = state.get('global_step', 0)
+            return state.get('episode', 0)
+        
+        return 0
+    
+    def log_metrics(self, episode: int):
+        """Log training metrics."""
+        logger.info(f"Episode {episode}:")
+        logger.info(f"  Episode reward: {np.mean(self.metrics['episode_rewards']):.4f}")
+        logger.info(f"  Episode length: {np.mean(self.metrics['episode_lengths']):.1f}")
+        logger.info(f"  Policy loss: {np.mean(self.metrics['policy_loss']):.6f}")
+        logger.info(f"  Value loss: {np.mean(self.metrics['value_loss']):.6f}")
+        logger.info(f"  Entropy: {np.mean(self.metrics['entropy']):.6f}")
+        logger.info(f"  Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Reward components
+        if self.metrics['r1_uncertainty']:
+            logger.info(f"  r1 (uncertainty): {np.mean(self.metrics['r1_uncertainty']):.6f}")
+        if self.metrics['r2_mse']:
+            logger.info(f"  r2 (mse): {np.mean(self.metrics['r2_mse']):.6f}")
+        if self.metrics['r3_mse_improvement']:
+            logger.info(f"  r3 (mse_improvement): {np.mean(self.metrics['r3_mse_improvement']):.6f}")
+    
+    def get_statistics(self) -> Dict[str, float]:
+        """Get current training statistics."""
+        stats = {
+            'mean_episode_reward': np.mean(self.metrics['episode_rewards']) if self.metrics['episode_rewards'] else 0.0,
+            'mean_episode_length': np.mean(self.metrics['episode_lengths']) if self.metrics['episode_lengths'] else 0.0,
+            'mean_policy_loss': np.mean(self.metrics['policy_loss']) if self.metrics['policy_loss'] else 0.0,
+            'mean_value_loss': np.mean(self.metrics['value_loss']) if self.metrics['value_loss'] else 0.0,
+            'mean_entropy': np.mean(self.metrics['entropy']) if self.metrics['entropy'] else 0.0,
+            'global_step': self.global_step,
+            'current_episode': self.current_episode,
+            'learning_rate': self.optimizer.param_groups[0]['lr'],
+        }
+        return stats
+
+
+def setup_explorer_phase1_training(
+    policy,
+    vae,
+    config: Optional[ExplorerTrainingConfig] = None,
+    device: str = "cuda",
+) -> Tuple[ExplorerRLTrainer, Any, Any]:
+    """
+    Convenience function to setup Phase 1 Explorer training.
+    
+    Args:
+        policy: F1_VLA policy
+        vae: VAE model
+        config: Training configuration
+        device: Device
+        
+    Returns:
+        trainer: ExplorerRLTrainer
+        vae_extractor: VAEEmbeddingExtractor
+        reward_manager: ExplorerRewardManager
+    """
+    from .explorer import initialize_explorer, ExplorerConfig
+    from .vae_embedding import VAEEmbeddingExtractor
+    from .reward_computation import ExplorerRewardManager, RewardConfig
+    
+    # Initialize explorer if not exists
+    if 'explorer' not in policy.list_actors():
+        explorer_config = ExplorerConfig(random_init=True)
+        initialize_explorer(policy, explorer_config, device)
+    
+    # Create VAE extractor
+    vae_extractor = VAEEmbeddingExtractor(vae, device=device)
+    
+    # Create reward manager
+    reward_config = RewardConfig()
+    reward_manager = ExplorerRewardManager(reward_config)
+    
+    # Create trainer
+    trainer = ExplorerRLTrainer(
+        policy=policy,
+        vae_extractor=vae_extractor,
+        reward_manager=reward_manager,
+        config=config,
+        device=device,
+    )
+    
+    return trainer, vae_extractor, reward_manager
