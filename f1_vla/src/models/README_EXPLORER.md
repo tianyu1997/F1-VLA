@@ -266,6 +266,7 @@ f1_vla/src/
 │   ├── explorer_rollout.py     # Rollout 收集
 │   ├── explorer_trainer.py     # Phase 1 PPO 训练
 │   ├── adversarial_trainer.py  # Phase 2 对抗训练
+│   ├── f1_integration.py       # F1-VLA和RoboTwin集成
 │   └── README_EXPLORER.md      # 本文档
 ├── scripts/
 │   └── train_explorer.py       # 集成训练脚本
@@ -277,6 +278,73 @@ f1_vla/src/
 │   └── test_adversarial_trainer.py
 └── config/
     └── explorer_train_config.yaml
+```
+
+## 模型集成
+
+### F1-VLA模型加载
+
+```python
+from f1_vla.src.models.f1_integration import load_f1_vla_policy
+
+# 加载模型和VAE
+policy, vae = load_f1_vla_policy(
+    config_path="/path/to/F1_pretrain",
+    checkpoint_path="/path/to/checkpoint",
+    vae_path="/path/to/vae.pth",
+    device="cuda",
+    add_explorer=True,  # 添加Explorer actor
+)
+
+# 使用Explorer
+policy.active_actor = 'explorer'
+action = policy(state, actor_name='explorer')
+```
+
+### RoboTwin环境创建
+
+```python
+from f1_vla.src.models.f1_integration import create_robotwin_env
+
+env = create_robotwin_env(
+    task_name="random_exploration",
+    history_length=4,
+    max_steps=200,
+    image_size=(224, 224),
+    action_scale=0.5,  # 安全探索
+)
+
+obs, info = env.reset()
+obs, reward, terminated, truncated, info = env.step(action)
+```
+
+### ExplorerEnvWrapper
+
+整合policy、VAE和环境的训练wrapper：
+
+```python
+from f1_vla.src.models.f1_integration import ExplorerEnvWrapper
+
+wrapper = ExplorerEnvWrapper(
+    policy=policy,
+    vae=vae,
+    env=env,
+    history_length=4,
+    device="cuda",
+)
+
+# 重置并获取Explorer输入
+explorer_obs, info = wrapper.reset()
+# explorer_obs包含:
+# - state_history: (L+1, state_dim)
+# - action_history: (L, action_dim)
+# - gt_img_emb: (L+1, embed_dim)
+# - pred_img_emb: (L, embed_dim)
+# - pred_uncertainty: (L,)
+
+# 执行动作
+explorer_obs, reward_info, terminated, truncated, info = wrapper.step(action)
+# reward_info包含计算reward所需的所有信息
 ```
 
 ## 测试
