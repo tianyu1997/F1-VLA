@@ -80,6 +80,69 @@ class F1_VLA(nn.Module):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    # ==================== Multi-Actor Interface ====================
+    
+    @property
+    def active_actor(self) -> str:
+        """Get the currently active actor name."""
+        return self.model.active_actor
+    
+    @active_actor.setter
+    def active_actor(self, actor_name: str):
+        """Set the active actor by name."""
+        self.model.active_actor = actor_name
+    
+    def get_actor(self, actor_name: str):
+        """Get a specific actor expert by name."""
+        return self.model.get_actor(actor_name)
+    
+    def add_actor(self, actor_name: str, random_init: bool = True):
+        """Add a new actor expert dynamically.
+        
+        Args:
+            actor_name: Name for the new actor (e.g., "explorer")
+            random_init: If True, randomly initialize weights. If False, copy from active actor.
+        """
+        self.model.add_actor(actor_name, random_init=random_init)
+    
+    def list_actors(self) -> list:
+        """Return list of available actor names."""
+        return self.model.list_actors()
+    
+    def set_trainable_actors(self, actor_names: list):
+        """Set which actors should have trainable parameters.
+        
+        Args:
+            actor_names: List of actor names to train. Other actors will be frozen.
+        """
+        self.model.set_trainable_actors(actor_names)
+    
+    def save_actor(self, actor_name: str, save_path: str):
+        """Save a specific actor's weights.
+        
+        Args:
+            actor_name: Name of the actor to save
+            save_path: Path to save the actor weights
+        """
+        actor = self.get_actor(actor_name)
+        torch.save(actor.state_dict(), save_path)
+        logger.info(f"Saved actor '{actor_name}' to {save_path}")
+    
+    def load_actor(self, actor_name: str, load_path: str, strict: bool = True):
+        """Load weights for a specific actor.
+        
+        Args:
+            actor_name: Name of the actor to load weights into
+            load_path: Path to the saved actor weights
+            strict: Whether to strictly enforce state dict key matching
+        """
+        actor = self.get_actor(actor_name)
+        state_dict = torch.load(load_path, map_location='cpu', weights_only=True)
+        actor.load_state_dict(state_dict, strict=strict)
+        logger.info(f"Loaded actor '{actor_name}' from {load_path}")
+
+    # ==================== End Multi-Actor Interface ====================
+
     @torch.no_grad
     def select_action_with_world_model(
         self, 
@@ -217,10 +280,28 @@ class F1_VLA(nn.Module):
         gen_token_len = gen_logits.shape[1]
         gt_world_model_indices = gt_world_model_indices.reshape(B, -1)[:, :gen_token_len]
         gen_loss = self.gen_loss_fct(gen_logits.reshape(-1, gen_logits.shape[-1]), gt_world_model_indices.reshape(-1)).view(B, -1)
-        gen_loss = gen_loss.mean()
+        
+        # Episode-internal loss warmup: weight down loss for early frames
+        # Memory is inaccurate at episode start, so early frame predictions should contribute less
+        frame_indices = batch.get("frame_idx")
+        warmup_frames = getattr(self.config, 'loss_warmup_frames', 8)  # Default 8 frames warmup
+        warmup_min_weight = getattr(self.config, 'loss_warmup_min_weight', 0.1)  # Minimum weight for frame 0
+        
+        if frame_indices is not None and warmup_frames > 0:
+            # Linear warmup from warmup_min_weight to 1.0 over warmup_frames
+            # weight = warmup_min_weight + (1 - warmup_min_weight) * min(frame_idx / warmup_frames, 1.0)
+            frame_indices = frame_indices.float()
+            loss_weights = warmup_min_weight + (1.0 - warmup_min_weight) * torch.clamp(frame_indices / warmup_frames, max=1.0)
+            loss_weights = loss_weights.view(B, 1).expand_as(gen_loss)  # [B, gen_token_len]
+            gen_loss = (gen_loss * loss_weights).mean()
+            avg_loss_weight = loss_weights[:, 0].mean()  # Average weight across batch
+        else:
+            gen_loss = gen_loss.mean()
+            avg_loss_weight = torch.tensor(1.0, device=gen_loss.device)
 
         loss_dict = {}
         loss_dict["wm_acc_mean"] = (gen_logits.argmax(dim=-1) == gt_world_model_indices).float().mean()
+        loss_dict["loss_weight"] = avg_loss_weight  # Monitor warmup weight
         last_resolution_token_len = self.model.num_resolutions * self.model.num_resolutions
         loss_dict["wm_acc_tail"] = (gen_logits[:, -last_resolution_token_len:].argmax(dim=-1) == gt_world_model_indices[:, -last_resolution_token_len:]).float().mean()
 

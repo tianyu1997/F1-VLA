@@ -71,8 +71,28 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.config = config
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=config.und_expert_config)
-        self.gemma_expert = GemmaForCausalLM(config=config.act_expert_config)
-        self.gemma_expert.model.embed_tokens = None                 # Remove unused embed_tokens
+        
+        # Multi-actor support: use nn.ModuleDict for multiple action experts
+        # Get actor names from config (default: ["actor"])
+        actor_names = getattr(config, 'actor_config', {})
+        if hasattr(actor_names, 'actor_names'):
+            actor_names = actor_names.actor_names
+        elif isinstance(actor_names, dict):
+            actor_names = actor_names.get('actor_names', ['actor'])
+        else:
+            actor_names = ['actor']
+        
+        # Create ModuleDict for action experts
+        self.gemma_experts = nn.ModuleDict()
+        for actor_name in actor_names:
+            expert = GemmaForCausalLM(config=config.act_expert_config)
+            expert.model.embed_tokens = None  # Remove unused embed_tokens
+            self.gemma_experts[actor_name] = expert
+        
+        # Keep backward compatibility: gemma_expert points to "actor" by default
+        self._active_actor = "actor" if "actor" in actor_names else actor_names[0]
+        
+        # World model expert (unchanged)
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None:
             self.gemma_wm_expert = GemmaForCausalLM(config=config.gen_expert_config)
             self.gemma_wm_expert.model.embed_tokens = None             # Remove unused embed_tokens
@@ -88,6 +108,54 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.freeze_gen_expert = False
 
         self.to_bfloat16_like_physical_intelligence()
+    
+    @property
+    def gemma_expert(self):
+        """Backward compatibility: return the active actor expert."""
+        return self.gemma_experts[self._active_actor]
+    
+    @property
+    def active_actor(self):
+        """Get the currently active actor name."""
+        return self._active_actor
+    
+    @active_actor.setter
+    def active_actor(self, actor_name: str):
+        """Set the active actor by name."""
+        if actor_name not in self.gemma_experts:
+            raise ValueError(f"Actor '{actor_name}' not found. Available: {list(self.gemma_experts.keys())}")
+        self._active_actor = actor_name
+    
+    def get_actor(self, actor_name: str):
+        """Get a specific actor expert by name."""
+        if actor_name not in self.gemma_experts:
+            raise ValueError(f"Actor '{actor_name}' not found. Available: {list(self.gemma_experts.keys())}")
+        return self.gemma_experts[actor_name]
+    
+    def add_actor(self, actor_name: str, random_init: bool = True):
+        """Add a new actor expert dynamically.
+        
+        Args:
+            actor_name: Name for the new actor
+            random_init: If True, randomly initialize weights. If False, copy from active actor.
+        """
+        if actor_name in self.gemma_experts:
+            logger.warning(f"Actor '{actor_name}' already exists. Skipping.")
+            return
+        
+        new_expert = GemmaForCausalLM(config=self.config.act_expert_config)
+        new_expert.model.embed_tokens = None
+        
+        if not random_init:
+            # Copy weights from the active actor
+            new_expert.load_state_dict(self.gemma_expert.state_dict())
+        
+        self.gemma_experts[actor_name] = new_expert
+        logger.info(f"Added new actor '{actor_name}' (random_init={random_init})")
+    
+    def list_actors(self):
+        """Return list of available actor names."""
+        return list(self.gemma_experts.keys())
 
     def set_requires_grad(
         self,
@@ -95,6 +163,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         freeze_gen_expert=False,
         train_act_expert_only=False,
         train_gen_expert_only=False,
+        trainable_actors=None,  # List of actor names to train; None means train active actor
     ):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_act_expert_only = train_act_expert_only
@@ -125,11 +194,23 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             and train_gen_expert_only:
             logger.info("Training World Model Expert only")
             self.paligemma.eval()
-            self.gemma_expert.eval()
-            for params in self.paligemma.parameters():
-                params.requires_grad = False
-            for params in self.gemma_expert.parameters():
-                params.requires_grad = False
+            # Freeze all action experts
+            for actor_name, expert in self.gemma_experts.items():
+                expert.eval()
+                for params in expert.parameters():
+                    params.requires_grad = False
+        
+        # Handle multi-actor gradient configuration
+        if trainable_actors is not None:
+            logger.info(f"Trainable actors: {trainable_actors}")
+            for actor_name, expert in self.gemma_experts.items():
+                if actor_name in trainable_actors:
+                    for params in expert.parameters():
+                        params.requires_grad = True
+                else:
+                    expert.eval()
+                    for params in expert.parameters():
+                        params.requires_grad = False
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -142,7 +223,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         if self.train_gen_expert_only:
             self.paligemma.eval()
-            self.gemma_expert.eval()
+            # Keep all action experts in eval mode
+            for expert in self.gemma_experts.values():
+                expert.eval()
 
         if self.freeze_gen_expert:
             self.gemma_wm_expert.eval()
@@ -152,7 +235,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         params_to_change_dtype = [
             "language_model.model.layers",
-            "gemma_expert.model.layers",
+            "gemma_experts",  # Updated for multi-actor
             "gemma_wm_expert.model.layers",
             "vision_tower",
             "multi_modal",
@@ -178,11 +261,18 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         fill_kv_cache: Optional[bool] = None,
         cat_past_key_values: Optional[bool] = False,
         memory_kv: Optional[List[tuple]] = None,  # Memory KV prefix per layer
+        actor_name: Optional[str] = None,  # Which actor to use (None = active actor)
     ):
-        if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None:
-            models = [self.paligemma.language_model.model, self.gemma_wm_expert.model, self.gemma_expert.model]
+        # Select which actor expert to use
+        if actor_name is not None:
+            action_expert = self.get_actor(actor_name)
         else:
-            models = [self.paligemma.language_model.model, self.gemma_expert.model]
+            action_expert = self.gemma_expert  # Uses active actor via property
+        
+        if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None:
+            models = [self.paligemma.language_model.model, self.gemma_wm_expert.model, action_expert.model]
+        else:
+            models = [self.paligemma.language_model.model, action_expert.model]
 
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient

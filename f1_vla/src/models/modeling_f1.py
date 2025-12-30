@@ -162,6 +162,42 @@ class F1FlowMatching(nn.Module):
                 if any (x in name for x in freeze_modules):
                     param.requires_grad = False
 
+    # ==================== Multi-Actor Interface ====================
+    
+    @property
+    def active_actor(self) -> str:
+        """Get the currently active actor name."""
+        return self.paligemma_with_expert.active_actor
+    
+    @active_actor.setter
+    def active_actor(self, actor_name: str):
+        """Set the active actor by name."""
+        self.paligemma_with_expert.active_actor = actor_name
+    
+    def get_actor(self, actor_name: str):
+        """Get a specific actor expert by name."""
+        return self.paligemma_with_expert.get_actor(actor_name)
+    
+    def add_actor(self, actor_name: str, random_init: bool = True):
+        """Add a new actor expert dynamically."""
+        self.paligemma_with_expert.add_actor(actor_name, random_init=random_init)
+    
+    def list_actors(self):
+        """Return list of available actor names."""
+        return self.paligemma_with_expert.list_actors()
+    
+    def set_trainable_actors(self, actor_names: list):
+        """Set which actors should have trainable parameters."""
+        self.paligemma_with_expert.set_requires_grad(
+            freeze_vision_encoder=self.freeze_vision_encoder,
+            freeze_gen_expert=self.freeze_gen_expert,
+            train_act_expert_only=self.train_act_expert_only,
+            train_gen_expert_only=self.train_gen_expert_only,
+            trainable_actors=actor_names,
+        )
+
+    # ==================== End Multi-Actor Interface ====================
+
     def sample_noise(self, shape, device):
         noise = torch.normal(
             mean=0.0,

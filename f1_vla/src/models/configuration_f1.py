@@ -48,6 +48,11 @@ class F1Config(PretrainedConfig):
         memory_config=None,  # Memory module configuration
         # Multi-camera configuration
         camera_config=None,  # Camera settings for multi-camera support
+        # Episode-internal loss warmup
+        loss_warmup_frames=8,  # Linear warmup over first N frames
+        loss_warmup_min_weight=0.1,  # Minimum loss weight for frame 0
+        # Multi-actor configuration
+        actor_config=None,  # Multi-actor settings for explorer training
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -64,6 +69,23 @@ class F1Config(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_implementation = attention_implementation
         self.resize_imgs_with_padding = resize_imgs_with_padding
+
+        # Episode-internal loss warmup
+        self.loss_warmup_frames = loss_warmup_frames
+        self.loss_warmup_min_weight = loss_warmup_min_weight
+
+        # Multi-actor configuration
+        # Supports multiple action experts (e.g., "actor" for policy, "explorer" for RL exploration)
+        if actor_config is None:
+            actor_config = {}
+        self.actor_config = DictWithAttrAccess({
+            # List of actor names to initialize. "actor" is the default policy actor.
+            "actor_names": list(actor_config.get("actor_names", ["actor"])),
+            # Which actor to use for training/inference. Can be overridden at runtime.
+            "active_actor": str(actor_config.get("active_actor", "actor")),
+            # Checkpoints for each actor (dict: actor_name -> ckpt_path or None for random init)
+            "actor_checkpoints": dict(actor_config.get("actor_checkpoints", {})),
+        })
 
         self.num_steps = 10
 
