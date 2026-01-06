@@ -24,7 +24,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from f1_vla.src.models.configuration_f1 import F1Config
 from f1_vla.src.policies.f1_policy import F1_VLA
-from f1_vla.src.policies.teacher_student_policy import TeacherStudentPolicy, StudentOnlyPolicy
+from f1_vla.src.policies.teacher_student_policy import TeacherStudentPolicy, StudentOnlyPolicy, TeacherStudentSplitGPU
 from f1_vla.src.utils.utils import (
     load_ckpt,
     clean_overrides,
@@ -74,6 +74,25 @@ def main(args, overrides):
     policy_config = F1Config.from_pretrained(f"{config.policy.ckpt_path}")
     policy_config = set_policy_config(policy_config, config.policy)
     policy_config = set_camera_config(policy_config, config.exp)
+    
+    # Set memory config from yaml
+    # IMPORTANT: memory_config must be a DictWithAttrAccess object, not individual attributes
+    from f1_vla.src.models.configuration_f1 import DictWithAttrAccess
+    use_memory = config.exp.get('use_memory', False)
+    policy_config.use_memory = use_memory
+    if use_memory and 'memory_config' in config.exp:
+        yaml_memory_config = config.exp.memory_config
+        # Create the full memory_config object that modeling_f1.py expects
+        policy_config.memory_config = DictWithAttrAccess({
+            "memory_len": int(yaml_memory_config.get('memory_len', 16)),
+            "bptt_steps": int(yaml_memory_config.get('bptt_steps', 4)),
+            "init_std": float(yaml_memory_config.get('init_std', 0.02)),
+            "tokenizer_max_length": int(yaml_memory_config.get('tokenizer_max_length', 512)),
+        })
+        logger.info(f"Memory config: use_memory={use_memory}, "
+                   f"memory_len={policy_config.memory_config.memory_len}, "
+                   f"bptt_steps={policy_config.memory_config.bptt_steps}, "
+                   f"init_std={policy_config.memory_config.init_std}")
 
     parser_training_args = HfArgumentParser((PolicyTrainingArguments))
     training_args = OmegaConf.to_container(config.exp.training_args, resolve=True)
@@ -184,10 +203,45 @@ def main(args, overrides):
     ts_config = config.exp.get('teacher_student_config', {})
     use_teacher_student = ts_config.get('use_teacher_student', False)
     use_student_only = ts_config.get('use_student_only', False)
+    use_split_gpu = ts_config.get('use_split_gpu', False)  # NEW: Split GPU mode
     
     logger.info("Creating Teacher-Student model")
     
-    if use_teacher_student:
+    if use_split_gpu:
+        # NEW: Teacher and Student on separate GPUs (avoids OOM)
+        teacher_ckpt = config.exp.get('teacher_ckpt', None)
+        student_ckpt = config.exp.get('student_ckpt', None)
+        memory_loss_weight = ts_config.get('memory_loss_weight', 0.5)
+        use_memory_distillation = ts_config.get('use_memory_distillation', True)
+        teacher_device = ts_config.get('teacher_device', 'cuda:0')
+        student_device = ts_config.get('student_device', 'cuda:1')
+        
+        logger.info(f"Creating TeacherStudentSplitGPU:")
+        logger.info(f"  teacher_ckpt: {teacher_ckpt}")
+        logger.info(f"  student_ckpt: {student_ckpt}")
+        logger.info(f"  teacher_device: {teacher_device}")
+        logger.info(f"  student_device: {student_device}")
+        logger.info(f"  memory_loss_weight: {memory_loss_weight}")
+        logger.info(f"  use_memory_distillation: {use_memory_distillation}")
+        
+        policy = TeacherStudentSplitGPU(
+            config=policy_config,
+            teacher_ckpt=teacher_ckpt,
+            student_ckpt=student_ckpt,
+            memory_loss_weight=memory_loss_weight,
+            use_memory_distillation=use_memory_distillation,
+            teacher_device=teacher_device,
+            student_device=student_device,
+            training_args=training_args,
+        )
+        
+        # CRITICAL: Prevent DataParallel wrapping for SplitGPU mode
+        # We manually manage devices, so tell trainer to treat this as single-GPU
+        training_args._n_gpu = 1
+        logger.info("[SplitGPU] Set _n_gpu=1 to prevent DataParallel wrapping")
+
+    
+    elif use_teacher_student:
         # Teacher-Student with memory distillation
         teacher_ckpt = config.exp.get('teacher_ckpt', None)
         student_ckpt = config.exp.get('student_ckpt', None)

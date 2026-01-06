@@ -38,6 +38,33 @@ def main(args, overrides):
     policy_config = F1Config.from_pretrained(f"{config.policy.ckpt_path}")
     policy_config = set_policy_config(policy_config, config.policy)
     policy_config = set_camera_config(policy_config, config.exp)
+    
+    # Set memory config from exp.use_memory and exp.memory_config
+    use_memory = config.exp.get('use_memory', False)
+    policy_config.use_memory = use_memory
+    if use_memory and hasattr(config.exp, 'memory_config') and config.exp.memory_config:
+        from f1_vla.src.models.configuration_f1 import DictWithAttrAccess
+        mem_cfg = config.exp.memory_config
+        # Use DictWithAttrAccess to match F1Config's expected format
+        policy_config.memory_config = DictWithAttrAccess({
+            "memory_len": int(mem_cfg.get('memory_len', 4)),
+            "bptt_steps": int(mem_cfg.get('bptt_steps', 8)),
+            "init_std": float(mem_cfg.get('init_std', 0.02)),
+            "tokenizer_max_length": int(mem_cfg.get('tokenizer_max_length', 512)),
+        })
+        logger.info(f"Memory enabled: memory_len={policy_config.memory_config.memory_len}, bptt_steps={policy_config.memory_config.bptt_steps}")
+    
+    # Set VAE config from exp.vae_config (pixel_loss_weight, etc.)
+    if hasattr(config.exp, 'vae_config') and config.exp.vae_config:
+        vae_cfg = config.exp.vae_config
+        if hasattr(vae_cfg, 'pixel_loss_weight'):
+            policy_config.pixel_loss_weight = vae_cfg.pixel_loss_weight
+        if hasattr(vae_cfg, 'pixel_loss_type'):
+            policy_config.pixel_loss_type = vae_cfg.pixel_loss_type
+        if hasattr(vae_cfg, 'freeze_encoder'):
+            policy_config.vae_freeze_encoder = vae_cfg.freeze_encoder
+        if hasattr(vae_cfg, 'test_mode'):
+            policy_config.vae_test_mode = vae_cfg.test_mode
 
     parser_training_args = HfArgumentParser((PolicyTrainingArguments))
     training_args = OmegaConf.to_container(config.exp.training_args, resolve=True)

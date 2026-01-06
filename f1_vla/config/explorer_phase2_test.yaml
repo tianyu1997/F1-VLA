@@ -1,0 +1,82 @@
+# Explorer Phase 2 (Adversarial Training) Test Configuration
+
+# Model configuration
+model:
+  pretrained_path: /mnt/data2/ty/F1-VLA/F1_pretrain
+  vae:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
+    vocab_size: 4096
+    z_channels: 32
+  world_model:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/wm
+
+# Environment configuration  
+environment:
+  type: dataset  # Use dataset for offline adversarial training
+  observation:
+    image_size: 256
+    history_length: 4
+  action:
+    dim: 7
+    max_episode_steps: 200
+    
+# Dataset configuration
+dataset:
+  data_dirs:
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+  task_descriptions:
+    - "manipulate objects in clean environment"
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 1  # Minimal for testing
+  batch_size: 4  # Small batch for testing to avoid OOM
+
+# Reward configuration
+reward:
+  alpha: 1.0   # uncertainty weight
+  beta: 0.5    # MSE weight  
+  gamma: 0.3   # MSE improvement weight
+  delta: 0.1   # action penalty weight
+  epsilon: 0.2 # uncertainty improvement weight
+
+# Phase 1: Disabled for Phase 2 test
+phase1:
+  enabled: false
+  ppo:
+    learning_rate: 0.0003
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_epsilon: 0.2
+    value_coef: 0.5
+    entropy_coef: 0.01
+    max_grad_norm: 0.5
+  training:
+    total_timesteps: 0
+    steps_per_rollout: 256
+    num_epochs: 4
+    batch_size: 32
+
+# Phase 2: Adversarial Training (WM vs Explorer)
+phase2:
+  enabled: true
+  adversarial:
+    wm_learning_rate: 0.00005
+    explorer_learning_rate: 0.0001
+    wm_updates_per_iter: 2
+    explorer_updates_per_iter: 2
+    warmup_iterations: 3
+    collapse_threshold: 0.1
+  training:
+    total_iterations: 100  # Short test
+
+# Output configuration
+output:
+  dir: outputs/explorer_phase2_test
+  log_freq: 5
+  save_freq: 50
+
+# Hardware configuration
+hardware:
+  device: cuda
+  mixed_precision: true
+  seed: 42

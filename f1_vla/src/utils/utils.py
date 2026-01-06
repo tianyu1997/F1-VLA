@@ -33,7 +33,13 @@ def clean_overrides(override_args):
 
 
 def load_ckpt(policy, config):
-    if config.exp.load_ckpt is not None:
+    # Safely check for load_ckpt key (OmegaConf may raise exception)
+    try:
+        load_ckpt_path = config.exp.load_ckpt if hasattr(config.exp, 'load_ckpt') else None
+    except:
+        load_ckpt_path = None
+    
+    if load_ckpt_path is not None:
         import os
         from safetensors import safe_open
         
@@ -60,9 +66,39 @@ def load_ckpt(policy, config):
         if missing:
             logger.info(f"  NOTE: {len(missing)} keys not in checkpoint (VAE/PaliGemma loaded separately)")
         
-        # Load with strict=False since VAE and PaliGemma are loaded separately
-        F1_VLA._load_as_safetensor(policy, ckpt_path, "cpu", strict=False)
-        logger.info(f"Successfully loaded {len(matched)} weights from pretrained checkpoint!")
+        # Check for memory_info_proj shape mismatch (due to GRU fix)
+        memory_proj_keys = [k for k in model_keys if 'memory_info_proj' in k]
+        skip_keys = []
+        if memory_proj_keys:
+            model_state = policy.state_dict()
+            with safe_open(ckpt_path, framework="pt") as f:
+                for key in memory_proj_keys:
+                    if key in ckpt_keys:
+                        model_shape = model_state[key].shape
+                        ckpt_tensor = f.get_tensor(key)
+                        ckpt_shape = ckpt_tensor.shape
+                        if model_shape != ckpt_shape:
+                            skip_keys.append(key)
+                            logger.warning(f"  SKIP {key}: shape mismatch (model={model_shape} vs ckpt={ckpt_shape})")
+                            logger.warning(f"    -> Will randomly initialize this layer (GRU mechanism updated)")
+        
+        # Load checkpoint, skipping incompatible keys
+        if skip_keys:
+            import torch
+            state_dict = {}
+            with safe_open(ckpt_path, framework="pt") as f:
+                for key in f.keys():
+                    if key not in skip_keys:
+                        state_dict[key] = f.get_tensor(key)
+            
+            missing_keys, unexpected_keys = policy.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded checkpoint with {len(skip_keys)} skipped keys (shape mismatch)")
+            logger.info(f"  Skipped: {skip_keys}")
+        else:
+            # Load with strict=False since VAE and PaliGemma are loaded separately
+            F1_VLA._load_as_safetensor(policy, ckpt_path, "cpu", strict=False)
+        
+        logger.info(f"Successfully loaded {len(matched) - len(skip_keys)} weights from pretrained checkpoint!")
     else:
         logger.info("No pretrained checkpoint specified, training from scratch")
         
@@ -98,6 +134,16 @@ def set_policy_config(policy_config, src_config):
         policy_config.loss_warmup_frames = src_config.loss_warmup_frames
     if hasattr(src_config, 'loss_warmup_min_weight'):
         policy_config.loss_warmup_min_weight = src_config.loss_warmup_min_weight
+    
+    # Pixel-level reconstruction loss configuration
+    if hasattr(src_config, 'vae_config'):
+        vae_cfg = src_config.vae_config
+        if hasattr(vae_cfg, 'pixel_loss_weight'):
+            policy_config.pixel_loss_weight = vae_cfg.pixel_loss_weight
+        if hasattr(vae_cfg, 'pixel_loss_type'):
+            policy_config.pixel_loss_type = vae_cfg.pixel_loss_type
+        if hasattr(vae_cfg, 'freeze_encoder'):
+            policy_config.vae_freeze_encoder = vae_cfg.freeze_encoder
 
     return policy_config
 

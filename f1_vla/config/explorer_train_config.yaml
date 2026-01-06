@@ -38,7 +38,7 @@ model:
 # =============================================================================
 environment:
   # 环境类型
-  type: "robotwin"  # robotwin, libero, simpler
+  type: "mock"  # Changed to mock for testing (options: robotwin, libero, simpler, mock)
   
   # RoboTwin环境配置
   robotwin:
@@ -53,7 +53,7 @@ environment:
     
   # 动作配置
   action:
-    dim: 14  # 机器人动作维度
+    dim: 7  # F1-VLA模型输出动作维度 (7-DOF robot arm)
     max_episode_steps: 200
 
 # =============================================================================

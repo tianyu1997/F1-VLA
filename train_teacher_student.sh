@@ -34,6 +34,9 @@ MEMORY_THRESHOLD=2000
 # Change to project directory
 cd /mnt/data2/ty/F1-VLA
 
+# Set memory management environment variables to reduce fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+
 # Parse arguments
 while getopts "c:ag:m:p:h" opt; do
     case $opt in
@@ -133,7 +136,8 @@ mkdir -p logs
 # Create log file name with timestamp
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CONFIG_NAME=$(basename "$CONFIG_FILE" .yaml)
-LOG_FILE="logs/teacher_student_${CONFIG_NAME}_${TIMESTAMP}.log"
+LOG_FILE="logs/${CONFIG_NAME}_${TIMESTAMP}.log"
+LOG_BASENAME="${CONFIG_NAME}_${TIMESTAMP}.log"
 
 echo "=============================================="
 echo "Teacher-Student Distillation Training"
@@ -142,14 +146,24 @@ echo "Config:     $CONFIG_FILE"
 echo "GPUs:       $GPUS ($NUM_GPUS GPUs)"
 echo "Port:       $MASTER_PORT"
 echo "Log file:   $LOG_FILE"
+echo "Latest log: logs/latest_teacher_student.log"
 echo "=============================================="
 
 # Export GPU configuration
 export CUDA_VISIBLE_DEVICES=$GPUS
 
-# Run training
-if [ "$NUM_GPUS" -gt 1 ]; then
-    echo "Starting distributed training on $NUM_GPUS GPUs..."
+# Check if using split_gpu mode (teacher and student on separate GPUs)
+USE_SPLIT_GPU=$(grep -E "^\s+use_split_gpu:\s*[Tt]rue" "$CONFIG_FILE" || echo "")
+
+if [ -n "$USE_SPLIT_GPU" ]; then
+    # SplitGPU mode: single process, teacher and student manage their own devices
+    echo "Mode: SplitGPU (teacher and student on separate GPUs)"
+    echo "Note: Devices are managed by TeacherStudentSplitGPU class"
+    nohup python train_teacher_student.py \
+        --config-file "$CONFIG_FILE" \
+        > "$LOG_FILE" 2>&1 &
+elif [ "$NUM_GPUS" -gt 1 ]; then
+    echo "Mode: Distributed training on $NUM_GPUS GPUs..."
     nohup torchrun \
         --nproc_per_node=$NUM_GPUS \
         --master_port=$MASTER_PORT \
@@ -157,7 +171,7 @@ if [ "$NUM_GPUS" -gt 1 ]; then
         --config-file "$CONFIG_FILE" \
         > "$LOG_FILE" 2>&1 &
 else
-    echo "Starting single-GPU training..."
+    echo "Mode: Single-GPU training..."
     nohup python train_teacher_student.py \
         --config-file "$CONFIG_FILE" \
         > "$LOG_FILE" 2>&1 &
@@ -171,8 +185,8 @@ echo "Training started in background"
 echo "PID: $PID"
 echo "Log: $LOG_FILE"
 echo ""
-echo "Monitor with: tail -f $LOG_FILE"
+echo "Monitor with: tail -f logs/latest_teacher_student.log"
 echo "Stop with:    kill $PID"
 
-# Create latest log symlink
-ln -sf "$LOG_FILE" logs/latest_teacher_student_log
+# Create latest log symlink (same style as train.sh)
+ln -sf "$LOG_BASENAME" "logs/latest_teacher_student.log"

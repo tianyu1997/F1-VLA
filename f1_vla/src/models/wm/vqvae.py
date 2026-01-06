@@ -24,9 +24,11 @@ class VQVAE(nn.Module):
         default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)
         v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]
         test_mode=True,
+        freeze_encoder=True,    # Freeze encoder and quantizer, only train decoder
     ):
         super().__init__()
         self.test_mode = test_mode
+        self.freeze_encoder = freeze_encoder
         self.V, self.Cvae = vocab_size, z_channels
         # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
         ddconfig = dict(
@@ -51,6 +53,19 @@ class VQVAE(nn.Module):
         if self.test_mode:
             self.eval()
             [p.requires_grad_(False) for p in self.parameters()]
+        elif self.freeze_encoder:
+            # Freeze encoder, quantizer, and quant_conv, but allow decoder and post_quant_conv to train
+            self.encoder.eval()
+            self.quantize.eval()
+            self.quant_conv.eval()
+            [p.requires_grad_(False) for p in self.encoder.parameters()]
+            [p.requires_grad_(False) for p in self.quantize.parameters()]
+            [p.requires_grad_(False) for p in self.quant_conv.parameters()]
+            # Decoder and post_quant_conv remain trainable
+            self.decoder.train()
+            self.post_quant_conv.train()
+            [p.requires_grad_(True) for p in self.decoder.parameters()]
+            [p.requires_grad_(True) for p in self.post_quant_conv.parameters()]
     
     # ===================== `forward` is only used in VAE training =====================
     def forward(self, inp, ret_usages=False):   # -> rec_B3HW, idx_N, loss

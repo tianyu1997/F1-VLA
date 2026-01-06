@@ -51,6 +51,9 @@ class F1Config(PretrainedConfig):
         # Episode-internal loss warmup
         loss_warmup_frames=8,  # Linear warmup over first N frames
         loss_warmup_min_weight=0.1,  # Minimum loss weight for frame 0
+        # Pixel-level reconstruction loss for world model
+        pixel_loss_weight=0.0,  # Weight for pixel-level loss (0 = disabled)
+        pixel_loss_type="mse",  # 'mse' or 'l1'
         # Multi-actor configuration
         actor_config=None,  # Multi-actor settings for explorer training
         **kwargs,
@@ -73,6 +76,10 @@ class F1Config(PretrainedConfig):
         # Episode-internal loss warmup
         self.loss_warmup_frames = loss_warmup_frames
         self.loss_warmup_min_weight = loss_warmup_min_weight
+        
+        # Pixel-level reconstruction loss
+        self.pixel_loss_weight = pixel_loss_weight
+        self.pixel_loss_type = pixel_loss_type
 
         # Multi-actor configuration
         # Supports multiple action experts (e.g., "actor" for policy, "explorer" for RL exploration)

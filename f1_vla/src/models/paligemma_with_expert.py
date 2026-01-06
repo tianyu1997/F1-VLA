@@ -150,6 +150,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             # Copy weights from the active actor
             new_expert.load_state_dict(self.gemma_expert.state_dict())
         
+        # Convert to bfloat16 to match other experts
+        for param in new_expert.model.layers.parameters():
+            param.data = param.data.to(dtype=torch.bfloat16)
+        
         self.gemma_experts[actor_name] = new_expert
         logger.info(f"Added new actor '{actor_name}' (random_init={random_init})")
     
@@ -192,9 +196,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None \
             and train_gen_expert_only:
-            logger.info("Training World Model Expert only")
-            self.paligemma.eval()
-            # Freeze all action experts
+            logger.info("Training World Model Expert + PaliGemma (unfrozen)")
+            # PaliGemma is NOT frozen - allow it to learn with memory
+            # Only freeze all action experts
             for actor_name, expert in self.gemma_experts.items():
                 expert.eval()
                 for params in expert.parameters():
@@ -222,7 +226,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
 
         if self.train_gen_expert_only:
-            self.paligemma.eval()
+            # PaliGemma stays in train mode (unfrozen)
             # Keep all action experts in eval mode
             for expert in self.gemma_experts.values():
                 expert.eval()
@@ -262,6 +266,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         cat_past_key_values: Optional[bool] = False,
         memory_kv: Optional[List[tuple]] = None,  # Memory KV prefix per layer
         actor_name: Optional[str] = None,  # Which actor to use (None = active actor)
+        experts_only_memory: bool = True,  # If True, memory_kv only affects experts, not frozen paligemma
     ):
         # Select which actor expert to use
         if actor_name is not None:
@@ -271,8 +276,11 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None:
             models = [self.paligemma.language_model.model, self.gemma_wm_expert.model, action_expert.model]
+            # Track which model indices are experts (not frozen paligemma)
+            expert_model_indices = {1, 2}  # gemma_wm_expert and action_expert
         else:
             models = [self.paligemma.language_model.model, action_expert.model]
+            expert_model_indices = {1}  # only action_expert
 
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient
@@ -283,7 +291,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             batch_size = hidden_states.shape[0]
 
         # Pre-process attention mask for memory prefix
-        # Memory KV will be prepended to all layers, so we extend mask once
+        # Memory KV will be prepended to expert layers, so we extend mask once
+        mem_len = 0
         if memory_kv is not None and attention_mask is not None:
             mem_len = memory_kv[0][0].shape[1]  # All layers have same mem_len
             seq_q = attention_mask.shape[1]
@@ -329,6 +338,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             key_states = apply_rope(key_states, position_ids)
 
             # Prepend memory KV if provided (memory doesn't use RoPE)
+            # When experts_only_memory=True, only expert queries attend to memory
             if memory_kv is not None and layer_idx < len(memory_kv):
                 mem_k, mem_v = memory_kv[layer_idx]
                 # mem_k, mem_v: (batch, mem_len, num_kv_heads, head_dim)
@@ -336,6 +346,18 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 mem_v = mem_v.to(dtype=value_states.dtype, device=value_states.device)
                 key_states = torch.cat([mem_k, key_states], dim=1)
                 value_states = torch.cat([mem_v, value_states], dim=1)
+                
+                # If experts_only_memory, mask out memory attention for paligemma queries
+                # This is done by modifying the attention mask for paligemma's query positions
+                if experts_only_memory and attention_mask is not None:
+                    # Get paligemma's sequence length (first in inputs_embeds)
+                    pali_seq_len = inputs_embeds[0].shape[1] if inputs_embeds[0] is not None else 0
+                    if pali_seq_len > 0:
+                        # Mask out memory positions for paligemma queries (first pali_seq_len queries)
+                        # attention_mask shape: (batch, total_q_len, mem_len + total_kv_len)
+                        # Set memory positions to False for paligemma queries
+                        attention_mask = attention_mask.clone()
+                        attention_mask[:, :pali_seq_len, :mem_len] = False
 
             if use_cache and past_key_values is None:
                 past_key_values = {}

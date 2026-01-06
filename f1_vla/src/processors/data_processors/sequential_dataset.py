@@ -425,8 +425,19 @@ class SequentialBatchSampler(Sampler):
                     yield batch_indices
     
     def __len__(self) -> int:
-        # Total number of batches for this rank (approximate)
-        return len(self.local_episode_ids) * 40 // self.batch_size  # ~40 frames per episode
+        # Accurate count: total batches for one pass through all episodes
+        # This allows Trainer to correctly calculate epoch boundaries
+        total_batches = 0
+        for batch_start in range(0, self.local_num_episodes, self.batch_size):
+            batch_end = min(batch_start + self.batch_size, self.local_num_episodes)
+            batch_episodes = list(range(batch_start, batch_end))
+            if self.drop_last and len(batch_episodes) < self.batch_size:
+                continue
+            # Count frames in this batch
+            batch_sample_lists = [self.episode_samples[self.local_episode_ids[i]] for i in batch_episodes]
+            max_len = max(len(samples) for samples in batch_sample_lists)
+            total_batches += max_len
+        return total_batches
 
 
 class SequentialCollateFn:

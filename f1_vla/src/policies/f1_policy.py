@@ -3,7 +3,7 @@ import logging
 import packaging
 from pathlib import Path
 from collections import deque
-from typing import List
+from typing import List, Optional
 
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
@@ -15,10 +15,11 @@ from safetensors.torch import save_model as save_model_as_safetensor
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from lerobot.constants import ACTION, OBS_STATE
-from lerobot.policies.pi0.modeling_pi0 import resize_with_pad, pad_vector
+from lerobot.policies.pi0.modeling_pi0 import resize_with_pad, pad_vector, create_sinusoidal_pos_embedding
 
 from transformers import AutoTokenizer
 from transformers.utils import logging
@@ -38,11 +39,17 @@ class F1_VLA(nn.Module):
     def __init__(
         self,
         config: F1Config,
+        device: Optional[torch.device] = None,
         **kwargs,
     ):
         super().__init__()
         self.config = config
         self.use_world_model = config.use_world_model
+        
+        # Determine target device for VAE loading
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._init_device = device
 
         self.language_tokenizer = AutoTokenizer.from_pretrained(config.language_tokenizer_path)
 
@@ -53,21 +60,26 @@ class F1_VLA(nn.Module):
             vocab_size=config.gen_expert_config.vae.vocab_size, 
             z_channels=config.gen_expert_config.vae.z_channels, 
             ch=config.gen_expert_config.vae.ch, 
+            dropout=getattr(config.gen_expert_config.vae, 'dropout', 0.0),
             test_mode=config.gen_expert_config.vae.test_mode, 
             share_quant_resi=config.gen_expert_config.vae.share_quant_resi, 
             v_patch_nums=patch_nums
         )
         if os.path.exists(config.gen_expert_config.vae.vae_ckpt):
-            vae_ckpt = torch.load(config.gen_expert_config.vae.vae_ckpt, map_location='cpu', weights_only=False)
+            # Load VAE weights directly to target device
+            vae_ckpt = torch.load(config.gen_expert_config.vae.vae_ckpt, map_location=device, weights_only=False)
             self.vae.load_state_dict(vae_ckpt, strict=True)
             del vae_ckpt
+        # Move VAE to target device
+        self.vae = self.vae.to(device)
         for param in self.vae.parameters():
             param.requires_grad = False
 
         self.use_only_3rd_hist_image = True
         self.last_l = patch_nums[-1] * patch_nums[-1]
 
-        self.gen_loss_fct = nn.CrossEntropyLoss(reduction="none")
+        # Add label smoothing to prevent overfitting on discrete VAE tokens
+        self.gen_loss_fct = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.1)
 
         self.model = F1FlowMatching(config, patch_nums, self.vae, **kwargs)
 
@@ -140,6 +152,213 @@ class F1_VLA(nn.Module):
         state_dict = torch.load(load_path, map_location='cpu', weights_only=True)
         actor.load_state_dict(state_dict, strict=strict)
         logger.info(f"Loaded actor '{actor_name}' from {load_path}")
+    
+    def forward_with_actor(
+        self,
+        batch: dict[str, Tensor],
+        actor_name: str = None,
+        return_action_stats: bool = False,
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        **kwargs
+    ) -> dict[str, Tensor]:
+        """Forward pass with a specific actor.
+        
+        This method temporarily switches to the specified actor, performs
+        the forward pass, and returns the results including optional 
+        action statistics for RL training.
+        
+        Args:
+            batch: Input batch with observations. Can be:
+                   - Full F1-VLA batch format with "observation.images.image0", etc.
+                   - Simplified format with "state_emb" or "observation.state" for RL
+            actor_name: Name of the actor to use (if None, uses active actor)
+            return_action_stats: If True, return additional stats for RL
+            noise: Optional noise for flow matching
+            time: Optional time for flow matching
+            **kwargs: Additional arguments passed to underlying forward
+            
+        Returns:
+            dict with:
+                - 'action': Action output (B, action_dim)
+                - 'state_emb': State embedding for value head (if return_action_stats)
+        """
+        # Save current active actor
+        original_actor = self.active_actor
+        
+        # Switch to specified actor if provided
+        if actor_name is not None and actor_name != original_actor:
+            self.active_actor = actor_name
+        
+        try:
+            output_dict = {}
+            
+            # Check if we have full image data or just state embeddings (RL mode)
+            has_images = "observation.images.image0" in batch
+            
+            if has_images:
+                # Full forward path with images
+                images, img_masks = self.prepare_mix_images(batch)
+                state = self.prepare_state(batch)
+                lang_tokens, lang_masks = self.prepare_language(batch)
+                
+                # Get state embedding
+                state_emb = self.model.state_proj(state)  # (B, hidden_dim)
+                output_dict['state_emb'] = state_emb
+                
+                B = state.shape[0]
+                device = state.device
+                
+                # Prepare time embedding
+                if time is None:
+                    time = torch.ones(B, device=device)
+                
+                # Time projection using sinusoidal embedding (same as modeling_f1.py)
+                # NOTE: action MLPs are in float32, paligemma is in bfloat16
+                from lerobot.policies.pi0.modeling_pi0 import create_sinusoidal_pos_embedding
+                time_emb = create_sinusoidal_pos_embedding(
+                    time, self.config.proj_width, min_period=4e-3, max_period=4.0, device=device
+                )
+                time_emb = time_emb.float()  # Keep in float32 for action MLPs
+                
+                # Prepare action input
+                action_dim = self.config.max_action_dim
+                chunk_size = self.config.chunk_size
+                
+                if noise is None:
+                    action_input = torch.zeros(B, chunk_size, action_dim, device=device, dtype=torch.float32)
+                else:
+                    action_input = noise.float()
+                
+                # Project action input (action_in_proj is float32)
+                action_emb = self.model.action_in_proj(action_input)
+                
+                # Fuse timestep + action information using an MLP (same as modeling_f1.py)
+                time_emb_expanded = time_emb[:, None, :].expand_as(action_emb)
+                action_time_emb = torch.cat([action_emb, time_emb_expanded], dim=2)
+                action_time_emb = self.model.action_time_mlp_in(action_time_emb)
+                action_time_emb = F.silu(action_time_emb)  # swish == silu
+                action_time_emb = self.model.action_time_mlp_out(action_time_emb)
+                
+                # Get prefix embeddings from understanding expert
+                und_embs, und_pad_masks, und_att_masks = self.model.embed_prefix(
+                    images, img_masks, lang_tokens, lang_masks
+                )
+                
+                # Ensure dtypes match und_embs (paligemma is bfloat16)
+                target_dtype = und_embs.dtype
+                action_time_emb = action_time_emb.to(dtype=target_dtype)
+                state_emb = state_emb.to(dtype=target_dtype)
+                
+                # Add state and action_time_emb to create suffix
+                suffix_embs = torch.cat([
+                    state_emb.unsqueeze(1),
+                    action_time_emb,
+                ], dim=1)
+                
+                suffix_len = suffix_embs.shape[1]
+                suffix_pad_masks = torch.ones(B, suffix_len, dtype=und_pad_masks.dtype, device=device)
+                suffix_att_masks = torch.ones(B, suffix_len, dtype=und_att_masks.dtype, device=device)
+                
+                pad_masks = torch.cat([und_pad_masks, suffix_pad_masks], dim=1)
+                att_masks = torch.cat([und_att_masks, suffix_att_masks], dim=1)
+                
+                from f1_vla.src.models.modeling_f1 import make_att_2d_masks
+                att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+                position_ids = torch.cumsum(pad_masks, dim=1) - 1
+                
+                # Forward through the model
+                (_, _, act_out), _ = self.model.paligemma_with_expert.forward(
+                    attention_mask=att_2d_masks,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[und_embs, None, suffix_embs],
+                    use_cache=False,
+                    fill_kv_cache=False,
+                )
+                
+                # Output action processing (act_out already processed by model)
+                action_features = act_out[:, 1:, :]  # Skip state token
+                # Convert to float32 for action_out_proj (which is float32)
+                action_features = action_features.to(dtype=torch.float32)
+                action_output = self.model.action_out_proj(action_features)
+                action_mean = action_output[:, 0, :]
+                
+            else:
+                # Simplified RL mode - use state embedding directly
+                # Get state from observation - raise error if missing
+                if "state_emb" in batch:
+                    state_emb = batch["state_emb"]
+                elif "observation.state" in batch:
+                    state = batch["observation.state"]
+                    if state.dim() == 1:
+                        state = state.unsqueeze(0)
+                    state_emb = self.model.state_proj(state)
+                else:
+                    raise ValueError(
+                        f"forward_with_actor (RL mode) requires 'state_emb' or 'observation.state' in batch. "
+                        f"Got keys: {list(batch.keys())}"
+                    )
+                
+                output_dict['state_emb'] = state_emb
+                
+                B = state_emb.shape[0]
+                device = state_emb.device
+                dtype = state_emb.dtype
+                
+                # For RL mode, use a simple MLP path through action projection
+                # Simplified: just use state + noise -> action
+                
+                # Time embedding using sinusoidal encoding (same as embed_suffix)
+                if time is None:
+                    time = torch.ones(B, device=device)
+                
+                from lerobot.policies.pi0.modeling_pi0 import create_sinusoidal_pos_embedding
+                time_emb = create_sinusoidal_pos_embedding(
+                    time, self.config.proj_width, min_period=4e-3, max_period=4.0, device=device
+                )
+                time_emb = time_emb.type(dtype=dtype)
+                
+                # Project action input (zeros for deterministic forward)
+                # For RL, we use chunk_size=1 for single-step actions
+                action_dim = self.config.max_action_dim
+                rl_chunk_size = 1  # Single step for RL
+                
+                if noise is None:
+                    action_input = torch.zeros(B, rl_chunk_size, action_dim, device=device, dtype=dtype)
+                else:
+                    action_input = noise.to(device=device, dtype=dtype)
+                    if action_input.dim() == 2:
+                        action_input = action_input.unsqueeze(1)  # (B, action_dim) -> (B, 1, action_dim)
+                
+                action_emb = self.model.action_in_proj(action_input)
+                
+                # Fuse time and action
+                time_emb_expanded = time_emb[:, None, :].expand_as(action_emb)
+                action_time_emb = torch.cat([action_emb, time_emb_expanded], dim=2)
+                
+                # Pass through MLPs
+                action_time_emb = self.model.action_time_mlp_in(action_time_emb)
+                action_time_emb = F.silu(action_time_emb)
+                action_time_emb = self.model.action_time_mlp_out(action_time_emb)
+                
+                # Project to action space and squeeze chunk dim
+                action_mean = self.model.action_out_proj(action_time_emb)  # (B, 1, action_dim)
+                action_mean = action_mean.squeeze(1)  # (B, action_dim)
+            
+            # Truncate to actual action dim
+            actual_action_dim = 7
+            if action_mean.shape[-1] > actual_action_dim:
+                action_mean = action_mean[..., :actual_action_dim]
+            
+            output_dict['action'] = action_mean
+            
+            return output_dict
+            
+        finally:
+            # Restore original actor
+            if actor_name is not None and actor_name != original_actor:
+                self.active_actor = original_actor
 
     # ==================== End Multi-Actor Interface ====================
 
@@ -256,11 +475,31 @@ class F1_VLA(nn.Module):
         world_model_images = self.prepare_mix_history_images(batch)
         B, T, C, H, W = world_model_images.shape
         world_model_images = world_model_images.reshape(B * T, C, H, W)
+        
+        # DEBUG: Check world_model_images before VAE encoding
+        if torch.isnan(world_model_images).any() or torch.isinf(world_model_images).any():
+            logger.error(f"[F1_VLA] world_model_images has nan/inf BEFORE VAE! "
+                        f"shape={world_model_images.shape}, nan={torch.isnan(world_model_images).sum()}")
+        
         world_model_image_indices = self.model.vae.img_to_idxBl(world_model_images)
+        
+        # DEBUG: Check indices after VAE encoding
+        for i, idx in enumerate(world_model_image_indices):
+            if torch.isnan(idx.float()).any() or torch.isinf(idx.float()).any():
+                logger.error(f"[F1_VLA] world_model_image_indices[{i}] has nan/inf! shape={idx.shape}")
+            if (idx < 0).any() or (idx >= self.config.gen_expert_config.vae.vocab_size).any():
+                logger.error(f"[F1_VLA] world_model_image_indices[{i}] out of range! min={idx.min()}, max={idx.max()}")
+        
         # prepare the output of world model
         gt_world_model_indices = torch.cat(world_model_image_indices, dim=1).reshape(B, T, -1)[:, cur_n_obs_img_steps: cur_n_obs_img_steps + cur_n_pred_img_steps].contiguous()
         # prepare the input of world model
         world_model_embs = self.model.vae.quantize.idxBl_to_var_input(world_model_image_indices)
+        
+        # DEBUG: Check embeddings after quantization
+        if torch.isnan(world_model_embs).any() or torch.isinf(world_model_embs).any():
+            logger.error(f"[F1_VLA] world_model_embs has nan/inf! shape={world_model_embs.shape}, "
+                        f"nan={torch.isnan(world_model_embs).sum()}")
+        
         world_model_embs = world_model_embs.reshape(B, T, *world_model_embs.shape[1:])
         world_model_input_embs = world_model_embs[:, :cur_n_obs_img_steps]
         world_model_output_embs = world_model_embs[:, cur_n_obs_img_steps:cur_n_obs_img_steps + cur_n_pred_img_steps]
@@ -270,16 +509,85 @@ class F1_VLA(nn.Module):
         #########################################################
         # Get memory state if enabled
         #########################################################
-        memory_kv, _, should_detach = self._get_memory_state(batch)
+        memory_kv, memory_token, should_detach = self._get_memory_state(batch)
 
         #########################################################
         # Forward and compute the loss
         #########################################################
-        action_losses, gen_logits = self.model.forward_with_world_model(images, img_masks, lang_tokens, lang_masks, state, world_model_input_embs, world_model_output_embs, actions, noise, time, memory_kv=memory_kv)
+        # Temporarily set train_gen_expert_only flag on model
+        original_train_gen_expert_only = getattr(self.model, 'train_gen_expert_only', False)
+        self.model.train_gen_expert_only = train_gen_expert_only
+        
+        # DEBUG: Check all model inputs for NaN/Inf
+        def _check_tensor(name, t):
+            if t is not None and isinstance(t, torch.Tensor):
+                if torch.isnan(t).any() or torch.isinf(t).any():
+                    logger.error(f"[F1_VLA] {name} has nan/inf! shape={t.shape}")
+                    return True
+            return False
+        
+        has_nan_input = False
+        has_nan_input |= _check_tensor("images", images)
+        has_nan_input |= _check_tensor("state", state)
+        has_nan_input |= _check_tensor("world_model_input_embs", world_model_input_embs)
+        has_nan_input |= _check_tensor("world_model_output_embs", world_model_output_embs)
+        has_nan_input |= _check_tensor("actions", actions)
+        if memory_kv is not None:
+            for i, (k, v) in enumerate(memory_kv):
+                has_nan_input |= _check_tensor(f"memory_kv[{i}].k", k)
+                has_nan_input |= _check_tensor(f"memory_kv[{i}].v", v)
+        has_nan_input |= _check_tensor("memory_token", memory_token)
+        
+        if has_nan_input:
+            logger.error("[F1_VLA] Model inputs have NaN/Inf! Skipping forward.")
+        
+        try:
+            action_losses, gen_logits, memory_info, past_key_values = self.model.forward_with_world_model(
+                images, img_masks, lang_tokens, lang_masks, state, 
+                world_model_input_embs, world_model_output_embs, actions, noise, time, 
+                memory_kv=memory_kv, memory_token=memory_token
+            )
+        finally:
+            # Restore original flag
+            self.model.train_gen_expert_only = original_train_gen_expert_only
 
         gen_token_len = gen_logits.shape[1]
         gt_world_model_indices = gt_world_model_indices.reshape(B, -1)[:, :gen_token_len]
-        gen_loss = self.gen_loss_fct(gen_logits.reshape(-1, gen_logits.shape[-1]), gt_world_model_indices.reshape(-1)).view(B, -1)
+        
+        # Debug: check for invalid values before CrossEntropyLoss
+        vocab_size = self.config.gen_expert_config.vae.vocab_size
+        if torch.isnan(gen_logits).any() or torch.isinf(gen_logits).any():
+            logger.error(f"[F1_VLA] gen_logits has nan/inf! shape={gen_logits.shape}, "
+                        f"nan_count={torch.isnan(gen_logits).sum()}, inf_count={torch.isinf(gen_logits).sum()}")
+        if (gt_world_model_indices < 0).any() or (gt_world_model_indices >= vocab_size).any():
+            logger.error(f"[F1_VLA] gt_world_model_indices out of range! "
+                        f"min={gt_world_model_indices.min()}, max={gt_world_model_indices.max()}, "
+                        f"vocab_size={vocab_size}")
+        
+        gen_loss_ce = self.gen_loss_fct(gen_logits.reshape(-1, gen_logits.shape[-1]), gt_world_model_indices.reshape(-1)).view(B, -1)
+        
+        # Pixel-level reconstruction loss
+        pixel_loss_weight = getattr(self.config, 'pixel_loss_weight', 0.0)
+        if pixel_loss_weight > 0:
+            # Get predicted indices from logits
+            pred_indices = gen_logits.argmax(dim=-1)  # [B, gen_token_len]
+            
+            # Decode images
+            with torch.set_grad_enabled(True):  # Enable gradients for VAE decoder
+                gt_images = self._decode_indices_to_images(gt_world_model_indices, B, cur_n_pred_img_steps)
+                pred_images = self._decode_indices_to_images(pred_indices, B, cur_n_pred_img_steps)
+            
+            # Compute pixel loss (MSE or L1)
+            pixel_loss_type = getattr(self.config, 'pixel_loss_type', 'mse')  # 'mse' or 'l1'
+            if pixel_loss_type == 'l1':
+                pixel_loss = F.l1_loss(pred_images, gt_images)
+            else:
+                pixel_loss = F.mse_loss(pred_images, gt_images)
+        else:
+            pixel_loss = torch.tensor(0.0, device=gen_loss_ce.device)
+        
+        # Combine losses
+        gen_loss_combined = gen_loss_ce + pixel_loss_weight * pixel_loss
         
         # Episode-internal loss warmup: weight down loss for early frames
         # Memory is inaccurate at episode start, so early frame predictions should contribute less
@@ -292,22 +600,49 @@ class F1_VLA(nn.Module):
             # weight = warmup_min_weight + (1 - warmup_min_weight) * min(frame_idx / warmup_frames, 1.0)
             frame_indices = frame_indices.float()
             loss_weights = warmup_min_weight + (1.0 - warmup_min_weight) * torch.clamp(frame_indices / warmup_frames, max=1.0)
-            loss_weights = loss_weights.view(B, 1).expand_as(gen_loss)  # [B, gen_token_len]
-            gen_loss = (gen_loss * loss_weights).mean()
+            loss_weights = loss_weights.view(B, 1).expand_as(gen_loss_ce)  # [B, gen_token_len]
+            gen_loss_ce_weighted = (gen_loss_ce * loss_weights).mean()
             avg_loss_weight = loss_weights[:, 0].mean()  # Average weight across batch
         else:
-            gen_loss = gen_loss.mean()
-            avg_loss_weight = torch.tensor(1.0, device=gen_loss.device)
+            gen_loss_ce_weighted = gen_loss_ce.mean()
+            avg_loss_weight = torch.tensor(1.0, device=gen_loss_ce.device)
+        
+        # Final gen_loss with pixel loss
+        gen_loss = gen_loss_ce_weighted + pixel_loss_weight * pixel_loss
 
         loss_dict = {}
+        # Store past_key_values for memory distillation (student needs gradients)
+        loss_dict["past_key_values"] = past_key_values
         loss_dict["wm_acc_mean"] = (gen_logits.argmax(dim=-1) == gt_world_model_indices).float().mean()
         loss_dict["loss_weight"] = avg_loss_weight  # Monitor warmup weight
+        loss_dict["wm_loss_ce"] = gen_loss_ce_weighted  # Cross-entropy loss
+        loss_dict["wm_loss_pixel"] = pixel_loss  # Pixel reconstruction loss
         last_resolution_token_len = self.model.num_resolutions * self.model.num_resolutions
         loss_dict["wm_acc_tail"] = (gen_logits[:, -last_resolution_token_len:].argmax(dim=-1) == gt_world_model_indices[:, -last_resolution_token_len:]).float().mean()
 
         if train_gen_expert_only:
             loss_dict["loss"] = gen_loss
             loss_dict["wm_loss"] = gen_loss
+            
+            # Update memory with GRU and store to memory bank
+            if self.config.use_memory and self.model.memory_manager is not None:
+                dataset_indices = batch.get("dataset_idx")
+                episode_indices = batch.get("episode_idx")
+                frame_indices = batch.get("frame_idx")
+                
+                if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
+                    # Update memory content using GRU if memory_info is available
+                    if memory_info is not None and memory_kv is not None:
+                        updated_memory = self.model.memory_bank.update_memory(memory_kv, memory_info)
+                        self._update_memory_state(batch, updated_memory, should_detach)
+                    
+                    # Update step count for BPTT tracking
+                    for b in range(len(dataset_indices)):
+                        self.model.memory_manager.update_step_count(
+                            dataset_indices[b].item(),
+                            episode_indices[b].item(),
+                            frame_indices[b].item()
+                        )
             
             # Generate images for eval visualization if requested (for gen_expert_only mode)
             if return_images:
@@ -343,15 +678,22 @@ class F1_VLA(nn.Module):
         loss_dict["loss"] = loss_dict["action_loss"] + gen_out_loss_ratio * loss_dict["wm_loss"]
 
         #########################################################
-        # Update memory step count for BPTT tracking
-        # (memory content update can be added later)
+        # Update memory with GRU and store to memory bank
         #########################################################
         if self.config.use_memory and self.model.memory_manager is not None:
-            # Update step count for BPTT tracking
             dataset_indices = batch.get("dataset_idx")
             episode_indices = batch.get("episode_idx")
             frame_indices = batch.get("frame_idx")
+            
             if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
+                # Update memory content using GRU if memory_info is available
+                if memory_info is not None and memory_kv is not None:
+                    # Use GRU to update memory based on memory_info
+                    updated_memory = self.model.memory_bank.update_memory(memory_kv, memory_info)
+                    # Store updated memory to memory bank
+                    self._update_memory_state(batch, updated_memory, should_detach)
+                
+                # Update step count for BPTT tracking
                 for b in range(len(dataset_indices)):
                     self.model.memory_manager.update_step_count(
                         dataset_indices[b].item(),

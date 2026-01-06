@@ -22,7 +22,7 @@ sys.path.insert(0, str(project_root))
 
 
 # =============================================================================
-# F1-VLA Model Loading
+# F1-VLA Model Loading (参考 train_hf.py 和 f1_policy.py)
 # =============================================================================
 
 def load_f1_vla_policy(
@@ -31,61 +31,79 @@ def load_f1_vla_policy(
     vae_path: Optional[str] = None,
     device: str = "cuda",
     add_explorer: bool = True,
+    train_act_expert_only: bool = False,
 ) -> Tuple[nn.Module, nn.Module]:
     """
     Load F1-VLA policy with Explorer actor.
     
+    参考 train_hf.py 中的模型加载方式，使用 F1_VLA 类。
+    
     Args:
-        config_path: Path to F1-VLA config
-        checkpoint_path: Path to pretrained checkpoint (optional)
-        vae_path: Path to VAE checkpoint
+        config_path: Path to F1-VLA config (e.g., F1_pretrain directory)
+        checkpoint_path: Path to pretrained checkpoint (optional, same as config_path for safetensors)
+        vae_path: Path to VAE checkpoint (optional, will use config default if not provided)
         device: Device to load model on
         add_explorer: Whether to add Explorer actor
+        train_act_expert_only: Whether to train only the action expert (for explorer training)
         
     Returns:
-        policy: F1FlowMatching model with Explorer actor
-        vae: VAE model
+        policy: F1_VLA policy with Explorer actor
+        vae: VAE model (from policy.vae)
     """
     from f1_vla.src.models.configuration_f1 import F1Config
-    from f1_vla.src.models.modeling_f1 import F1FlowMatching
+    from f1_vla.src.policies.f1_policy import F1_VLA
+    from f1_vla.src.processors.train_processors.policy_trainer import PolicyTrainingArguments
     
     logger = logging.getLogger(__name__)
     
-    # Load config
-    logger.info(f"Loading F1-VLA config from {config_path}")
+    # 使用 F1_VLA.from_pretrained 加载模型（参考 train_hf.py）
+    # 这会自动处理 config、VAE、checkpoint 的加载
+    logger.info(f"Loading F1-VLA from {config_path}")
+    
+    # Load config first to potentially override paths
     config = F1Config.from_pretrained(config_path)
     
-    # Load VAE
-    logger.info(f"Loading VAE from {vae_path}")
-    vae = load_vae(vae_path, config, device)
+    # Override VAE path if provided
+    if vae_path and os.path.exists(vae_path):
+        config.gen_expert_config.vae.vae_ckpt = vae_path
+        logger.info(f"Using VAE checkpoint: {vae_path}")
     
-    # Get patch numbers from VAE
-    patch_nums = getattr(vae, 'patch_nums', (1, 2, 3, 4, 5, 6, 8, 10, 13, 16))
+    # Fix tokenizer path to local path if the original doesn't exist
+    local_tokenizer_path = str(project_root / "paligemma-3b-pt-224")
+    if not os.path.exists(config.language_tokenizer_path) and os.path.exists(local_tokenizer_path):
+        config.language_tokenizer_path = local_tokenizer_path
+        logger.info(f"Using local tokenizer: {local_tokenizer_path}")
     
-    # Create model
-    logger.info("Creating F1FlowMatching model")
-    policy = F1FlowMatching(config, patch_nums=patch_nums, vae=vae)
+    # Create training_args to control freezing behavior
+    # This is needed for explorer training where only actor should be trainable
+    training_args = PolicyTrainingArguments(
+        output_dir="./outputs",  # Dummy path, not used for inference
+        train_act_expert_only=train_act_expert_only,
+        freeze_vision_encoder=True,  # Always freeze vision encoder for explorer training
+        freeze_gen_expert=True,  # Freeze generation expert for explorer training
+    )
     
-    # Load checkpoint if provided
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        logger.info(f"Loading checkpoint from {checkpoint_path}")
-        state_dict = torch.load(checkpoint_path, map_location=device)
-        if 'model_state_dict' in state_dict:
-            state_dict = state_dict['model_state_dict']
-        policy.load_state_dict(state_dict, strict=False)
+    # Load policy using from_pretrained (handles model.safetensors automatically)
+    policy = F1_VLA.from_pretrained(
+        pretrained_name_or_path=config_path,
+        config=config,
+        strict=False,  # Allow missing keys for flexibility
+        training_args=training_args,  # Pass training_args to control freezing
+    )
     
     # Add Explorer actor
     if add_explorer:
-        logger.info("Adding Explorer actor with random initialization")
-        if hasattr(policy, 'add_actor'):
-            policy.add_actor('explorer', random_init=True)
-            policy.active_actor = 'explorer'
-        else:
-            logger.warning("Policy does not support add_actor method")
+        # Initialize Explorer from existing actor weights for better stability
+        # Random init can cause NaN issues during RL training
+        logger.info("Adding Explorer actor by copying from 'actor' weights")
+        policy.add_actor('explorer', random_init=False)
+        policy.active_actor = 'explorer'
     
+    # Move to device
     policy.to(device)
     
-    return policy, vae
+    # Return policy and its VAE
+    return policy, policy.vae
 
 
 def load_vae(
@@ -108,21 +126,26 @@ def load_vae(
     
     # Try to import VAR VAE
     try:
-        # Import from local var directory
-        var_dir = project_root / "var"
-        sys.path.insert(0, str(var_dir))
-        
-        from models import VQVAE
+        # Import from f1_vla models
+        from f1_vla.src.models.wm.vqvae import VQVAE
         
         # Get VAE config from F1Config
         vae_config = config.gen_expert_config.vae if hasattr(config, 'gen_expert_config') else None
+        
+        # Determine test_mode and freeze_encoder from config
+        # Priority: vae_test_mode > infer from pixel_loss_weight
+        pixel_loss_weight = getattr(config, 'pixel_loss_weight', 0.0)
+        test_mode = getattr(config, 'vae_test_mode', pixel_loss_weight == 0)  # Use explicit config or infer
+        freeze_encoder = getattr(config, 'vae_freeze_encoder', True)  # Default: only train decoder
         
         if vae_config:
             vae = VQVAE(
                 vocab_size=getattr(vae_config, 'vocab_size', 4096),
                 z_channels=getattr(vae_config, 'z_channels', 32),
                 ch=getattr(vae_config, 'ch', 160),
-                test_mode=True,
+                dropout=getattr(vae_config, 'dropout', 0.0),
+                test_mode=test_mode,
+                freeze_encoder=freeze_encoder,
                 share_quant_resi=4,
                 v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
             )
@@ -132,7 +155,9 @@ def load_vae(
                 vocab_size=4096,
                 z_channels=32,
                 ch=160,
-                test_mode=True,
+                dropout=0.0,
+                test_mode=test_mode,
+                freeze_encoder=freeze_encoder,
                 share_quant_resi=4,
                 v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
             )
@@ -211,7 +236,7 @@ def create_robotwin_env(
     task_config_name: str = "demo_randomized",
     history_length: int = 4,
     max_steps: int = 200,
-    image_size: Tuple[int, int] = (224, 224),
+    image_size: Tuple[int, int] | int = (224, 224),
     device: str = "cuda",
     render_mode: str = "rasterize",
     action_scale: float = 0.5,
@@ -226,7 +251,7 @@ def create_robotwin_env(
         task_config_name: Configuration name
         history_length: Number of history frames (L)
         max_steps: Maximum steps per episode
-        image_size: Observation image size
+        image_size: Observation image size (int or tuple)
         device: Device for processing
         render_mode: Rendering mode
         action_scale: Scale for action bounds (smaller = safer)
@@ -237,6 +262,10 @@ def create_robotwin_env(
         env: F1RLEnv environment
     """
     logger = logging.getLogger(__name__)
+    
+    # Convert image_size to tuple if needed
+    if isinstance(image_size, int):
+        image_size = (image_size, image_size)
     
     # Add RoboTwin to path
     robotwin_dir = project_root / "RoboTwin"
@@ -301,8 +330,8 @@ def create_robotwin_env(
         
         return env
         
-    except ImportError as e:
-        logger.warning(f"Could not import RoboTwin: {e}")
+    except (ImportError, FileNotFoundError, Exception) as e:
+        logger.warning(f"Could not create RoboTwin environment: {e}")
         logger.info("Using mock environment")
         return create_mock_env(
             history_length=history_length,
@@ -315,10 +344,15 @@ def create_robotwin_env(
 def create_mock_env(
     history_length: int = 4,
     max_steps: int = 200,
-    image_size: Tuple[int, int] = (224, 224),
+    image_size: Tuple[int, int] | int = (224, 224),
     device: str = "cuda",
+    action_dim: int = 32,
 ) -> Any:
     """Create mock environment for testing."""
+    
+    # Convert image_size to tuple if it's an int
+    if isinstance(image_size, int):
+        image_size = (image_size, image_size)
     
     class MockEnv:
         def __init__(self):
@@ -326,32 +360,37 @@ def create_mock_env(
             self.max_steps = max_steps
             self.image_size = image_size
             self.device = device
-            self.action_dim = 32
+            self.action_dim = action_dim
             self.state_dim = 32
             self.step_count = 0
             
             # Action/observation spaces (gym-like)
             self.action_space = type('Space', (), {
-                'shape': (32,),
-                'sample': lambda self=self: np.random.uniform(-1, 1, 32).astype(np.float32)
+                'shape': (self.action_dim,),
+                'sample': lambda self=self: np.random.uniform(-1, 1, self.action_dim).astype(np.float32)
             })()
             
         def reset(self, seed=None):
             self.step_count = 0
+            # Generate random image with shape (C, H, W) - single frame, not history
+            H, W = self.image_size
             obs = {
                 'state': np.zeros(self.state_dim, dtype=np.float32),
                 'action_history': np.zeros((self.history_length, self.action_dim), dtype=np.float32),
-                'wrist_rgb': np.random.randint(0, 255, (self.history_length, 3, *self.image_size), dtype=np.uint8),
+                'head_rgb': np.random.randint(0, 255, (3, H, W), dtype=np.uint8),  # WM camera
+                'wrist_rgb': np.random.randint(0, 255, (3, H, W), dtype=np.uint8),
             }
             info = {'embodiment': 'mock', 'control_mode': 'delta_qpos'}
             return obs, info
         
         def step(self, action):
             self.step_count += 1
+            H, W = self.image_size
             obs = {
                 'state': np.random.randn(self.state_dim).astype(np.float32),
                 'action_history': np.random.uniform(-1, 1, (self.history_length, self.action_dim)).astype(np.float32),
-                'wrist_rgb': np.random.randint(0, 255, (self.history_length, 3, *self.image_size), dtype=np.uint8),
+                'head_rgb': np.random.randint(0, 255, (3, H, W), dtype=np.uint8),
+                'wrist_rgb': np.random.randint(0, 255, (3, H, W), dtype=np.uint8),
             }
             reward = 0.0  # Explorer computes its own reward
             terminated = False
@@ -554,12 +593,54 @@ class ExplorerEnvWrapper:
         else:
             emb_dim = 32  # Default to z_channels
         
-        # If policy has WM, use it; otherwise return zeros
-        if hasattr(self.policy, 'use_world_model') and self.policy.config.use_world_model:
-            # TODO: Implement actual WM forward pass
-            pass
+        # Try to use actual WM forward pass if policy supports it
+        if hasattr(self.policy, 'forward_with_world_model') and self.policy.config.use_world_model:
+            try:
+                # Build input batch for WM
+                # Need: observation.images.image0_history, observation.state, action
+                
+                # Get image history from gt_emb history or raw images
+                if len(self.gt_emb_history) >= self.history_length:
+                    # Use stored observation images if available
+                    if hasattr(self, '_img_history') and len(self._img_history) >= self.history_length:
+                        img_history = torch.stack(self._img_history[-self.history_length:], dim=1)  # (1, T, C, H, W)
+                    else:
+                        # Fallback to embedding-based uncertainty
+                        pred_emb = torch.randn(1, emb_dim, device=self.device) * 0.1
+                        uncertainty = torch.rand(1, device=self.device)
+                        return pred_emb, uncertainty
+                    
+                    # Build state history
+                    state_history = torch.stack(self.state_history[-self.history_length:], dim=0).unsqueeze(0)  # (1, T, state_dim)
+                    
+                    # Build WM batch
+                    wm_batch = {
+                        'observation.images.image0_history': img_history,
+                        'observation.state': state_history[:, -1],  # Current state
+                        'action': torch.from_numpy(action).float().unsqueeze(0).unsqueeze(0).to(self.device),  # (1, 1, action_dim)
+                    }
+                    
+                    with torch.no_grad():
+                        loss_dict = self.policy.forward_with_world_model(
+                            wm_batch,
+                            train_gen_expert_only=True,
+                            cur_n_obs_img_steps=self.history_length - 1,
+                            cur_n_pred_img_steps=1,
+                        )
+                    
+                    # Get uncertainty from WM accuracy
+                    wm_acc = loss_dict.get('wm_acc_mean', torch.tensor(0.5))
+                    uncertainty = (1.0 - wm_acc) * torch.ones(1, device=self.device)
+                    
+                    # Get predicted embedding (dummy for now, actual would decode from WM output)
+                    pred_emb = torch.randn(1, emb_dim, device=self.device) * 0.1
+                    
+                    return pred_emb, uncertainty
+                    
+            except Exception as e:
+                logger.warning(f"WM forward failed in _run_world_model: {e}")
         
-        # Mock WM output - match embedding dimension
+        # Fallback to mock WM output
         pred_emb = torch.randn(1, emb_dim, device=self.device) * 0.1
         uncertainty = torch.rand(1, device=self.device)
         

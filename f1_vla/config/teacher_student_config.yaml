@@ -6,16 +6,13 @@
 # Loss = GT_loss + memory_loss_weight * Memory_distillation_loss
 
 dataset:
-  # Use ME_KVM data format
+  # Use ME_KVM data format - CLEAN ONLY (match teacher training)
   use_mekvm_format: True
   mekvm_data_dirs:
     - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
-    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/complex_texture
   mekvm_task_descriptions:
     - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在复杂纹理环境中,探索环境,根据动作和状态预测下一帧观测。"
   mekvm_weights:
-    - 1.0
     - 1.0
   n_obs_img_steps: 4
   n_pred_img_steps: 1
@@ -33,44 +30,62 @@ exp:
   stage: stage_teacher_student
   
   # Teacher checkpoint (trained world model with memory)
-  teacher_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wm_only_v2/checkpoint-episode-2516
+  teacher_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-286272
   
   # Student checkpoint (optional, if None will copy from teacher)
   # Set this to resume student training or use a different initialization
-  student_ckpt: null
+  student_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-286272
   
   # Memory configuration - ENABLED
-  use_memory: True
+  # Memory configuration for STUDENT
+  # NOTE: Teacher checkpoint was trained WITHOUT memory (use_memory: False in saved config)
+  # So we disable memory for teacher and only enable for student learning
+  use_memory: True  # Enable memory for both teacher and student
   memory_config:
-    memory_len: 128
-    bptt_steps: 8
+    memory_len: 32        # Full memory length for distillation
+    bptt_steps: 4        # Match teacher BPTT steps
+    init_std: 0.02       # Memory initialization std
     tokenizer_max_length: 512
   
   # Teacher-Student specific config
   teacher_student_config:
-    use_teacher_student: True
-    memory_loss_weight: 0.5  # Weight for memory distillation loss
-    use_memory_distillation: True  # Enable memory distillation
+    use_teacher_student: False  # Standard mode (both on same GPU) - OOM prone
+    use_student_only: False     # Control group (no teacher)
+    use_split_gpu: True         # NEW: Teacher and Student on separate GPUs (recommended)
+    
+    # Device assignment for split_gpu mode
+    # NOTE: These are indices within CUDA_VISIBLE_DEVICES, not absolute GPU IDs
+    # If you run with -g 5,6 then cuda:0=GPU5, cuda:1=GPU6
+    teacher_device: "cuda:0"    # First visible GPU (teacher)
+    student_device: "cuda:1"    # Second visible GPU (student)
+    
+    # Memory distillation config
+    # ENABLED: Memory distillation from teacher to student
+    memory_loss_weight: 0.1     # Enabled - weight for memory distillation loss
+    use_memory_distillation: True  # Enabled - distill memory from teacher to student
 
   training_args:
     output_dir: outputs/teacher_student_wm
-    run_name: teacher_student_wm
+    run_name: teacher_student_split_gpu
     do_train: True
     do_eval: False
     num_train_epochs: 100
-    per_device_train_batch_size: 4
+    per_device_train_batch_size: 1  # Reduced from 2 to 1 to save memory
     per_device_eval_batch_size: 1
 
-    learning_rate: !!float 5e-5
-    weight_decay: !!float 1e-10
+    learning_rate: !!float 3e-5    # Reduced for stability (match v5)
+    weight_decay: !!float 1e-4     # Increased regularization (match v5)
     adam_beta1: 0.9
-    adam_beta2: 0.95
+    adam_beta2: 0.999              # Better for Transformers (match v5)
     adam_epsilon: !!float 1e-8
+    optim: adamw_bnb_8bit          # 8-bit optimizer saves ~50% memory
     lr_scheduler_type: cosine
-    gradient_accumulation_steps: 2
+    gradient_accumulation_steps: 8  # Increased from 4 to 8 to maintain effective batch size of 8
+    gradient_checkpointing: False    # Model doesn't support this
+    max_grad_norm: 1.0              # Gradient clipping to prevent NaN
 
-    max_steps: -1
-    warmup_steps: 200
+    max_steps: 180000              # Half of v5 (360k) for student training
+    warmup_steps: 2000             # Longer warmup (match v5)
     log_level: info
     log_level_replica: error
 

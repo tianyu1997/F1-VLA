@@ -194,6 +194,20 @@ class EpisodeProgressCallback(TrainerCallback):
             if self.pbar is not None and state.is_local_process_zero:
                 self.pbar.reset()
                 self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+            
+            # Clear memory bank at epoch boundary to prevent OOM
+            if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
+                model = self.policy.model
+                if hasattr(model, 'memory_bank'):
+                    old_size = len(model.memory_bank._memory_bank)
+                    model.memory_bank._memory_bank.clear()
+                    logger.info(f"Cleared {old_size} memory states at epoch {self.current_epoch}")
+            
+            # Force GPU memory cleanup
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info(f"Cleared CUDA cache at epoch {self.current_epoch}")
     
     def on_step_end(self, args, state, control, **kwargs):
         """Update progress bar after each step."""
@@ -210,7 +224,7 @@ class EpisodeProgressCallback(TrainerCallback):
             self.pbar.set_postfix_str(f'L={loss:.3f} A={acc:.1%}')
     
     def update_metrics(self, loss: float, wm_loss: float = 0.0, wm_acc: float = 0.0, action_loss: float = 0.0):
-        """Update real-time metrics from compute_loss."""
+        """Update real-time metrics from compute_loss (every micro-batch)."""
         self.current_loss = loss
         self.current_wm_loss = wm_loss
         self.current_wm_acc = wm_acc
@@ -290,10 +304,16 @@ class PolicyTrainerCallback(TrainerCallback):
             self.image_transforms.to(args.device)
 
     def on_epoch_begin(self, args, state, control, **kwargs):
-        """Reset memory at the start of each epoch for BPTT."""
-        if hasattr(self.policy, 'model') and hasattr(self.policy.model, 'memory_manager'):
-            if self.policy.model.memory_manager is not None:
-                self.policy.model.memory_manager.on_epoch_start()
+        """Called at Trainer epoch boundary.
+        
+        Note: We do NOT clear memory bank here anymore because:
+        1. With max_steps training, Trainer's epoch boundary doesn't align with our SequentialBatchSampler
+        2. Memory bank should only be cleared when the sampler completes a full pass over all episodes
+        3. This avoids the expensive DDP sync and dataloader rebuild at artificial epoch boundaries
+        
+        Memory is now cleared by the SequentialBatchSampler when it starts a new epoch of episodes.
+        """
+        pass  # Don't clear memory at Trainer's epoch boundary
 
 
 class PolicyTrainer(Trainer):
@@ -404,7 +424,7 @@ class PolicyTrainer(Trainer):
 
         loss = outputs["loss"]
         
-        # Update real-time metrics for progress bar (every step)
+        # Update real-time metrics for progress bar (every micro-batch for real-time display)
         if hasattr(self, 'episode_progress_callback') and self.state.is_local_process_zero:
             wm_loss = outputs.get("wm_loss", torch.tensor(0)).cpu().item()
             wm_acc = outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item()
@@ -572,7 +592,7 @@ class PolicyTrainer(Trainer):
             
             # Get model predictions
             try:
-                logger.info(f"[Eval] Running forward pass for sample {idx}")
+                # logger.info(f"[Eval] Running forward pass for sample {idx}")
                 outputs = self.policy.forward_with_world_model(
                     batch,
                     cur_n_obs_img_steps=self.cur_n_obs_img_steps,
@@ -582,14 +602,14 @@ class PolicyTrainer(Trainer):
                     return_images=True,  # Request image outputs for visualization
                 )
                 
-                logger.info(f"[Eval] Forward pass output keys: {outputs.keys()}")
+                # logger.info(f"[Eval] Forward pass output keys: {outputs.keys()}")
                 
                 # Get ground truth and predicted images
                 # Assuming wm_pred_img and wm_gt_img are in outputs
                 if 'wm_pred_img' in outputs and 'wm_gt_img' in outputs:
                     pred_img = outputs['wm_pred_img']  # [B, T, C, H, W] or [B, C, H, W]
                     gt_img = outputs['wm_gt_img']
-                    logger.info(f"[Eval] Got images: gt_shape={gt_img.shape}, pred_shape={pred_img.shape}")
+                    # logger.info(f"[Eval] Got images: gt_shape={gt_img.shape}, pred_shape={pred_img.shape}")
                     frames_list.append((gt_img.cpu(), pred_img.cpu()))
                 else:
                     logger.warning(f"[Eval] Missing image keys. Available: {outputs.keys()}")

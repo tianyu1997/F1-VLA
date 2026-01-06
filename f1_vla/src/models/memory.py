@@ -75,7 +75,10 @@ class KVMemoryBank(nn.Module):
         # GRU for memory update
         # Input: memory_info from memory token output (hidden_size -> head_dim projection)
         # Hidden: flattened memory state (head_dim per slot)
-        self.memory_info_proj = nn.Linear(hidden_size, head_dim)
+        # Project to separate inputs for each slot (num_layers * 2 * memory_len slots)
+        num_total_slots = num_layers * 2 * memory_len
+        self.num_total_slots = num_total_slots
+        self.memory_info_proj = nn.Linear(hidden_size, head_dim * num_total_slots)
         self.memory_gru = nn.GRUCell(
             input_size=head_dim,
             hidden_size=head_dim
@@ -85,6 +88,11 @@ class KVMemoryBank(nn.Module):
         # Key: (dataset_idx, episode_idx) -> memory_state
         # Memory state is stored as List of (K, V) tensors per layer
         self._memory_bank: Dict[Tuple[int, int], List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+        
+        # Maximum number of episodes to keep in memory bank
+        # In SequentialBatchSampler, only batch_size episodes are active at a time
+        # Set to a larger value to cache more episodes and avoid frequent pruning
+        self._max_memory_bank_size = 512  # Increased to handle 1440 total episodes better
         
         logger.info(
             f"Initialized KVMemoryBank: layers={num_layers}, "
@@ -109,7 +117,12 @@ class KVMemoryBank(nn.Module):
         Returns:
             Memory token tensor: (batch_size, 1, hidden_size)
         """
-        return self.memory_token.to(device=device, dtype=dtype).expand(batch_size, -1, -1).contiguous()
+        token = self.memory_token.to(device=device, dtype=dtype).expand(batch_size, -1, -1).contiguous()
+        # Check and fix NaN in memory token (can happen if params are corrupted)
+        if torch.isnan(token).any() or torch.isinf(token).any():
+            logger.warning(f"[KVMemoryBank] memory_token has NaN/Inf! Replacing with zeros.")
+            token = torch.zeros_like(token)
+        return token
     
     def get_initial_memory(
         self,
@@ -131,6 +144,14 @@ class KVMemoryBank(nn.Module):
             Each tensor: (batch, memory_len, num_kv_heads, head_dim)
         """
         init_mem = self.init_memory.to(device=device, dtype=dtype)
+        
+        # Check and fix NaN in init_memory (can happen if params are corrupted)
+        if torch.isnan(init_mem).any() or torch.isinf(init_mem).any():
+            nan_count = torch.isnan(init_mem).sum().item()
+            inf_count = torch.isinf(init_mem).sum().item()
+            logger.warning(f"[KVMemoryBank] init_memory has NaN/Inf! nan={nan_count}, inf={inf_count}. Replacing with zeros.")
+            init_mem = torch.where(torch.isnan(init_mem) | torch.isinf(init_mem), 
+                                   torch.zeros_like(init_mem), init_mem)
         
         memory_state = []
         for layer_idx in range(self.num_layers):
@@ -175,7 +196,11 @@ class KVMemoryBank(nn.Module):
         batch_size = len(dataset_indices)
         
         # Initialize with init_memory for all samples
-        memory_state = self.get_initial_memory(batch_size, device, dtype)
+        # Clone to avoid in-place operation issues with leaf variables
+        init_memory = self.get_initial_memory(batch_size, device, dtype)
+        memory_state = []
+        for k, v in init_memory:
+            memory_state.append((k.clone(), v.clone()))
         
         # Override with stored memory for samples with frame_idx > 0
         for b in range(batch_size):
@@ -190,8 +215,22 @@ class KVMemoryBank(nn.Module):
                     for layer_idx in range(self.num_layers):
                         # Copy stored memory into this batch position
                         k_stored, v_stored = stored_memory[layer_idx]
-                        memory_state[layer_idx][0][b] = k_stored[0].to(device=device, dtype=dtype)
-                        memory_state[layer_idx][1][b] = v_stored[0].to(device=device, dtype=dtype)
+                        k_val = k_stored[0].detach().to(device=device, dtype=dtype)
+                        v_val = v_stored[0].detach().to(device=device, dtype=dtype)
+                        
+                        # Check for NaN/Inf in stored memory and replace with init_memory
+                        if torch.isnan(k_val).any() or torch.isinf(k_val).any():
+                            logger.warning(f"[KVMemoryBank] Stored memory key has NaN/Inf at layer {layer_idx}, "
+                                         f"sample {b}, key={key}. Using init_memory instead.")
+                            # Keep the init_memory value (already in memory_state)
+                            continue
+                        if torch.isnan(v_val).any() or torch.isinf(v_val).any():
+                            logger.warning(f"[KVMemoryBank] Stored memory value has NaN/Inf at layer {layer_idx}, "
+                                         f"sample {b}, key={key}. Using init_memory instead.")
+                            continue
+                            
+                        memory_state[layer_idx][0][b] = k_val
+                        memory_state[layer_idx][1][b] = v_val
         
         return memory_state
     
@@ -216,18 +255,45 @@ class KVMemoryBank(nn.Module):
         device = memory_info.device
         dtype = memory_info.dtype
         
+        # Check input for NaN/Inf
+        if torch.isnan(memory_info).any() or torch.isinf(memory_info).any():
+            logger.error(f"[KVMemoryBank] memory_info has NaN/Inf! Using zeros.")
+            memory_info = torch.zeros_like(memory_info)
+        
         # Move modules to device and convert input to float32 for computation
         memory_info_f32 = memory_info.float()
         
-        # Project memory_info to head_dim
+        # Clip memory_info to prevent extreme values
+        memory_info_f32 = torch.clamp(memory_info_f32, -10.0, 10.0)
+        
+        # Project memory_info to separate inputs for each slot
         proj = self.memory_info_proj.to(device).float()
-        memory_info_proj = proj(memory_info_f32)  # (batch, head_dim)
+        memory_info_proj = proj(memory_info_f32)  # (batch, head_dim * num_total_slots)
+        
+        # Check projection for NaN/Inf
+        if torch.isnan(memory_info_proj).any() or torch.isinf(memory_info_proj).any():
+            logger.error(f"[KVMemoryBank] memory_info_proj has NaN/Inf after projection! Using zeros.")
+            memory_info_proj = torch.zeros_like(memory_info_proj)
+        
+        # Clip projected values
+        memory_info_proj = torch.clamp(memory_info_proj, -10.0, 10.0)
+        
+        # Reshape to (batch, num_total_slots, head_dim) - each slot gets different input
+        memory_info_proj = memory_info_proj.view(batch_size, self.num_total_slots, self.head_dim)
         
         # Flatten all memory slots for GRU update
-        # We treat each memory slot as a hidden state and update with the same input
+        # Each slot will now be updated with its own specific input vector
         flat_slots = []
-        for k, v in previous_memory:
+        for layer_idx, (k, v) in enumerate(previous_memory):
             # k, v: (batch, memory_len, heads, dim)
+            # Check for NaN/Inf and replace with zeros if found
+            if torch.isnan(k).any() or torch.isinf(k).any():
+                logger.error(f"[KVMemoryBank] previous_memory layer {layer_idx} key has NaN/Inf! Replacing with zeros.")
+                k = torch.zeros_like(k)
+            if torch.isnan(v).any() or torch.isinf(v).any():
+                logger.error(f"[KVMemoryBank] previous_memory layer {layer_idx} value has NaN/Inf! Replacing with zeros.")
+                v = torch.zeros_like(v)
+            
             flat_slots.append(k.reshape(batch_size, -1, self.head_dim).clone())
             flat_slots.append(v.reshape(batch_size, -1, self.head_dim).clone())
         
@@ -235,21 +301,38 @@ class KVMemoryBank(nn.Module):
         memory_slots = torch.cat(flat_slots, dim=1).float()
         num_slots = memory_slots.shape[1]
         
+        # Clip memory slots to prevent extreme values
+        memory_slots = torch.clamp(memory_slots, -10.0, 10.0)
+        
         # Move GRU to device and float32
         gru = self.memory_gru.to(device).float()
         
-        # Update each batch sample's memory slots
+        # Update each batch sample's memory slots with slot-specific inputs
         updated_slots_list = []
         for b in range(batch_size):
             slot_b = memory_slots[b].clone()  # (num_slots, head_dim)
-            inp_b = memory_info_proj[b:b+1].expand(num_slots, -1).contiguous()
+            inp_b = memory_info_proj[b]  # (num_slots, head_dim) - different for each slot!
             
-            # Apply GRU: each slot updated with same memory_info
+            # Apply GRU: each slot updated with its own specific memory_info
             new_slot_b = gru(inp_b, slot_b)
+            
+            # Check for NaN/Inf after GRU and replace with original slot
+            if torch.isnan(new_slot_b).any() or torch.isinf(new_slot_b).any():
+                logger.warning(f"[KVMemoryBank] GRU output has NaN/Inf for batch {b}! Using previous memory.")
+                new_slot_b = slot_b  # Revert to previous memory
+            
+            # Clip to prevent extreme values
+            new_slot_b = torch.clamp(new_slot_b, -10.0, 10.0)
+            
             updated_slots_list.append(new_slot_b)
         
         # Stack: (batch, num_slots, head_dim)
         updated_slots = torch.stack(updated_slots_list, dim=0)
+        
+        # Final safety check
+        if torch.isnan(updated_slots).any() or torch.isinf(updated_slots).any():
+            logger.error(f"[KVMemoryBank] updated_slots has NaN/Inf after GRU! Replacing with clamped memory_slots.")
+            updated_slots = torch.clamp(memory_slots, -10.0, 10.0)
         
         # Convert back to original dtype
         updated_slots = updated_slots.to(dtype)
@@ -275,6 +358,14 @@ class KVMemoryBank(nn.Module):
                 batch_size, self.memory_len,
                 self.num_kv_heads, self.head_dim
             ).contiguous()
+            
+            # Final check: if NaN/Inf detected, use zeros
+            if torch.isnan(new_k).any() or torch.isinf(new_k).any():
+                logger.error(f"[KVMemoryBank] new_k has NaN/Inf in final reshape! Using zeros.")
+                new_k = torch.zeros_like(new_k)
+            if torch.isnan(new_v).any() or torch.isinf(new_v).any():
+                logger.error(f"[KVMemoryBank] new_v has NaN/Inf in final reshape! Using zeros.")
+                new_v = torch.zeros_like(new_v)
             
             new_memory.append((new_k, new_v))
         
@@ -303,6 +394,22 @@ class KVMemoryBank(nn.Module):
             ep_idx = episode_indices[b].item()
             key = (ds_idx, ep_idx)
             
+            # Check if memory has NaN before storing
+            has_nan = False
+            for layer_idx in range(self.num_layers):
+                k = memory_state[layer_idx][0][b:b+1]
+                v = memory_state[layer_idx][1][b:b+1]
+                if torch.isnan(k).any() or torch.isinf(k).any():
+                    has_nan = True
+                    break
+                if torch.isnan(v).any() or torch.isinf(v).any():
+                    has_nan = True
+                    break
+            
+            if has_nan:
+                logger.warning(f"[KVMemoryBank] Skipping store for key={key} due to NaN/Inf in memory state")
+                continue
+            
             # Extract this sample's memory and store
             sample_memory = []
             for layer_idx in range(self.num_layers):
@@ -319,6 +426,20 @@ class KVMemoryBank(nn.Module):
                 sample_memory.append((k, v))
             
             self._memory_bank[key] = sample_memory
+        
+        # Prune old episodes if memory bank is too large
+        self._prune_memory_bank_if_needed()
+    
+    def _prune_memory_bank_if_needed(self) -> None:
+        """Remove oldest episodes if memory bank exceeds max size."""
+        if len(self._memory_bank) > self._max_memory_bank_size:
+            # Remove oldest entries (first added)
+            # Dict maintains insertion order in Python 3.7+
+            num_to_remove = len(self._memory_bank) - self._max_memory_bank_size
+            keys_to_remove = list(self._memory_bank.keys())[:num_to_remove]
+            for key in keys_to_remove:
+                del self._memory_bank[key]
+            logger.debug(f"Pruned {num_to_remove} episodes from memory bank, now {len(self._memory_bank)} episodes")
     
     def clear_memory_bank(self) -> None:
         """Clear all stored memory states."""

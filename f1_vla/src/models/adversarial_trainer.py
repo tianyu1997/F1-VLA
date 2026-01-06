@@ -180,49 +180,66 @@ class WorldModelTrainer:
         """
         Execute one WM training step.
         
+        Uses F1Policy.forward_with_world_model for world model training.
+        
         Args:
             batch: Input batch
-            gt_next_imgs: Ground truth next images
+            gt_next_imgs: Ground truth next images (not directly used, WM gets GT from batch)
             
         Returns:
             Loss dict
         """
         self.optimizer.zero_grad()
         
-        # Forward pass - predict next frame
-        output = self.policy.predict_next_frame(batch)
-        pred_imgs = output.get('pred_imgs')
-        
-        if pred_imgs is None:
-            logger.warning("WM returned None pred_imgs")
-            return {'wm_loss': 0.0}
-        
-        # Resize if needed
-        if pred_imgs.shape[-2:] != gt_next_imgs.shape[-2:]:
-            pred_imgs = F.interpolate(
-                pred_imgs,
-                size=gt_next_imgs.shape[-2:],
-                mode='bilinear',
-                align_corners=False
+        try:
+            # Temporarily set train_gen_expert_only=True on the model
+            # This makes forward_with_world_model skip action head and only train WM
+            original_train_gen_expert_only = getattr(self.policy.model, 'train_gen_expert_only', False)
+            self.policy.model.train_gen_expert_only = True
+            
+            # Use F1Policy's forward_with_world_model method for training
+            # This trains the world model using the batch's built-in GT images
+            loss_dict = self.policy.forward_with_world_model(
+                batch,
+                train_gen_expert_only=True,  # Also pass as parameter for f1_policy level
+                cur_n_obs_img_steps=4,  # Typically 4 history frames
+                cur_n_pred_img_steps=1,  # Predict 1 frame
             )
+            
+            # Restore original value
+            self.policy.model.train_gen_expert_only = original_train_gen_expert_only
+            
+            wm_loss = loss_dict.get('wm_loss', loss_dict.get('loss', torch.tensor(0.0)))
+            if isinstance(wm_loss, torch.Tensor):
+                wm_loss_value = wm_loss.item()
+            else:
+                wm_loss_value = wm_loss
+            
+            # Backward
+            if isinstance(wm_loss, torch.Tensor) and wm_loss.requires_grad:
+                wm_loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    self._get_wm_parameters(),
+                    self.config.max_grad_norm
+                )
+                
+                self.optimizer.step()
+        except Exception as e:
+            logger.error(f"WM train_step failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise the exception instead of using dummy loss
+            # This ensures bugs are caught rather than silently ignored
+            # Restore model state before re-raising
+            if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
+                self.policy.model.train_gen_expert_only = False
+            raise RuntimeError(f"WM train_step failed: {e}") from e
         
-        # Compute loss
-        loss = F.mse_loss(pred_imgs, gt_next_imgs)
+        self.losses.append(wm_loss_value)
         
-        # Backward
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self._get_wm_parameters(),
-            self.config.max_grad_norm
-        )
-        
-        self.optimizer.step()
-        
-        self.losses.append(loss.item())
-        
-        return {'wm_loss': loss.item()}
+        return {'wm_loss': wm_loss_value}
     
     def get_prediction_error(
         self,
@@ -240,24 +257,36 @@ class WorldModelTrainer:
             MSE error per sample (B,)
         """
         with torch.no_grad():
-            output = self.policy.predict_next_frame(batch)
-            pred_imgs = output.get('pred_imgs')
-            
-            if pred_imgs is None:
-                return torch.zeros(gt_next_imgs.shape[0], device=self.device)
-            
-            # Resize if needed
-            if pred_imgs.shape[-2:] != gt_next_imgs.shape[-2:]:
-                pred_imgs = F.interpolate(
-                    pred_imgs,
-                    size=gt_next_imgs.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
+            try:
+                # Temporarily set train_gen_expert_only=True
+                original_train_gen_expert_only = getattr(self.policy.model, 'train_gen_expert_only', False)
+                self.policy.model.train_gen_expert_only = True
+                
+                # Use forward_with_world_model to get predictions and accuracy
+                loss_dict = self.policy.forward_with_world_model(
+                    batch,
+                    train_gen_expert_only=True,
+                    cur_n_obs_img_steps=4,
+                    cur_n_pred_img_steps=1,
                 )
-            
-            # Per-sample MSE
-            error = F.mse_loss(pred_imgs, gt_next_imgs, reduction='none')
-            error = error.mean(dim=[1, 2, 3])  # (B,)
+                
+                # Restore
+                self.policy.model.train_gen_expert_only = original_train_gen_expert_only
+                
+                # WM accuracy gives us an indication of prediction quality
+                # Lower accuracy = higher prediction error = higher reward for explorer
+                wm_acc = loss_dict.get('wm_acc_mean', torch.tensor(1.0))
+                
+                # Convert accuracy to error: error = 1 - accuracy
+                # This gives higher error (reward) when WM predictions are worse
+                batch_size = batch.get('observation.state', batch.get('action', gt_next_imgs)).shape[0]
+                error = (1.0 - wm_acc) * torch.ones(batch_size, device=self.device)
+            except Exception as e:
+                logger.warning(f"get_prediction_error failed: {e}")
+                batch_size = batch.get('observation.state', batch.get('action', gt_next_imgs)).shape[0]
+                error = torch.ones(batch_size, device=self.device) * 0.5  # Default error
+                if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
+                    self.policy.model.train_gen_expert_only = False
             
             return error
     
@@ -311,6 +340,9 @@ class AdversarialExplorerTrainer:
         self.value_head = nn.Linear(proj_width, 1).to(device)
         
         # Action log std
+        
+        # Step counter
+        self.global_step = 0
         self.log_std = nn.Parameter(
             torch.zeros(config.mini_batch_size, device=device) - 1.0
         )
@@ -433,14 +465,29 @@ class AdversarialExplorerTrainer:
         state_emb = output.get('state_emb')
         if state_emb is None:
             state_emb = self.policy.model.state_proj(batch['observation.state'])
-        values = self.value_head(state_emb)
+        values = self.value_head(state_emb).squeeze(-1)  # [batch, 1] -> [batch]
         
-        # Normalize advantages
-        if self.config.ppo_epochs > 1 and advantages.numel() > 1:
+        # Ensure old_values is also squeezed
+        if old_values.dim() > 1:
+            old_values = old_values.squeeze(-1)
+        
+        # Ensure returns has correct shape
+        if returns.dim() > 1:
+            returns = returns.squeeze(-1)
+        
+        # Normalize advantages only for large batches
+        if self.config.ppo_epochs > 1 and advantages.numel() >= 8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # Policy loss (clipped)
         ratio = torch.exp(log_probs - old_log_probs)
+        
+        # Debug logging
+        if self.global_step % 10 == 0:
+            logger.debug(f"[Explorer PPO] ratio: mean={ratio.mean():.4f}, min={ratio.min():.4f}, max={ratio.max():.4f}")
+            logger.debug(f"[Explorer PPO] log_probs: mean={log_probs.mean():.4f}, old: {old_log_probs.mean():.4f}")
+            logger.debug(f"[Explorer PPO] advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
+        
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
@@ -478,6 +525,7 @@ class AdversarialExplorerTrainer:
         
         self.policy_losses.append(policy_loss.item())
         self.value_losses.append(value_loss.item())
+        self.global_step += 1
         
         return {
             'policy_loss': policy_loss.item(),
@@ -524,7 +572,8 @@ class AdversarialTrainingManager:
         self.device = device
         
         # Create VAE extractor
-        self.vae_extractor = VAEEmbeddingExtractor(vae, device=device)
+        self.vae_extractor = VAEEmbeddingExtractor(vae)
+        self.vae_extractor = self.vae_extractor.to(device)
         
         # Create trainers
         self.wm_trainer = WorldModelTrainer(policy, self.config, device)
@@ -612,6 +661,134 @@ class AdversarialTrainingManager:
         
         self.iteration += 1
         self.global_step += len(episode_data)
+        
+        return iteration_metrics
+    
+    def train_step_offline(
+        self,
+        batch: Dict[str, Any],
+        iteration: int,
+    ) -> Dict[str, float]:
+        """
+        Offline adversarial training step using dataset batch.
+        
+        Unlike train_iteration which uses rollout data, this method
+        works with dataset batches directly for Phase 2 adversarial training.
+        
+        Args:
+            batch: Dataset batch containing images, actions, etc.
+            iteration: Current iteration number
+            
+        Returns:
+            Metrics dict
+        """
+        iteration_metrics = {}
+        
+        # Get ground truth next images from batch
+        # Try different possible keys
+        gt_next_imgs = batch.get('pixel_values')  # [B, T, C, H, W]
+        if gt_next_imgs is None:
+            gt_next_imgs = batch.get('observation.images.image0_target')
+        if gt_next_imgs is None:
+            gt_next_imgs = batch.get('observation.images.image0_history')
+            if gt_next_imgs is not None and gt_next_imgs.dim() == 5:
+                # Take last frame as "target"
+                gt_next_imgs = gt_next_imgs[:, -1:]  # [B, 1, C, H, W]
+        
+        if gt_next_imgs is None:
+            logger.warning("No image data found in batch, skipping")
+            return iteration_metrics
+        
+        # Make sure it's on the right device
+        if isinstance(gt_next_imgs, torch.Tensor):
+            gt_next_imgs = gt_next_imgs.to(self.device)
+        
+        # Phase 1: Train WM on batch
+        wm_losses = []
+        for _ in range(self.config.wm_updates_per_iter):
+            loss_dict = self.wm_trainer.train_step(batch, gt_next_imgs)
+            wm_losses.append(loss_dict['wm_loss'])
+        
+        if wm_losses:
+            iteration_metrics['wm_loss'] = np.mean(wm_losses)
+            self.metrics['wm_loss'].append(iteration_metrics['wm_loss'])
+        
+        # Phase 2: Train Explorer adversarially (after warmup)
+        if iteration >= self.config.warmup_iterations:
+            # Explorer tries to fool the WM
+            # Compute adversarial reward based on WM prediction error
+            adv_reward = self.explorer_trainer.compute_adversarial_reward(
+                batch, gt_next_imgs
+            )
+            mean_adv_reward = adv_reward.mean().item()
+            iteration_metrics['adversarial_reward'] = mean_adv_reward
+            self.metrics['adversarial_reward'].append(mean_adv_reward)
+            
+            # Generate explorer actions and train with PPO
+            with torch.no_grad():
+                # Forward through explorer to get actions
+                explorer_output = self.policy.forward_with_actor(
+                    batch,
+                    actor_name='explorer',
+                    return_action_stats=True,
+                )
+                
+                action_mean = explorer_output['action']
+                # Sample actions
+                std = torch.exp(self.explorer_trainer.log_std[:action_mean.shape[-1]])
+                dist = torch.distributions.Normal(action_mean, std)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions).sum(dim=-1)
+                
+                # Compute value estimate from state embedding
+                state_emb = explorer_output.get('state_emb')
+                if state_emb is None:
+                    state_emb = self.policy.model.state_proj(batch['observation.state'].to(self.device))
+                values = self.explorer_trainer.value_head(state_emb).squeeze(-1)
+            
+            # For offline training, we use single-step update
+            batch_size = gt_next_imgs.shape[0]
+            
+            # Prepare PPO batch
+            old_log_probs = log_probs.detach()
+            old_values = values.detach()
+            
+            # Compute simple advantages (single step)
+            rewards = adv_reward.detach()
+            advantages = rewards - old_values
+            returns = rewards
+            
+            # Normalize advantages only if batch is large enough
+            # For very small batches, normalization removes useful signal
+            if advantages.numel() >= 8:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            elif advantages.numel() > 1 and advantages.std() > 1e-6:
+                # For small batches, just center without scaling
+                advantages = advantages - advantages.mean()
+            
+            # Train explorer with PPO
+            for _ in range(self.config.explorer_updates_per_iter):
+                for _ in range(self.config.ppo_epochs):
+                    loss_dict = self.explorer_trainer.train_step(
+                        batch=batch,
+                        old_log_probs=old_log_probs,
+                        old_values=old_values,
+                        advantages=advantages,
+                        returns=returns,
+                        actions=actions,
+                    )
+            
+            iteration_metrics.update({
+                'explorer_policy_loss': loss_dict['policy_loss'],
+                'explorer_value_loss': loss_dict['value_loss'],
+                'explorer_entropy': loss_dict.get('entropy', 0.0),
+            })
+            
+            self.metrics['explorer_policy_loss'].append(loss_dict['policy_loss'])
+            self.metrics['explorer_value_loss'].append(loss_dict['value_loss'])
+        
+        self.iteration = iteration
+        self.global_step += 1
         
         return iteration_metrics
     

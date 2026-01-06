@@ -1,5 +1,5 @@
 dataset:
-  # Use ME_KVM data format - MIXED DATA (clean + complex_texture for diversity)
+  # Use ME_KVM data format - clean data only
   use_mekvm_format: True
   mekvm_data_dirs:
     - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
@@ -27,14 +27,15 @@ dataset:
 
 exp:
   stage: stage1_pretrain_wm
-  # Resume from checkpoint (set load_ckpt to null when resuming)
-  load_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-255678
+  # Load from F1_pretrain (not checkpoint resume, fresh memory training)
+  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain
   
-  # Memory configuration - ENABLED
+  # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
   memory_config:
-    memory_len: 16      # Number of memory slots per layer
-    bptt_steps: 4       # BPTT truncation length
+    memory_len: 32     # Number of memory slots per layer (balanced speed/capacity)
+    bptt_steps: 4       # BPTT truncation length (4 for faster training)
+    init_std: 0.02      # Memory parameter initialization std
     tokenizer_max_length: 512
 
   # VAE training configuration
@@ -46,30 +47,30 @@ exp:
     dropout: 0.0              # No dropout
 
   training_args:
-    output_dir: outputs/memory_wm_clean_only
-    run_name: memory_wm_v7_conservative_lr
-    # Resume from checkpoint - rollback to stable (acc ~27%)
-    resume_from_checkpoint: /mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-255678
+    output_dir: outputs/memory_from_f1pretrain
+    run_name: memory_from_f1pretrain_v1
+    # Fresh training - no resume
+    resume_from_checkpoint: null
     do_train: True
     do_eval: False
-    # Use max_steps instead of num_train_epochs to avoid epoch boundary issues
-    # 240 eps × 40 frames × 100 epochs / (batch_size=2 × grad_accum=2) ≈ 240,000 steps
     num_train_epochs: 1000  # Set very high, max_steps controls actual training
-    per_device_train_batch_size: 2  # Keep same batch size
+    per_device_train_batch_size: 1  # Reduced for memory with KVMemoryBank
     per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 4   # Keep same accumulation
+    gradient_accumulation_steps: 8  # 8 for faster training (fewer weight updates per epoch)
 
-    learning_rate: !!float 2e-5  # Conservative lr for stable training (v7)
-    weight_decay: !!float 1e-6   # Moderate regularization
-    max_grad_norm: 1.0           # Gradient clipping to prevent explosion (CRITICAL)
+    # Use standard AdamW optimizer (avoid 8bit for memory training stability)
+    optim: adamw_bnb_8bit
+
+    learning_rate: !!float 3e-5  # Slightly higher for fresh training
+    weight_decay: !!float 1e-4   # Standard regularization
+    max_grad_norm: 1.0           # Gradient clipping
     adam_beta1: 0.9
-    adam_beta2: 0.999            # Increased from 0.95 for smoother 2nd moment estimate
+    adam_beta2: 0.999
     adam_epsilon: !!float 1e-8
     lr_scheduler_type: cosine
 
-    # Use max_steps to control training - increased to continue training
-    max_steps: 360000            # Increased from 240k (currently at ~240k steps)
-    warmup_steps: 2000           # Longer warmup for stable training from checkpoint (v7)
+    max_steps: 360000
+    warmup_steps: 3000           # Longer warmup for fresh memory training
     log_level: info
     log_level_replica: error
 
@@ -84,17 +85,17 @@ exp:
     save_safetensors: True
     disable_tqdm: True
 
-    save_total_limit: 3
+    save_total_limit: 5
     overwrite_output_dir: True
-    dataloader_num_workers: 4
+    dataloader_num_workers: 8
     dataloader_pin_memory: False
     dataloader_persistent_workers: True
-    dataloader_prefetch_factor: 4
+    dataloader_prefetch_factor: 8
     remove_unused_columns: False
 
     # Episode-based logging/saving/eval
-    logging_episodes: 10
-    save_episodes: 500
+    logging_episodes: 50
+    save_episodes: 240  # 每个epoch保存一次，释放显存
     eval_episodes: 100
 
     label_names: 
@@ -148,8 +149,7 @@ policy:
   vae_ckpt: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
 
   # Episode-internal loss warmup: DISABLED for better memory initialization
-  # Previous: Frame 0 had only 0.1 weight, preventing init_memory from learning
-  loss_warmup_frames: 0       # DISABLED - all frames train equally (CRITICAL FIX)
+  loss_warmup_frames: 0       # DISABLED - all frames train equally
   loss_warmup_min_weight: 1.0 # All frames have full weight
 
   temporal_conv_kernel_size: 4

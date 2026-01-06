@@ -156,7 +156,7 @@ class F1FlowMatching(nn.Module):
         for params in self.state_proj.parameters():
             params.requires_grad = self.train_state_proj
 
-        if training_args.train_gen_expert_only:
+        if self.train_gen_expert_only:
             freeze_modules = ["state_proj", "action_in_proj", "action_out_proj", "action_time_mlp_in", "action_time_mlp_out"]
             for name, param in self.named_parameters():
                 if any (x in name for x in freeze_modules):
@@ -417,7 +417,8 @@ class F1FlowMatching(nn.Module):
         num_samples: int = 1,
         rng: torch.Generator | None = None,
         memory_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> Tensor:
+        memory_token: Optional[torch.Tensor] = None,  # (batch, 1, hidden_size) memory token to append
+    ) -> Tuple[Tensor, Tensor, Optional[torch.Tensor]]:
         """use the world model to guide the acton generation
             step1: prepare the noise and time for the action generation
             step2: prepare the world model inputs
@@ -428,6 +429,13 @@ class F1FlowMatching(nn.Module):
         Args:
             memory_kv: Optional memory KV prefix. List of (K, V) per layer.
                 Each tensor: (batch, mem_len, num_kv_heads, head_dim)
+            memory_token: Optional memory token to append to gen sequence.
+                Its output hidden state will be used as memory_info for GRU update.
+                
+        Returns:
+            action_losses: Action prediction loss
+            gen_logits: World model generation logits
+            memory_info: Hidden state of memory token (batch, hidden_size), or None
         """
         if self.train_gen_expert_only:
             gen_embs, gen_pad_masks, gen_att_masks = self.embed_wm_inputs(
@@ -436,12 +444,27 @@ class F1FlowMatching(nn.Module):
             und_embs, und_pad_masks, und_att_masks = self.embed_prefix(
                 images, img_masks, lang_tokens, lang_masks
             )
+            batch_size = und_embs.shape[0]
+            
             if self.cfg_scale > 0:
-                batch_size = und_embs.shape[0]
                 seq_len = und_embs.shape[1]
                 mask_flags = (torch.rand(batch_size, device=und_embs.device) < self.cfg_scale).unsqueeze(1).unsqueeze(2)
                 cfg_emb = self.cfg_embedding.expand(batch_size, seq_len, -1)
                 und_embs = torch.where(mask_flags, cfg_emb, und_embs)
+
+            # Append memory token to PaliGemma input (und_embs) at the end
+            # This allows the memory token to be processed by PaliGemma's full attention
+            # Memory info will be extracted from pali_out at the last position
+            memory_info = None
+            memory_token_in_pali = False
+            if memory_token is not None:
+                mem_tok = memory_token.expand(batch_size, -1, -1).to(dtype=und_embs.dtype, device=und_embs.device)
+                und_embs = torch.cat([und_embs, mem_tok], dim=1)  # Append to end
+                mem_tok_pad = torch.ones(batch_size, 1, dtype=und_pad_masks.dtype, device=und_pad_masks.device)
+                mem_tok_att = torch.zeros(batch_size, 1, dtype=und_att_masks.dtype, device=und_att_masks.device)  # Full attention
+                und_pad_masks = torch.cat([und_pad_masks, mem_tok_pad], dim=1)
+                und_att_masks = torch.cat([und_att_masks, mem_tok_att], dim=1)
+                memory_token_in_pali = True
 
             pad_masks = torch.cat([und_pad_masks, gen_pad_masks], dim=1)
             att_masks = torch.cat([und_att_masks, gen_att_masks], dim=1)
@@ -449,19 +472,27 @@ class F1FlowMatching(nn.Module):
             att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-            (_, gen_out, _), _ = self.paligemma_with_expert.forward(
+            (pali_out, gen_out, _), past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks,
                 position_ids=position_ids,
                 past_key_values=None,
                 inputs_embeds=[und_embs, gen_embs, None],
-                use_cache=False,
-                fill_kv_cache=False,
+                use_cache=True,  # Enable to return past_key_values for memory distillation
+                fill_kv_cache=True,
                 memory_kv=memory_kv,
+                experts_only_memory=False,  # Allow paligemma to access memory KV as well
             )
+            
+            # Extract memory_info from memory token position (last position of pali_out)
+            # PaliGemma processes the memory token with full visual+language context
+            if memory_token_in_pali:
+                memory_info = pali_out[:, -1, :]  # (batch, hidden_size) - last position
+                # Note: pali_out still includes the memory token but it doesn't affect gen_out
+            
             gen_out = gen_out.to(dtype=torch.float32)
             gen_out = self.wm_out_proj(self.wm_out_layer_norm(gen_out))[:, -self.L:]
 
-            return 0, gen_out
+            return 0, gen_out, memory_info, past_key_values
 
         else:
             bsize = state.shape[0]
@@ -485,6 +516,19 @@ class F1FlowMatching(nn.Module):
                 images, img_masks, lang_tokens, lang_masks
             )
 
+            # Append memory token to PaliGemma input (und_embs) at the end
+            # This allows the memory token to be processed by PaliGemma's full attention
+            memory_info = None
+            memory_token_in_pali = False
+            if memory_token is not None:
+                mem_tok = memory_token.expand(bsize, -1, -1).to(dtype=und_embs.dtype, device=device)
+                und_embs = torch.cat([und_embs, mem_tok], dim=1)  # Append to end
+                mem_tok_pad = torch.ones(bsize, 1, dtype=und_pad_masks.dtype, device=device)
+                mem_tok_att = torch.zeros(bsize, 1, dtype=und_att_masks.dtype, device=device)  # Full attention
+                und_pad_masks = torch.cat([und_pad_masks, mem_tok_pad], dim=1)
+                und_att_masks = torch.cat([und_att_masks, mem_tok_att], dim=1)
+                memory_token_in_pali = True
+
             # 2. prepare the mask and position ids
             # Calculate extra positions needed for the generation loop
             # For num_resolutions steps, we need positions for patches at each resolution level
@@ -504,7 +548,7 @@ class F1FlowMatching(nn.Module):
             cur_position = und_embs.shape[1] + gen_embs.shape[1]
 
             # 3. compute KV cache
-            (_, gen_out, _), past_key_values = self.paligemma_with_expert.forward(
+            (pali_out, gen_out, _), past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks[:, :cur_position, :cur_position],
                 position_ids=position_ids[:, :cur_position],
                 past_key_values=None,
@@ -512,7 +556,13 @@ class F1FlowMatching(nn.Module):
                 use_cache=self.config.use_cache,
                 fill_kv_cache=True,
                 memory_kv=memory_kv,
+                experts_only_memory=False,  # Allow paligemma to access memory KV as well
             )
+            
+            # Extract memory_info from memory token position (last position of pali_out)
+            # PaliGemma processes the memory token with full visual+language context
+            if memory_token_in_pali:
+                memory_info = pali_out[:, -1, :]  # (batch, hidden_size) - last position
 
             # 4. generate world model output
             all_gen_logits = []
@@ -588,7 +638,7 @@ class F1FlowMatching(nn.Module):
             gen_logits = torch.cat(all_gen_logits, dim=1)
             gen_logits = gen_logits[:, -self.L:]
 
-            return losses, gen_logits
+            return losses, gen_logits, memory_info, past_key_values
 
     def _preparse_world_model_inputs(self, world_model_input_embs, device):
         # compute the position and level embeddings for the world model input

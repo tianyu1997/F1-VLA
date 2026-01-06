@@ -162,6 +162,11 @@ class ExplorerRLTrainer:
         # Setup training
         self._setup_training()
         
+        # KV memory/cache for Explorer
+        # This maintains memory across steps within an episode
+        self.episode_memory_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        self.episode_past_kv: Optional[List[torch.FloatTensor]] = None
+        
         # Metrics tracking
         self.metrics = {
             'episode_rewards': deque(maxlen=100),
@@ -250,27 +255,33 @@ class ExplorerRLTrainer:
     
     def _freeze_world_model(self):
         """Freeze World Model parameters."""
-        if hasattr(self.policy.model, 'paligemma_with_expert'):
-            pwm = self.policy.model.paligemma_with_expert
+        # Check if this is a F1_VLA policy (has .model attribute) or direct model
+        model = getattr(self.policy, 'model', self.policy)
+        
+        if not hasattr(model, 'paligemma_with_expert'):
+            logger.info("Model has no 'paligemma_with_expert' attribute, skipping WM freeze")
+            return
             
-            # Freeze WM expert
-            if hasattr(pwm, 'gemma_wm_expert'):
-                for param in pwm.gemma_wm_expert.parameters():
-                    param.requires_grad = False
+        pwm = model.paligemma_with_expert
+        
+        # Freeze WM expert
+        if hasattr(pwm, 'gemma_wm_expert'):
+            for param in pwm.gemma_wm_expert.parameters():
+                param.requires_grad = False
+        
+        # Freeze VAE
+        if hasattr(model, 'vae') and model.vae is not None:
+            for param in model.vae.parameters():
+                param.requires_grad = False
+        
+        # Freeze vision tower
+        if hasattr(pwm, 'paligemma'):
+            for param in pwm.paligemma.vision_tower.parameters():
+                param.requires_grad = False
             
-            # Freeze VAE
-            if hasattr(self.policy.model, 'vae'):
-                for param in self.policy.model.vae.parameters():
-                    param.requires_grad = False
-            
-            # Freeze vision tower
-            if hasattr(pwm, 'paligemma'):
-                for param in pwm.paligemma.vision_tower.parameters():
-                    param.requires_grad = False
-                
-                # Freeze language model embeddings
-                for param in pwm.paligemma.language_model.parameters():
-                    param.requires_grad = False
+            # Freeze language model embeddings
+            for param in pwm.paligemma.language_model.parameters():
+                param.requires_grad = False
         
         logger.info("Froze World Model and shared components")
     
@@ -292,7 +303,7 @@ class ExplorerRLTrainer:
         Forward pass through Explorer.
         
         Args:
-            batch: Input batch
+            batch: Input batch (can include images for full vision path)
             actions: Optional actions to evaluate
             deterministic: If True, use mean action
             
@@ -301,15 +312,66 @@ class ExplorerRLTrainer:
             log_probs: Log probabilities (B,)
             values: Value estimates (B,)
         """
+        # Check if we have full image data for vision understanding
+        has_images = 'observation.images.image0' in batch
+        
+        if has_images:
+            B = batch['observation.state'].shape[0]
+            # Use full forward path with vision encoding
+            forward_batch = {
+                'observation.images.image0': batch['observation.images.image0'],
+                'observation.images.image0_mask': batch.get('observation.images.image0_mask', 
+                    torch.ones(B, dtype=torch.bool, device=batch['observation.state'].device)),
+                'observation.state': batch['observation.state'],
+                'task': batch.get('task', ["perform the task"] * B),
+            }
+        else:
+            # Fallback: Re-compute state_emb from observation.state to get gradients
+            # Don't use pre-computed state_emb as it may be detached
+            if 'observation.state' in batch:
+                state = batch['observation.state']
+                state_emb = self.policy.model.state_proj(state)
+                # Create new batch for forward_with_actor with fresh state_emb
+                forward_batch = {'state_emb': state_emb}
+            else:
+                forward_batch = batch
+        
         # Forward through policy with explorer actor
+        # Include memory_kv if using memory
+        forward_kwargs = {
+            'actor_name': 'explorer',
+            'return_action_stats': True,
+        }
+        
+        # Add memory_kv if available (for KV cache support)
+        if self.episode_memory_kv is not None:
+            forward_kwargs['memory_kv'] = self.episode_memory_kv
+        
         output = self.policy.forward_with_actor(
-            batch,
-            actor_name='explorer',
-            return_action_stats=True,
+            forward_batch,
+            **forward_kwargs
         )
         
         # Get action mean
         action_mean = output['action']  # (B, action_dim)
+        
+        # Check for NaN in action_mean and handle gracefully
+        if torch.isnan(action_mean).any():
+            logger.warning(f"NaN detected in action_mean, replacing with zeros. Input batch keys: {list(forward_batch.keys())}")
+            # Debug: log input stats
+            for k, v in forward_batch.items():
+                if isinstance(v, torch.Tensor):
+                    logger.warning(f"  {k}: shape={v.shape}, has_nan={torch.isnan(v).any()}, min={v.min().item():.4f}, max={v.max().item():.4f}")
+            action_mean = torch.zeros_like(action_mean)
+        
+        # Get state_emb for value head (from output or recompute)
+        if 'state_emb' in output:
+            state_emb = output['state_emb']
+        elif 'observation.state' in batch:
+            state = batch['observation.state']
+            state_emb = self.policy.model.state_proj(state)
+        else:
+            raise ValueError("Cannot compute state_emb for value head")
         
         # Get std
         std = torch.exp(self.log_std)
@@ -318,6 +380,15 @@ class ExplorerRLTrainer:
         dist = torch.distributions.Normal(action_mean, std)
         
         if actions is not None:
+            # Ensure actions have correct dimension
+            if actions.shape[-1] != action_mean.shape[-1]:
+                if actions.shape[-1] > action_mean.shape[-1]:
+                    # Truncate if got more dimensions than expected
+                    actions = actions[..., :action_mean.shape[-1]]
+                else:
+                    # Pad if got fewer dimensions
+                    pad_size = action_mean.shape[-1] - actions.shape[-1]
+                    actions = torch.cat([actions, torch.zeros(*actions.shape[:-1], pad_size, device=actions.device)], dim=-1)
             # Evaluate provided actions
             log_probs = dist.log_prob(actions).sum(dim=-1)
         elif deterministic:
@@ -331,11 +402,7 @@ class ExplorerRLTrainer:
         # Clamp actions
         actions = torch.clamp(actions, -1.0, 1.0) * self.config.action_scale
         
-        # Value estimate
-        state_emb = output.get('state_emb')
-        if state_emb is None:
-            # Fallback: use state from batch
-            state_emb = self.policy.model.state_proj(batch['observation.state'])
+        # Value estimate using state_emb
         values = self.value_head(state_emb)
         
         return actions, log_probs, values
@@ -478,7 +545,11 @@ class ExplorerRLTrainer:
             mb_batch = {}
             for key in batch:
                 if key not in ['actions', 'old_log_probs', 'old_values', 'advantages', 'returns']:
-                    mb_batch[key] = batch[key][mb_indices]
+                    if key == 'task':
+                        # Handle task field (list of strings) with list indexing
+                        mb_batch[key] = [batch[key][i.item()] for i in mb_indices]
+                    else:
+                        mb_batch[key] = batch[key][mb_indices]
             
             self.optimizer.zero_grad()
             
@@ -491,6 +562,7 @@ class ExplorerRLTrainer:
             
             # Policy loss (clipped)
             ratio = torch.exp(log_probs - mb_old_log_probs)
+            
             surr1 = ratio * mb_advantages
             surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * mb_advantages
             policy_loss = -torch.min(surr1, surr2).mean()
@@ -536,46 +608,65 @@ class ExplorerRLTrainer:
             total_entropy += entropy.item()
             total_loss += loss.item()
             num_batches += 1
+            
+            # Track additional metrics (accumulate from last mini-batch)
+            if num_batches == 1:
+                avg_ratio = ratio.mean().item()
+                clip_frac = ((ratio - 1.0).abs() > self.config.clip_epsilon).float().mean().item()
+                avg_advantage = mb_advantages.mean().item()
         
         return {
             'policy_loss': total_policy_loss / num_batches,
             'value_loss': total_value_loss / num_batches,
             'entropy': total_entropy / num_batches,
             'total_loss': total_loss / num_batches,
+            'ratio': avg_ratio,
+            'clip_fraction': clip_frac,
+            'advantage_mean': avg_advantage,
+            'std': std.mean().item(),
         }
     
-    def save_checkpoint(self, episode: int):
-        """Save training checkpoint."""
-        checkpoint_dir = self.output_dir / f"checkpoint_{episode:06d}"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    def save_checkpoint(self, checkpoint_path: str):
+        """Save training checkpoint.
         
-        # Save explorer actor
-        self.policy.save_actor('explorer', str(checkpoint_dir / 'explorer.pt'))
+        Args:
+            checkpoint_path: Full path to save checkpoint (e.g., 'checkpoints/phase1/step_10000.pth')
+        """
+        import os
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save value head
-        torch.save(self.value_head.state_dict(), checkpoint_dir / 'value_head.pt')
+        # Create checkpoint dict
+        checkpoint = {
+            'optimizer': self.optimizer.state_dict(),
+            'value_head': self.value_head.state_dict(),
+        }
         
-        # Save optimizer
-        torch.save(self.optimizer.state_dict(), checkpoint_dir / 'optimizer.pt')
-        
-        # Save scheduler
         if self.scheduler is not None:
-            torch.save(self.scheduler.state_dict(), checkpoint_dir / 'scheduler.pt')
+            checkpoint['scheduler'] = self.scheduler.state_dict()
+        
+        # Save checkpoint
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Save explorer actor separately (for easy loading)
+        actor_path = checkpoint_path.replace('.pth', '_explorer.pt')
+        self.policy.save_actor('explorer', actor_path)
         
         # Save log_std
-        torch.save(self.log_std.data, checkpoint_dir / 'log_std.pt')
+        log_std_path = os.path.join(checkpoint_dir, 'log_std.pt')
+        torch.save(self.log_std.data, log_std_path)
         
         # Save training state
         state = {
-            'episode': episode,
             'global_step': self.global_step,
-            'config': self.config.to_dict(),
+            'config': self.config.to_dict() if hasattr(self.config, 'to_dict') else {},
             'metrics': {k: list(v) for k, v in self.metrics.items()},
         }
-        with open(checkpoint_dir / 'training_state.json', 'w') as f:
+        state_path = os.path.join(checkpoint_dir, 'training_state.json')
+        with open(state_path, 'w') as f:
             json.dump(state, f, indent=2)
         
-        logger.info(f"Saved checkpoint at episode {episode}")
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_dir: str) -> int:
         """

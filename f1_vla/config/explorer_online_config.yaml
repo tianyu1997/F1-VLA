@@ -1,0 +1,78 @@
+# Explorer RL Training Configuration - Online RL Mode
+# Uses environment interaction with sequential rollout buffer
+
+# Model configuration
+model:
+  pretrained_path: /mnt/data2/ty/F1-VLA/F1_pretrain
+  vae:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
+    vocab_size: 4096
+    z_channels: 32
+  world_model:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/wm
+
+# Environment configuration - Online RL mode
+environment:
+  type: mock  # Use 'robotwin' for real simulation, 'mock' for testing
+  observation:
+    image_size: 256
+    history_length: 4
+  action:
+    dim: 7
+    max_episode_steps: 200
+    
+# Sequential settings (for rollout buffer organization)
+dataset:
+  # Not used in online mode, but keeps format consistent
+  data_dirs: []
+  task_descriptions: []
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 4
+
+# Reward configuration
+reward:
+  alpha: 1.0   # uncertainty weight (main Explorer reward)
+  beta: 0.5    # MSE weight  
+  gamma: 0.3   # MSE improvement weight
+  delta: 0.1   # action penalty weight
+  epsilon: 0.2 # uncertainty improvement weight
+
+# Phase 1: RL Training (Explorer only, WM frozen)
+phase1:
+  enabled: true
+  ppo:
+    learning_rate: 0.0001
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_epsilon: 0.2
+    value_coef: 0.5
+    entropy_coef: 0.01
+    max_grad_norm: 1.0
+  training:
+    total_timesteps: 50000  # Total environment steps
+    steps_per_rollout: 512  # Steps per collection phase
+    num_epochs: 4           # PPO epochs per update
+    batch_size: 64          # Mini-batch size for PPO
+
+# Phase 2: Adversarial Training (disabled for initial test)
+phase2:
+  enabled: false
+  adversarial:
+    wm_learning_rate: 0.00005
+    explorer_learning_rate: 0.0001
+    wm_updates_per_iter: 5
+    explorer_updates_per_iter: 5
+    warmup_iterations: 10
+
+# Output configuration
+output:
+  dir: outputs/explorer_online_rl
+  log_freq: 10
+  save_freq: 5000
+
+# Hardware configuration
+hardware:
+  device: cuda
+  mixed_precision: true
+  seed: 42

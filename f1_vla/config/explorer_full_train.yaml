@@ -1,0 +1,82 @@
+# Explorer RL Full Training Configuration
+# Includes both Phase 1 (RL) and Phase 2 (Adversarial Training)
+
+# Model configuration
+model:
+  pretrained_path: /mnt/data2/ty/F1-VLA/F1_pretrain
+  vae:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
+    vocab_size: 4096
+    z_channels: 32
+  world_model:
+    checkpoint_path: /mnt/data2/ty/F1-VLA/wm
+
+# Environment configuration  
+environment:
+  type: dataset
+  observation:
+    image_size: 256
+    history_length: 4
+  action:
+    dim: 7
+    max_episode_steps: 200
+    
+# Dataset configuration
+dataset:
+  data_dirs:
+    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+  task_descriptions:
+    - "manipulate objects in clean environment"
+  n_obs_img_steps: 4
+  n_pred_img_steps: 1
+  chunk_size: 4
+
+# Reward configuration
+reward:
+  alpha: 1.0   # uncertainty weight
+  beta: 0.5    # MSE weight  
+  gamma: 0.3   # MSE improvement weight
+  delta: 0.1   # action penalty weight
+  epsilon: 0.2 # uncertainty improvement weight
+
+# Phase 1: RL Training (Explorer only, WM frozen)
+phase1:
+  enabled: true
+  ppo:
+    learning_rate: 0.0003   # Increased from 0.0001 for faster learning
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_epsilon: 0.2
+    value_coef: 0.5
+    entropy_coef: 0.01
+    max_grad_norm: 0.5      # Reduced for stability
+  training:
+    total_timesteps: 10000  # Increased for better convergence
+    steps_per_rollout: 256  # Moderate buffer size
+    num_epochs: 4
+    batch_size: 32          # Keep small for memory
+
+# Phase 2: Adversarial Training (WM vs Explorer)
+phase2:
+  enabled: true
+  adversarial:
+    wm_learning_rate: 0.00005
+    explorer_learning_rate: 0.0001
+    wm_updates_per_iter: 3
+    explorer_updates_per_iter: 3
+    warmup_iterations: 5
+    collapse_threshold: 0.1
+  training:
+    total_iterations: 500  # For testing
+
+# Output configuration
+output:
+  dir: outputs/explorer_full_train
+  log_freq: 10
+  save_freq: 500
+
+# Hardware configuration
+hardware:
+  device: cuda
+  mixed_precision: true
+  seed: 42

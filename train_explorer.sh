@@ -1,47 +1,44 @@
 #!/bin/bash
 
-# F1-VLA Training Script
-# Supports both manual GPU selection and auto-detection of free GPUs
+# Explorer Actor RL Training Script
+# 参照 train.sh 风格，支持自动选择空闲GPU和后台训练
 #
 # Usage:
-#   ./train.sh [OPTIONS]
+#   ./train_explorer.sh [OPTIONS]
 #
 # Options:
-#   -c, --config FILE     Config file (default: f1_vla/config/train_config.yaml)
-#   -g, --gpus IDS        GPU IDs, comma-separated (e.g., "0,1,2")
-#   -n, --num-gpus N      Number of GPUs (used with manual mode)
+#   -c, --config FILE     Config file (default: f1_vla/config/explorer_train_config.yaml)
+#   -g, --gpus IDS        GPU IDs, comma-separated (e.g., "0,1")
 #   -a, --auto            Auto-detect free GPUs (memory < 2GB)
-#   -m, --max-gpus N      Max GPUs to use in auto mode (default: 4)
-#   -r, --resume PATH     Resume from checkpoint (path or name like "checkpoint-episode-15500")
-#   -p, --port PORT       Master port for distributed training (default: 29500)
+#   -m, --max-gpus N      Max GPUs to use in auto mode (default: 1)
+#   -p, --phase N         Training phase (1, 2, or both)
+#   -r, --resume PATH     Resume from checkpoint
 #   -h, --help            Show this help message
 #
 # Examples:
-#   ./train.sh -c config.yaml -g 0,1           # Manual: use GPU 0,1
-#   ./train.sh -a -c config.yaml               # Auto: detect free GPUs
-#   ./train.sh -a -m 2 -c config.yaml          # Auto: use max 2 free GPUs
-#   ./train.sh -a -c config.yaml -r checkpoint-episode-15500  # Resume training
+#   ./train_explorer.sh -a                          # Auto GPU, default config
+#   ./train_explorer.sh -g 5                        # Use GPU 5
+#   ./train_explorer.sh -a -p 1                     # Phase 1 only
+#   ./train_explorer.sh -a -r checkpoint.pth        # Resume training
 
 set -e
 
 # ============================================
 # Default values
 # ============================================
-CONFIG_FILE="f1_vla/config/memory_wm_clean_only.yaml"
+CONFIG_FILE="f1_vla/config/explorer_train_config.yaml"
 GPU_IDS=""
-NUM_GPUS=""
 AUTO_MODE=false
-MAX_GPUS=4
-MASTER_PORT=29500
-# Default: Resume from checkpoint-episode-10000 with VAE decoder unfrozen
-RESUME_CKPT="/mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-256178"
+MAX_GPUS=1
+PHASE=""
+RESUME_CKPT=""
 MEMORY_THRESHOLD=2000  # MB
 
 # ============================================
 # Parse arguments
 # ============================================
 show_help() {
-    head -25 "$0" | tail -22
+    head -22 "$0" | tail -19
     exit 0
 }
 
@@ -55,10 +52,6 @@ while [[ $# -gt 0 ]]; do
             GPU_IDS="$2"
             shift 2
             ;;
-        -n|--num-gpus)
-            NUM_GPUS="$2"
-            shift 2
-            ;;
         -a|--auto)
             AUTO_MODE=true
             shift
@@ -67,12 +60,12 @@ while [[ $# -gt 0 ]]; do
             MAX_GPUS="$2"
             shift 2
             ;;
-        -r|--resume)
-            RESUME_CKPT="$2"
+        -p|--phase)
+            PHASE="$2"
             shift 2
             ;;
-        -p|--port)
-            MASTER_PORT="$2"
+        -r|--resume)
+            RESUME_CKPT="$2"
             shift 2
             ;;
         -h|--help)
@@ -111,9 +104,13 @@ if [ "$AUTO_MODE" = true ]; then
                 FREE_GPUS="$FREE_GPUS,$gpu_id"
             fi
             GPU_COUNT=$((GPU_COUNT + 1))
-            echo "  GPU $gpu_id: ${mem_used}MB (FREE)"
+            echo "  GPU $gpu_id: ${mem_used}MB (FREE - selected)"
         else
-            echo "  GPU $gpu_id: ${mem_used}MB (busy or skipped)"
+            if [ "$mem_used" -ge "$MEMORY_THRESHOLD" ]; then
+                echo "  GPU $gpu_id: ${mem_used}MB (busy)"
+            else
+                echo "  GPU $gpu_id: ${mem_used}MB (skipped - max reached)"
+            fi
         fi
     done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits)
     
@@ -123,15 +120,10 @@ if [ "$AUTO_MODE" = true ]; then
     fi
     
     GPU_IDS="$FREE_GPUS"
-    NUM_GPUS="$GPU_COUNT"
 else
     # Manual mode
     if [ -z "$GPU_IDS" ]; then
-        GPU_IDS="0,1"
-    fi
-    if [ -z "$NUM_GPUS" ]; then
-        # Count GPUs from GPU_IDS
-        NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
+        GPU_IDS="0"
     fi
 fi
 
@@ -147,74 +139,61 @@ export TOKENIZERS_PARALLELISM=false
 # ============================================
 # Create log directory and file
 # ============================================
-LOG_DIR="logs"
+LOG_DIR="logs/explorer"
 mkdir -p $LOG_DIR
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/train_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/train_explorer_${TIMESTAMP}.log"
 
 # ============================================
 # Print training info
 # ============================================
 echo ""
 echo "=========================================="
-echo "F1-VLA Training (torchrun)"
+echo "Explorer Actor RL Training"
 echo "=========================================="
 echo "Config: $CONFIG_FILE"
-echo "GPUs: $GPU_IDS ($NUM_GPUS GPUs)"
+echo "GPU: $GPU_IDS"
 echo "Mode: $([ "$AUTO_MODE" = true ] && echo "Auto-detect" || echo "Manual")"
+if [ -n "$PHASE" ]; then
+echo "Phase: $PHASE"
+else
+echo "Phase: Both (1 & 2)"
+fi
 if [ -n "$RESUME_CKPT" ]; then
 echo "Resume: $RESUME_CKPT"
 fi
-echo "Master port: $MASTER_PORT"
 echo "Log file: $LOG_FILE"
 echo "=========================================="
 echo ""
 
 # ============================================
-# Build extra arguments
+# Build command arguments
 # ============================================
-EXTRA_ARGS=""
+CMD_ARGS="--config $CONFIG_FILE"
+
+if [ -n "$PHASE" ]; then
+    CMD_ARGS="$CMD_ARGS --phase $PHASE"
+fi
+
 if [ -n "$RESUME_CKPT" ]; then
-    # Check if checkpoint exists
-    if [ ! -d "$RESUME_CKPT" ]; then
-        echo "WARNING: Checkpoint not found: $RESUME_CKPT"
-        echo "Available checkpoints in outputs/memory_wm_clean_only/:"
-        ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
-        echo ""
-        read -p "Continue without resuming? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-        RESUME_CKPT=""
-    else
-        # Checkpoint exists, use it
-        EXTRA_ARGS="exp.training_args.resume_from_checkpoint=$RESUME_CKPT"
-        echo "Checkpoint verified: $RESUME_CKPT"
-    fi
+    CMD_ARGS="$CMD_ARGS --resume $RESUME_CKPT"
 fi
 
 # ============================================
-# Run training with torchrun
+# Run training in background
 # ============================================
-nohup torchrun \
-    --nproc_per_node=$NUM_GPUS \
-    --master_port=$MASTER_PORT \
-    train_hf.py \
-    --config "$CONFIG_FILE" \
-    $EXTRA_ARGS \
-    > "$LOG_FILE" 2>&1 &
+nohup python -u f1_vla/src/scripts/train_explorer.py $CMD_ARGS > "$LOG_FILE" 2>&1 &
 
 # Save PID
 PID=$!
-echo $PID > "${LOG_DIR}/train_pid.txt"
+echo $PID > "${LOG_DIR}/train_explorer_pid.txt"
 
 # Create latest_log symlink
-ln -sf "train_${TIMESTAMP}.log" "${LOG_DIR}/latest_log.log"
+ln -sf "train_explorer_${TIMESTAMP}.log" "${LOG_DIR}/latest_log.log"
 
 echo "Training started with PID: $PID"
 echo ""
-echo "Monitor:  tail -f logs/latest_log.log"
+echo "Monitor:  tail -f logs/explorer/latest_log.log"
 echo "Stop:     kill $PID"
 echo ""
