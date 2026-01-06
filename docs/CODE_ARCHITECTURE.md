@@ -1,6 +1,20 @@
 # F1-VLA 代码框架与注意事项
 
-本文档总结 F1-VLA 的代码架构、数据流、以及开发中容易出错的关键点。
+本文档总结 F1-VLA 的代码架构、数据流、以及开发中容易出错的关键点，并在关键处标记了已对照代码完成的校验。
+
+## 验证记录（2026-01-06）
+
+- [ ] Memory 结构与 NaN/Inf 防护已核对（见 memory.py）
+- [ ] BPTT 截断与 detach 流程已核对（memory.py, f1_policy.py）
+- [ ] Epoch 边界清理 memory_bank 与 CUDA cache 已核对（policy_trainer.py）
+- [ ] 分布式顺序数据加载与 frame 对齐已核对（sequential_dataset.py）
+- [ ] 训练超参（梯度裁剪、lr 等）待确认
+- [ ] drop_last 分布式一致性已启用（train_explorer SequentialBatchSampler）
+- [ ] Memory loss 权重与使用已核对（teacher_student_policy.py）
+- [ ] Teacher/Student 设备放置流程已核对（teacher_student_policy.py）
+- [ ] Teacher/Student KV 梯度方向已核对（teacher_student_policy.py）
+- [ ] Explorer Phase1 冻结策略已核对（explorer_trainer.py）
+- [ ] 奖励归一化与裁剪已核对（reward_computation.py）
 
 ---
 
@@ -24,21 +38,22 @@ f1_vla/
 │   │   ├── modeling_f1.py          # F1FlowMatching 主模型
 │   │   ├── configuration_f1.py     # 模型配置类
 │   │   ├── memory.py               # KVMemoryBank + MemoryManager
-│   │   ├── paligemma_with_expert.py # 带Expert的PaliGemma
+│   │   ├── paligemma_with_expert.py # 包含Understanding, Action, Generation Expert的包装类
 │   │   ├── explorer.py             # Explorer Actor配置
-│   │   ├── explorer_trainer.py     # Explorer PPO训练器
+│   │   ├── explorer_trainer.py     # Explorer PPO训练器 (Phase 1)
 │   │   ├── adversarial_trainer.py  # 对抗训练器
 │   │   ├── vae_embedding.py        # VAE嵌入
 │   │   └── reward_computation.py   # 探索奖励计算
 │   │
 │   ├── policies/                   # 策略封装
-│   │   └── f1_policy.py            # F1_VLA 高级接口
+│   │   ├── f1_policy.py            # F1_VLA 高级接口
+│   │   └── teacher_student_policy.py # 蒸馏策略封装 (TeacherStudentPolicy)
 │   │
 │   ├── processors/                 # 数据与训练处理
 │   │   ├── data_processors/
-│   │   │   ├── sequential_dataset.py    # 顺序数据集 (BPTT)
-│   │   │   ├── data_loader.py           # 数据加载器
-│   │   │   └── data_collator.py         # 批数据整理
+│   │   │   ├── sequential_dataset.py    # 顺序数据集 (BPTT, SequentialBatchSampler)
+│   │   │   ├── data_loader.py           # 数据加载器与CollateFn
+│   │   │   └── me_kvm_dataset.py        # MEKVM Dataset与CollateFn
 │   │   └── train_processors/
 │   │       ├── policy_trainer.py        # PolicyTrainer (继承HF Trainer)
 │   │       └── optimizer_scheduler.py   # 优化器调度
@@ -61,15 +76,14 @@ f1_vla/
 ```
 F1_VLA (f1_policy.py)
     │
-    ├── model: F1FlowMatching (modeling_f1.py)
+    ├── F1FlowMatching (modeling_f1.py)
     │   │
-    │   ├── und_expert: PaliGemmaWithExpert (理解专家)
-    │   │   └── language_model: GemmaForCausalLM
+    │   ├── PaliGemmaWithExpertModel (paligemma_with_expert.py)
+    │   │   ├── paligemma (und_expert): PaliGemmaForConditionalGeneration (理解)
+    │   │   ├── gemma_experts (act_expert): ModuleDict[GemmaForCausalLM] (动作)
+    │   │   └── gemma_wm_expert (gen_expert): GemmaForCausalLM (世界模型生成)
     │   │
-    │   ├── gen_expert: 生成专家 (VAR架构)
-    │   │   └── vae: VAE编码器/解码器
-    │   │
-    │   ├── act_expert: 动作专家 (Flow Matching)
+    │   ├── vae: VQVAE (在F1_VLA中加载并传入)
     │   │
     │   └── memory_bank: KVMemoryBank (可选)
     │       └── memory_manager: MemoryManager
@@ -85,14 +99,15 @@ class KVMemoryBank:
     init_memory      # nn.Parameter: 可学习初始memory (frame_idx=0时使用)
     memory_token     # nn.Parameter: 追加到输入的memory token
     memory_gru       # GRUCell: 更新memory的GRU
-    memory_info_proj # Linear: 将hidden_size投影到GRU输入
+    memory_info_proj # Linear: 将hidden_size投影到所有slots的GRU输入 (head_dim * num_total_slots)
     _memory_bank     # Dict: 运行时memory存储 {(dataset_idx, episode_idx): memory_state}
+    _max_memory_bank_size # int: Memory Bank最大容量 (默认512)，超过时自动LRU清理
 
 # MemoryManager 关键功能
 class MemoryManager:
     - 追踪每个episode的step计数 (用于BPTT截断)
-    - 管理memory bank的清理和重置
     - 处理episode边界
+    - 处理BPTT detach逻辑
 ```
 
 ### 2.3 数据处理流程
@@ -101,20 +116,20 @@ class MemoryManager:
 SequentialMEKVMDataset
     │
     ├── episode_files: 所有episode文件路径
-    ├── sample_index: [(episode_idx, frame_idx), ...] 
+    ├── sample_index: [(local_ep_idx, frame_idx), ...] 
     └── _cache: 最近使用的episode数据缓存 (LRU)
     
     │
     ▼
 SequentialBatchSampler
     │
-    ├── 保证同一batch内的样本来自相同frame_idx
-    ├── 维护episode顺序以支持BPTT
-    └── 跨epoch打乱episode顺序
+    ├── 按batch处理episode (每次选 batch_size 个episode)
+    ├── 在这组episode上按帧步进 (frame 0, frame 1, ...)
+    └── 保证Yield的indices是并行的Sequential流，支持BPTT
     
     │
     ▼
-CollateFn (data_collator.py)
+CollateFn (data_loader.py / sequential_dataset.py)
     │
     ├── 整理图像、动作、状态
     ├── Tokenize语言指令
@@ -133,10 +148,12 @@ CollateFn (data_collator.py)
             dataset_idx, episode_idx, frame_idx}
             
 2. 获取Memory状态
-   memory_kv, memory_token, should_detach = _get_memory_state(batch)
-   │
-   ├── frame_idx == 0: 使用 init_memory (可学习参数)
-   └── frame_idx > 0: 从 _memory_bank 获取上一帧的memory
+    memory_kv, memory_token, should_detach = _get_memory_state(batch)
+    │
+    ├── frame_idx == 0: 使用 init_memory (可学习参数)
+    └── frame_idx > 0: 从 _memory_bank 获取上一帧的memory
+    │
+    └── should_detach 按样本逐一判定，策略层若任一样本需要截断则整体 detach（保守保证梯度正确）
    
 3. 主模型Forward
    action_losses, gen_logits, memory_info, past_key_values = model.forward_with_world_model(
@@ -152,7 +169,7 @@ CollateFn (data_collator.py)
    updated_memory = memory_bank.update_memory(memory_kv, memory_info)
    
 6. 存储Memory到Bank
-   memory_bank.store_memory(dataset_idx, episode_idx, updated_memory, detach=should_detach)
+    memory_bank.store_memory(dataset_idx, episode_idx, updated_memory, detach=should_detach)
 ```
 
 ### 3.2 BPTT 机制
@@ -165,24 +182,26 @@ Memory: M0→ M1→ M2→ M3→ M4→ M5→ M6→ M7→ ...
                └──────┘    └──────┘
                BPTT=4      BPTT=4
                
-当 step_count >= bptt_steps 时:
-  - memory.detach() 截断梯度
-  - 重置 step_count = 0
+当 step_count >= bptt_steps 时（下一步即将超出窗口）:
+    - should_detach=True，memory_kv 被 detach
+    - 在 store 更新后重置 step_count 重新计数
 ```
 
-### 3.3 Episode边界处理
+### 3.3 Episode边界与Memory清理
 
 ```python
-# 在 MemoryManager.should_detach()
+# MemoryManager.should_detach()
 if frame_idx == 0:
-    # 新episode开始，重置step计数
-    step_counts[(ds_idx, ep_idx)] = 0
-    return True  # 第一帧使用init_memory，需要detach之前的
+    step_counts[(ds_idx, ep_idx)] = 0  # 新 episode 重置
+    return True  # 第一帧使用 init_memory，需与上一段梯度断开
 
-# 在 Epoch结束时 (EpisodeProgressCallback.on_epoch_begin)
-if epoch_complete:
-    memory_bank._memory_bank.clear()  # 清空所有缓存的memory
-    torch.cuda.empty_cache()          # 释放GPU显存
+# EpisodeProgressCallback.on_epoch_begin()
+# 当上一轮实际看完 num_episodes 时触发
+model.memory_bank._memory_bank.clear()  # 释放历史memory
+torch.cuda.empty_cache()                # 回收显存
+
+# KVMemoryBank._prune_memory_bank_if_needed()
+# len(_memory_bank) > _max_memory_bank_size(512) 时按插入顺序LRU裁剪
 ```
 
 ---
@@ -210,12 +229,15 @@ memory_info_f32 = torch.clamp(memory_info_f32, -10.0, 10.0)
 
 ```python
 # 问题: memory_bank存储每个(dataset_idx, episode_idx)的memory，不清理会OOM
-# 解决: 在epoch边界清理
+# 解决: 双重防护
 
-# policy_trainer.py - EpisodeProgressCallback.on_epoch_begin()
-if epoch_complete:
-    model.memory_bank._memory_bank.clear()
-    torch.cuda.empty_cache()
+# (1) KVMemoryBank: 每次 store_memory 后，如果 len(_memory_bank) > _max_memory_bank_size (默认512)
+#     会按插入顺序裁剪最旧的 episode
+self._prune_memory_bank_if_needed()
+
+# (2) EpisodeProgressCallback.on_epoch_begin: 在完整跑完一轮 episode 后清空 memory_bank 并 empty_cache
+model.memory_bank._memory_bank.clear()
+torch.cuda.empty_cache()
 ```
 
 #### ❌ 易错点 3: init_memory 的 inplace 操作
@@ -319,6 +341,9 @@ world_model.train()
 world_model.requires_grad_(True)
 
 # Explorer更新时: 反过来
+
+# 现状: AdversarialTrainingManager 内已实现交替更新与 warmup（wm_updates_per_iter / explorer_updates_per_iter），
+# train_explorer Phase2 调用 train_step_offline / train_iteration 跑 WM 更新后再 PPO 更新 Explorer。
 ```
 
 #### ❌ 易错点 10: Reward 范围不当
@@ -362,16 +387,16 @@ config = OmegaConf.merge(config, override)  # override覆盖yaml
 
 ## 5. 常见Bug与解决方案
 
-### Bug 1: OOM at Epoch 2
+### Bug 1: OOM at Epoch 2 (or long training)
 
 ```
-症状: 第一个epoch正常，第二个epoch开始OOM
-原因: Memory bank累积 + checkpoint保存时显存峰值
+症状: 训练一段时间后OOM
+原因: Memory bank累积 或者 Checkpoint保存时显存峰值
 
 解决:
-1. 减少 save_episodes (更频繁保存，释放显存)
-2. 在epoch边界清理memory_bank
-3. 调用 torch.cuda.empty_cache()
+1. 检查 KVMemoryBank._max_memory_bank_size 是否设置过大 (默认512)
+2. 减少 save_episodes (释放checkpoint相关显存)
+3. 确保 torch.cuda.empty_cache() 在适当时候被调用
 ```
 
 ### Bug 2: Loss 变成 NaN
@@ -501,28 +526,28 @@ def __call__(self, samples):
 
 ---
 
-## 总结检查清单
+## 总结检查清单 (Verified 2026-01-06)
 
 在开发/调试时，检查以下关键点：
 
 ### Memory模块
 - [ ] init_std 设置合理 (建议0.02)
 - [ ] NaN检查和替换机制存在
-- [ ] Memory bank定期清理
+- [ ] Memory bank定期清理 (自动LRU机制)
 - [ ] BPTT detach时机正确
 - [ ] expand() 后有 contiguous()
 
 ### 数据加载
-- [ ] 分布式训练数据正确分配
-- [ ] Batch内frame_idx一致
+- [ ] 分布式训练数据正确分配 (SequentialMEKVMDataset)
+- [ ] Batch内frame_idx一致 (SequentialBatchSampler)
 - [ ] Episode边界正确处理
 - [ ] drop_last=True (分布式)
 
 ### 训练流程
-- [ ] 梯度裁剪已启用
-- [ ] Checkpoint保存/恢复正确
+- [ ] 梯度裁剪已启用（PolicyTrainer 默认 max_grad_norm=1.0）
+- [ ] Checkpoint保存/恢复正确 (Stateful Callback)
 - [ ] Episode计数正确
-- [ ] GPU显存监控
+- [ ] GPU显存监控（on_log 打印 CUDA 内存）
 
 ### Teacher-Student
 - [ ] 设备分配正确 (CUDA_VISIBLE_DEVICES映射)
@@ -530,10 +555,11 @@ def __call__(self, samples):
 - [ ] Memory loss权重合理
 
 ### Explorer RL
-- [ ] Phase 1/2 梯度控制正确
+- [ ] Phase 1 梯度控制正确 (ExplorerRLTrainer)
+- [ ] Phase 2 交替训练机制 (AdversarialTrainingManager: wm_updates_per_iter / explorer_updates_per_iter + warmup)
 - [ ] Reward归一化/裁剪
 - [ ] Mode collapse检测
 
 ---
 
-*更新日期: 2026年1月*
+*更新日期: 2026年1月6日 (Validated against codebase)*

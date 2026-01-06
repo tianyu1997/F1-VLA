@@ -222,6 +222,15 @@ class EpisodeProgressCallback(TrainerCallback):
             loss = logs.get('wm_out_loss', logs.get('loss', 0))
             acc = logs.get('wm_acc_mean', 0)
             self.pbar.set_postfix_str(f'L={loss:.3f} A={acc:.1%}')
+
+        # Lightweight GPU memory snapshot for visibility (once per log event)
+        if state.is_local_process_zero and torch.cuda.is_available():
+            mem_info = []
+            for i in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(i) / 1e9
+                reserv = torch.cuda.memory_reserved(i) / 1e9
+                mem_info.append(f"{i}:A{alloc:.2f}G/R{reserv:.2f}G")
+            logger.info(f"[GPU Memory] {' | '.join(mem_info)}")
     
     def update_metrics(self, loss: float, wm_loss: float = 0.0, wm_acc: float = 0.0, action_loss: float = 0.0):
         """Update real-time metrics from compute_loss (every micro-batch)."""
@@ -382,6 +391,12 @@ class PolicyTrainer(Trainer):
         # Restore our custom eval_dataset after Trainer.__init__()
         self.eval_dataset = self._custom_eval_dataset
         logger.info(f"[PolicyTrainer] eval_dataset after init: {self.eval_dataset is not None}")
+
+        # Ensure gradient clipping is active even if the caller does not set it explicitly.
+        # HuggingFace Trainer applies clip_grad_norm_ when max_grad_norm > 0.
+        if getattr(self.args, "max_grad_norm", None) in (None, 0):
+            self.args.max_grad_norm = 1.0
+            logger.info("[PolicyTrainer] max_grad_norm not set; defaulting to 1.0 for gradient clipping")
     
     
     def get_train_dataloader(self):

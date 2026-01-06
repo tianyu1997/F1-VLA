@@ -264,7 +264,7 @@ class KVMemoryBank(nn.Module):
         memory_info_f32 = memory_info.float()
         
         # Clip memory_info to prevent extreme values
-        memory_info_f32 = torch.clamp(memory_info_f32, -10.0, 10.0)
+        memory_info_f32.clamp_(-10.0, 10.0)
         
         # Project memory_info to separate inputs for each slot
         proj = self.memory_info_proj.to(device).float()
@@ -276,7 +276,7 @@ class KVMemoryBank(nn.Module):
             memory_info_proj = torch.zeros_like(memory_info_proj)
         
         # Clip projected values
-        memory_info_proj = torch.clamp(memory_info_proj, -10.0, 10.0)
+        memory_info_proj.clamp_(-10.0, 10.0)
         
         # Reshape to (batch, num_total_slots, head_dim) - each slot gets different input
         memory_info_proj = memory_info_proj.view(batch_size, self.num_total_slots, self.head_dim)
@@ -294,15 +294,15 @@ class KVMemoryBank(nn.Module):
                 logger.error(f"[KVMemoryBank] previous_memory layer {layer_idx} value has NaN/Inf! Replacing with zeros.")
                 v = torch.zeros_like(v)
             
-            flat_slots.append(k.reshape(batch_size, -1, self.head_dim).clone())
-            flat_slots.append(v.reshape(batch_size, -1, self.head_dim).clone())
+            flat_slots.append(k.reshape(batch_size, -1, self.head_dim))
+            flat_slots.append(v.reshape(batch_size, -1, self.head_dim))
         
         # Concatenate: (batch, total_slots, head_dim)
         memory_slots = torch.cat(flat_slots, dim=1).float()
         num_slots = memory_slots.shape[1]
         
         # Clip memory slots to prevent extreme values
-        memory_slots = torch.clamp(memory_slots, -10.0, 10.0)
+        memory_slots.clamp_(-10.0, 10.0)
         
         # Move GRU to device and float32
         gru = self.memory_gru.to(device).float()
@@ -322,7 +322,7 @@ class KVMemoryBank(nn.Module):
                 new_slot_b = slot_b  # Revert to previous memory
             
             # Clip to prevent extreme values
-            new_slot_b = torch.clamp(new_slot_b, -10.0, 10.0)
+            new_slot_b.clamp_(-10.0, 10.0)
             
             updated_slots_list.append(new_slot_b)
         
@@ -332,7 +332,7 @@ class KVMemoryBank(nn.Module):
         # Final safety check
         if torch.isnan(updated_slots).any() or torch.isinf(updated_slots).any():
             logger.error(f"[KVMemoryBank] updated_slots has NaN/Inf after GRU! Replacing with clamped memory_slots.")
-            updated_slots = torch.clamp(memory_slots, -10.0, 10.0)
+            updated_slots = memory_slots.clamp(-10.0, 10.0)
         
         # Convert back to original dtype
         updated_slots = updated_slots.to(dtype)

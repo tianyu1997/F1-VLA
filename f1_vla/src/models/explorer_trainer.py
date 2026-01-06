@@ -74,6 +74,13 @@ class ExplorerTrainingConfig:
     freeze_world_model: bool = True
     freeze_policy_actor: bool = True
     
+    # Mode collapse detection
+    detect_mode_collapse: bool = True
+    min_action_std: float = 0.1          # Alert if action std falls below this
+    min_entropy_threshold: float = 0.5   # Alert if entropy falls below this
+    collapse_check_window: int = 50      # Window size for collapse detection
+    entropy_bonus_on_collapse: float = 0.1  # Extra entropy bonus when collapse detected
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -179,7 +186,16 @@ class ExplorerRLTrainer:
             'r2_mse': deque(maxlen=100),
             'r3_mse_improvement': deque(maxlen=100),
             'r4_uncertainty_improvement': deque(maxlen=100),
+            # Mode collapse detection metrics
+            'action_std': deque(maxlen=100),
+            'action_mean_norm': deque(maxlen=100),
+            'state_coverage': deque(maxlen=100),
         }
+        
+        # Mode collapse state
+        self._collapse_detected = False
+        self._collapse_count = 0
+        self._visited_states = set()  # Hash of visited state embeddings
         
         # Training state
         self.global_step = 0
@@ -293,6 +309,111 @@ class ExplorerRLTrainer:
                 param.requires_grad = False
             logger.info("Froze policy actor")
     
+    def detect_mode_collapse(
+        self,
+        actions: torch.Tensor,
+        entropy: torch.Tensor,
+        state_emb: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """
+        Detect mode collapse based on action diversity and entropy.
+        
+        Mode collapse indicators:
+        1. Low action standard deviation (actions becoming uniform)
+        2. Low policy entropy (deterministic policy)
+        3. Low state coverage (visiting same states repeatedly)
+        
+        Args:
+            actions: Batch of actions (B, action_dim)
+            entropy: Policy entropy (scalar or per-sample)
+            state_emb: Optional state embeddings for coverage tracking
+            
+        Returns:
+            Dict with collapse detection results and metrics
+        """
+        if not self.config.detect_mode_collapse:
+            return {'collapsed': False}
+        
+        result = {
+            'collapsed': False,
+            'reasons': [],
+            'metrics': {},
+        }
+        
+        # 1. Check action standard deviation
+        action_std = actions.std(dim=0).mean().item()
+        action_mean_norm = actions.mean(dim=0).norm().item()
+        result['metrics']['action_std'] = action_std
+        result['metrics']['action_mean_norm'] = action_mean_norm
+        
+        self.metrics['action_std'].append(action_std)
+        self.metrics['action_mean_norm'].append(action_mean_norm)
+        
+        if action_std < self.config.min_action_std:
+            result['collapsed'] = True
+            result['reasons'].append(f'Low action std: {action_std:.4f} < {self.config.min_action_std}')
+        
+        # 2. Check entropy
+        entropy_val = entropy.mean().item() if entropy.dim() > 0 else entropy.item()
+        result['metrics']['entropy'] = entropy_val
+        
+        if entropy_val < self.config.min_entropy_threshold:
+            result['collapsed'] = True
+            result['reasons'].append(f'Low entropy: {entropy_val:.4f} < {self.config.min_entropy_threshold}')
+        
+        # 3. Check state coverage (if state embeddings provided)
+        if state_emb is not None:
+            # Discretize state embeddings for hashing
+            state_hash = self._hash_states(state_emb)
+            new_states = 0
+            for h in state_hash:
+                if h not in self._visited_states:
+                    self._visited_states.add(h)
+                    new_states += 1
+            
+            coverage_rate = new_states / len(state_hash) if len(state_hash) > 0 else 0
+            result['metrics']['new_state_rate'] = coverage_rate
+            result['metrics']['total_visited_states'] = len(self._visited_states)
+            self.metrics['state_coverage'].append(coverage_rate)
+            
+            # Low coverage over recent window suggests collapse
+            if len(self.metrics['state_coverage']) >= self.config.collapse_check_window:
+                recent_coverage = np.mean(list(self.metrics['state_coverage'])[-self.config.collapse_check_window:])
+                if recent_coverage < 0.05:  # Less than 5% new states
+                    result['collapsed'] = True
+                    result['reasons'].append(f'Low state coverage: {recent_coverage:.2%}')
+        
+        # Update collapse state
+        if result['collapsed']:
+            self._collapse_count += 1
+            if not self._collapse_detected:
+                self._collapse_detected = True
+                logger.warning(f"[Mode Collapse Detected] Episode {self.current_episode}: {result['reasons']}")
+        else:
+            self._collapse_detected = False
+        
+        return result
+    
+    def _hash_states(self, state_emb: torch.Tensor, num_bins: int = 100) -> List[int]:
+        """Hash state embeddings for coverage tracking."""
+        # Discretize to bins and create hash
+        state_np = state_emb.detach().cpu().numpy()
+        # Use first few dimensions for hashing
+        state_reduced = state_np[:, :min(16, state_np.shape[1])]
+        # Discretize
+        bins = np.linspace(-3, 3, num_bins)
+        digitized = np.digitize(state_reduced, bins)
+        # Create hash from digitized values
+        hashes = [hash(tuple(row)) for row in digitized]
+        return hashes
+    
+    def get_entropy_coef(self) -> float:
+        """Get entropy coefficient, with bonus if collapse detected."""
+        base_coef = self.config.entropy_coef
+        if self._collapse_detected:
+            return base_coef + self.config.entropy_bonus_on_collapse
+        return base_coef
+
     def forward_explorer(
         self,
         batch: Dict[str, torch.Tensor],

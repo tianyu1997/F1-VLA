@@ -124,7 +124,9 @@ class SequentialMEKVMDataset(Dataset):
         
         # Episode cache (LRU style)
         self._cache = {}
-        self._cache_max_size = 10
+        # Increase cache size to improve performance on servers with sufficient RAM
+        # Assuming average episode size ~50MB, 64 episodes ~= 3.2GB RAM
+        self._cache_max_size = 64
         
         logger.info(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
     
@@ -190,6 +192,9 @@ class SequentialMEKVMDataset(Dataset):
     
     def _resize_to_256(self, img: torch.Tensor) -> torch.Tensor:
         """Resize image(s) from 224x224 to 256x256 for VAE compatibility."""
+        if img.shape[-2:] == (256, 256):
+            return img
+            
         original_shape = img.shape
         if len(original_shape) == 3:
             img = img.unsqueeze(0)

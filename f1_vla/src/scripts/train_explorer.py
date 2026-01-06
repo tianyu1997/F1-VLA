@@ -616,7 +616,7 @@ class ExplorerTrainingPipeline:
             dataset=self.train_dataset,
             batch_size=self.config.phase1_batch_size,
             shuffle_episodes=True,
-            drop_last=False,
+            drop_last=True,
         )
         
         # Create collate function
@@ -1038,7 +1038,7 @@ class ExplorerTrainingPipeline:
             dataset=self.train_dataset,
             batch_size=self.config.phase2_batch_size,  # Smaller batch size
             shuffle_episodes=True,
-            drop_last=False,
+            drop_last=True,
         )
         phase2_dataloader = DataLoader(
             self.train_dataset,
