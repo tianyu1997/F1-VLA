@@ -594,16 +594,20 @@ class SequentialRolloutCollector:
         if isinstance(curr_img, np.ndarray):
             if curr_img.ndim == 4:
                 curr_img = curr_img[-1]
-            if curr_img.max() > 1.0:
-                curr_img = curr_img / 255.0
+            if curr_img.dtype == np.uint8 or curr_img.max() > 1.0:
+                curr_img = curr_img.astype(np.float32) / 255.0
             curr_img = torch.from_numpy(curr_img).float().unsqueeze(0).to(self.device)
+            # Normalize to [-1, 1] for VAE
+            curr_img = curr_img * 2.0 - 1.0
         
         if isinstance(next_img, np.ndarray):
             if next_img.ndim == 4:
                 next_img = next_img[-1]
-            if next_img.max() > 1.0:
-                next_img = next_img / 255.0
+            if next_img.dtype == np.uint8 or next_img.max() > 1.0:
+                next_img = next_img.astype(np.float32) / 255.0
             next_img = torch.from_numpy(next_img).float().unsqueeze(0).to(self.device)
+            # Normalize to [-1, 1] for VAE
+            next_img = next_img * 2.0 - 1.0
         
         with torch.no_grad():
             # 1. Get VAE embeddings (ground truth)

@@ -174,26 +174,26 @@ echo ""
 # ============================================
 # Build extra arguments
 # ============================================
-EXTRA_ARGS=""
-if [ -n "$RESUME_CKPT" ]; then
-    # Check if checkpoint exists
-    if [ ! -d "$RESUME_CKPT" ]; then
-        echo "WARNING: Checkpoint not found: $RESUME_CKPT"
-        echo "Available checkpoints in outputs/memory_wm_clean_only/:"
-        ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
-        echo ""
-        read -p "Continue without resuming? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-        RESUME_CKPT=""
-    else
-        # Checkpoint exists, use it
-        EXTRA_ARGS="exp.training_args.resume_from_checkpoint=$RESUME_CKPT"
-        echo "Checkpoint verified: $RESUME_CKPT"
-    fi
-fi
+# EXTRA_ARGS=""
+# if [ -n "$RESUME_CKPT" ]; then
+#     # Check if checkpoint exists
+#     if [ ! -d "$RESUME_CKPT" ]; then
+#         echo "WARNING: Checkpoint not found: $RESUME_CKPT"
+#         echo "Available checkpoints in outputs/memory_wm_clean_only/:"
+#         ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
+#         echo ""
+#         read -p "Continue without resuming? (y/n) " -n 1 -r
+#         echo
+#         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#             exit 1
+#         fi
+#         RESUME_CKPT=""
+#     else
+#         # Checkpoint exists, use it
+#         EXTRA_ARGS="exp.training_args.resume_from_checkpoint=$RESUME_CKPT"
+#         echo "Checkpoint verified: $RESUME_CKPT"
+#     fi
+# fi
 
 # ============================================
 # Run training with torchrun

@@ -99,6 +99,23 @@ class F1_VLA(nn.Module):
         """Get the currently active actor name."""
         return self.model.active_actor
     
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing."""
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        elif hasattr(self.model, "paligemma"):
+             # If F1FlowMatching wraps paligemma directly
+             if hasattr(self.model.paligemma, "gradient_checkpointing_enable"):
+                self.model.paligemma.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+        elif hasattr(self.model, "paligemma"):
+            if hasattr(self.model.paligemma, "gradient_checkpointing_disable"):
+                self.model.paligemma.gradient_checkpointing_disable()
+    
     @active_actor.setter
     def active_actor(self, actor_name: str):
         """Set the active actor by name."""
@@ -835,6 +852,9 @@ class F1_VLA(nn.Module):
         # Concatenate history and target along time dimension
         # Result: (B, n_obs + n_pred, C, H, W)
         combined = torch.cat([hist_img, target_img], dim=1)
+
+        # Normalize [0, 1] -> [-1, 1] for VAE
+        combined = combined * 2.0 - 1.0
 
         return combined
 

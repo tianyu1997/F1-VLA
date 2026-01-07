@@ -1,5 +1,7 @@
 import os
+import json
 import random
+import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Union, Tuple
@@ -85,8 +87,9 @@ class EpisodeProgressCallback(TrainerCallback):
     Implements state persistence for proper checkpoint resume.
     """
     
-    def __init__(self, num_episodes: int = 0, total_steps: int = 0, batch_size: int = 4, num_epochs: int = 1,
+    def __init__(self, policy=None, num_episodes: int = 0, total_steps: int = 0, batch_size: int = 4, num_epochs: int = 1,
                  logging_episodes: int = 10, save_episodes: int = 100, eval_episodes: int = 50):
+        self.policy = policy
         self.num_episodes = num_episodes
         self.total_steps = total_steps
         self.batch_size = batch_size
@@ -98,7 +101,7 @@ class EpisodeProgressCallback(TrainerCallback):
         # Number of episode batches (groups of batch_size episodes)
         self.num_episode_batches = (num_episodes + batch_size - 1) // batch_size
         self.pbar = None
-        self.current_epoch = 0
+        self.current_epoch = -1  # Initialized to -1 so first on_epoch_begin starts at 0 (displayed as E1)
         self.current_episode_batch = 0
         self.seen_episodes = set()  # Track all seen episode indices
         self.epoch_episode_count = 0  # Episodes seen in current epoch
@@ -109,6 +112,7 @@ class EpisodeProgressCallback(TrainerCallback):
         
         # Flag to track if we've been restored from checkpoint
         self._restored_from_checkpoint = False
+        self._is_first_epoch_step = False  # Track first epoch step after resume
         
         # Real-time metrics (updated every step from compute_loss)
         self.current_loss = 0.0
@@ -144,28 +148,45 @@ class EpisodeProgressCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize progress bar at training start."""
         from tqdm import tqdm
+        self._is_first_epoch_step = True  # Next on_epoch_begin is the first one after start/resume
+        
         if state.is_local_process_zero:
             # Calculate epoch from total_episode_count (more reliable than state.epoch for resume)
             if not self._restored_from_checkpoint:
                 # Fresh start - calculate from state.epoch if available
+                # If resuming mid-epoch (e.g. 0.99), current_epoch should be -1 so on_epoch_begin makes it 0.
                 if state.epoch:
-                    self.current_epoch = int(state.epoch)
-                    # Also estimate episode counts from global_step
-                    if state.global_step > 0 and self.num_episodes > 0:
-                        # Estimate total episodes = global_step * batch_size
-                        self.total_episode_count = state.global_step * self.batch_size
+                    # state.epoch is a float (e.g. 0.99)
+                    self.current_epoch = int(state.epoch) - 1
+                    
+                    # Estimate episode counts from fractional epoch
+                    if self.num_episodes > 0:
+                        # Improved estimation: uses epoch fraction directly
+                        self.total_episode_count = int(state.epoch * self.num_episodes)
                         self.epoch_episode_count = self.total_episode_count % self.num_episodes
+                        
                         self.last_log_episode = self.total_episode_count
                         self.last_save_episode = self.total_episode_count
-                        self.last_eval_episode = self.total_episode_count  # Also set eval marker
-                        logger.info(f"[EpisodeProgressCallback] Estimated from state: epoch={self.current_epoch}, "
-                                   f"total_episodes={self.total_episode_count}")
+                        self.last_eval_episode = self.total_episode_count
+                        
+                        # Fix: Populate seen_episodes with dummies so correct length is maintained
+                        # valid episode indices are >= 0, so we use negative dummies
+                        if self.epoch_episode_count > 0:
+                            for i in range(self.epoch_episode_count):
+                                self.seen_episodes.add(-(i + 1))
+                        
+                        logger.info(f"[EpisodeProgressCallback] Estimated from state.epoch={state.epoch:.4f}: "
+                                   f"current_epoch={self.current_epoch}, "
+                                   f"total_episodes={self.total_episode_count}, "
+                                   f"epoch_episodes={self.epoch_episode_count} "
+                                   f"(pre-filled {len(self.seen_episodes)} seen_episodes)")
             
             # Initial progress within current epoch
             initial_progress = self.epoch_episode_count
             
             # Show epoch and episode progress (compact format)
-            desc = f"E{self.current_epoch + 1}/{self.num_epochs}"
+            desc = f"E{self.current_epoch + 2}/{self.num_epochs}" # Display next epoch since on_epoch_begin will increment
+            # Wait, pbar description is updated in on_epoch_begin anyway.
             # Use num_episodes as total (per epoch)
             self.pbar = tqdm(
                 total=self.num_episodes,
@@ -185,29 +206,50 @@ class EpisodeProgressCallback(TrainerCallback):
         Note: We track epochs ourselves instead of relying on state.epoch 
         because HuggingFace's state.epoch calculation can differ after resume.
         """
-        # Only increment epoch if we actually completed the previous one
-        # (detected by epoch_episode_count reaching num_episodes)
-        if self.epoch_episode_count >= self.num_episodes:
-            self.current_epoch += 1
-            self.seen_episodes.clear()
-            self.epoch_episode_count = 0
-            if self.pbar is not None and state.is_local_process_zero:
-                self.pbar.reset()
-                self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+        # Always reset at epoch boundary provided by Trainer
+        # This handles cases where epoch_episode_count didn't exactly match num_episodes
+        # (e.g., due to drop_last, resuming mid-epoch, etc.)
+        self.current_epoch += 1
+        
+        # If this is the FIRST epoch begin call after resume, AND we have populated episodes,
+        # we check if we need to skip the reset (mid-epoch resume) or enforce it (epoch boundary).
+        if self._is_first_epoch_step:
+            self._is_first_epoch_step = False
+            # Check if we are really mid-epoch
+            is_mid_epoch = self.epoch_episode_count > 0 and self.epoch_episode_count < self.num_episodes
             
-            # Clear memory bank at epoch boundary to prevent OOM
-            if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
-                model = self.policy.model
-                if hasattr(model, 'memory_bank'):
-                    old_size = len(model.memory_bank._memory_bank)
-                    model.memory_bank._memory_bank.clear()
-                    logger.info(f"Cleared {old_size} memory states at epoch {self.current_epoch}")
-            
-            # Force GPU memory cleanup
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                logger.info(f"Cleared CUDA cache at epoch {self.current_epoch}")
+            if is_mid_epoch:
+                logger.info(f"[EpisodeProgressCallback] Resuming mid-epoch {self.current_epoch}. Skipping reset. "
+                           f"Already seen {self.epoch_episode_count} episodes.")
+                if self.pbar is not None and state.is_local_process_zero:
+                    self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+                return
+            elif self.epoch_episode_count >= self.num_episodes:
+                 logger.info(f"[EpisodeProgressCallback] Resuming at end of epoch (count={self.epoch_episode_count}). Enforcing reset.")
+
+        # Log if we are correcting a count mismatch
+        if self.epoch_episode_count != self.num_episodes and self.epoch_episode_count > 0:
+            logger.warning(f"[EpisodeProgressCallback] Epoch {self.current_epoch} starting but previous epoch count was {self.epoch_episode_count}/{self.num_episodes}. Forcing reset.")
+
+        self.seen_episodes.clear()
+        self.epoch_episode_count = 0
+        if self.pbar is not None and state.is_local_process_zero:
+            self.pbar.reset()
+            self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+        
+        # Clear memory bank at epoch boundary to prevent OOM
+        if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
+            model = self.policy.model
+            if hasattr(model, 'memory_bank'):
+                old_size = len(model.memory_bank._memory_bank)
+                model.memory_bank._memory_bank.clear()
+                logger.info(f"[EpisodeProgressCallback] Cleared {old_size} memory states at epoch {self.current_epoch} start")
+        
+        # Force GPU memory cleanup
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(f"[EpisodeProgressCallback] Cleared CUDA cache at epoch {self.current_epoch} start")
     
     def on_step_end(self, args, state, control, **kwargs):
         """Update progress bar after each step."""
@@ -315,14 +357,28 @@ class PolicyTrainerCallback(TrainerCallback):
     def on_epoch_begin(self, args, state, control, **kwargs):
         """Called at Trainer epoch boundary.
         
-        Note: We do NOT clear memory bank here anymore because:
-        1. With max_steps training, Trainer's epoch boundary doesn't align with our SequentialBatchSampler
-        2. Memory bank should only be cleared when the sampler completes a full pass over all episodes
-        3. This avoids the expensive DDP sync and dataloader rebuild at artificial epoch boundaries
-        
-        Memory is now cleared by the SequentialBatchSampler when it starts a new epoch of episodes.
+        Note: We explicitly clear memory to prevent leaks across epochs.
         """
-        pass  # Don't clear memory at Trainer's epoch boundary
+        if hasattr(self.policy, 'model'):
+            # Clear memory bank
+            if hasattr(self.policy.model, 'memory_bank') and self.policy.model.memory_bank is not None:
+                if hasattr(self.policy.model.memory_bank, 'clear_memory_bank'):
+                    self.policy.model.memory_bank.clear_memory_bank()
+                elif hasattr(self.policy.model.memory_bank, '_memory_bank'):
+                    self.policy.model.memory_bank._memory_bank.clear()
+                logger.info(f"[PolicyTrainerCallback] Cleared memory bank at epoch {state.epoch} start")
+            
+            # Clear memory manager step counts (for BPTT)
+            if hasattr(self.policy.model, 'memory_manager') and self.policy.model.memory_manager is not None:
+                if hasattr(self.policy.model.memory_manager, '_step_counts'):
+                    self.policy.model.memory_manager._step_counts.clear()
+                logger.info(f"[PolicyTrainerCallback] Cleared memory manager step counts at epoch {state.epoch} start")
+
+        # Force GC and CUDA cache clear
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class PolicyTrainer(Trainer):
@@ -368,6 +424,7 @@ class PolicyTrainer(Trainer):
         batch_size = training_args.per_device_train_batch_size if training_args else 4
         num_epochs = int(training_args.num_train_epochs) if training_args else 1
         self.episode_progress_callback = EpisodeProgressCallback(
+            policy=policy,
             num_episodes=num_episodes,
             total_steps=total_steps,
             batch_size=batch_size,
@@ -397,6 +454,97 @@ class PolicyTrainer(Trainer):
         if getattr(self.args, "max_grad_norm", None) in (None, 0):
             self.args.max_grad_norm = 1.0
             logger.info("[PolicyTrainer] max_grad_norm not set; defaulting to 1.0 for gradient clipping")
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        super().save_model(output_dir, _internal_call)
+        
+        # Save callback state explicitly
+        if self.episode_progress_callback and self.is_world_process_zero():
+             try:
+                 state = self.episode_progress_callback.state()
+                 state_path = os.path.join(output_dir, "episode_progress.json")
+                 with open(state_path, "w") as f:
+                     json.dump(state, f)
+                 logger.info(f"Saved episode progress to {state_path}")
+             except Exception as e:
+                 logger.warning(f"Failed to save episode progress: {e}")
+
+    def _save_full_checkpoint(self, output_dir: str):
+        """Save complete checkpoint including optimizer, scheduler, and RNG state."""
+        # 1. Save model, args, trainer_state (via standard _save)
+        self._save(output_dir)
+        
+        # 2. Save optimizer and scheduler (only on main process)
+        if self.is_world_process_zero() and not self.args.save_only_model:
+            if self.optimizer is not None:
+                torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+            if self.lr_scheduler is not None:
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+        
+        # 3. Save RNG state (only on main process for now, mirroring HF behavior)
+        if self.is_world_process_zero() and not self.args.save_only_model:
+            rng_states = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+            }
+            if torch.cuda.is_available():
+                if self.args.local_rank != -1:  # Distributed
+                    rng_states["cuda"] = torch.cuda.get_rng_state()
+                else:
+                    rng_states["cuda"] = torch.cuda.get_rng_state_all()
+            
+            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        
+        # Try to load callback state
+        if self.episode_progress_callback:
+            state_path = os.path.join(resume_from_checkpoint, "episode_progress.json")
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, "r") as f:
+                        state = json.load(f)
+                    self.episode_progress_callback.load_state(state)
+                    logger.info(f"Loaded episode progress from {state_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load episode progress from {state_path}: {e}")
+            else:
+                logger.info(f"No episode progress file found at {state_path}, will estimate from global_step")
+                
+                # Check if we can infer from checkpoint directory name
+                try:
+                    dir_name = os.path.basename(resume_from_checkpoint.rstrip('/'))
+                    if dir_name.startswith("checkpoint-episode-"):
+                        ep_count = int(dir_name.split("-")[-1])
+                        self.episode_progress_callback.total_episode_count = ep_count
+                        # Also update last markers to prevent immediate re-save/re-eval
+                        self.episode_progress_callback.last_save_episode = ep_count
+                        self.episode_progress_callback.last_log_episode = ep_count
+                        self.episode_progress_callback.last_eval_episode = ep_count
+                        
+                        # Mark as restored so on_train_begin doesn't overwrite with estimation
+                        self.episode_progress_callback._restored_from_checkpoint = True
+                        
+                        # Populate seen_episodes with dummies to match the count within current epoch
+                        # We guess epoch_episode_count based on ep_count and num_episodes
+                        # This avoids double-counting the current episode immediately after resume
+                        if self.episode_progress_callback.num_episodes > 0:
+                             epoch_ep_count = ep_count % self.episode_progress_callback.num_episodes
+                             if epoch_ep_count == 0 and ep_count > 0:
+                                 # Edge case: we are exactly at end of epoch multple
+                                 epoch_ep_count = self.episode_progress_callback.num_episodes
+                             
+                             self.episode_progress_callback.epoch_episode_count = epoch_ep_count
+                             for i in range(epoch_ep_count):
+                                 self.episode_progress_callback.seen_episodes.add(-(i + 1))
+                                 
+                        logger.info(f"Inferred episode count {ep_count} from checkpoint name '{dir_name}'")
+                except Exception as e:
+                    logger.warning(f"Failed to infer episode count from checkpoint name: {e}")
     
     
     def get_train_dataloader(self):
@@ -506,7 +654,7 @@ class PolicyTrainer(Trainer):
             if self.state.is_world_process_zero:
                 episode_count = self.episode_progress_callback.total_episode_count
                 save_dir = os.path.join(self.args.output_dir, f"checkpoint-episode-{episode_count}")
-                self._save(save_dir)
+                self._save_full_checkpoint(save_dir)  # Use full save including optimizer/RNG
                 logger.info(f"Saved checkpoint at episode {episode_count}")
             self.episode_progress_callback.mark_saved()
         

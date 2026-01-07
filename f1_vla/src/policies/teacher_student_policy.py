@@ -680,12 +680,12 @@ class TeacherStudentSplitGPU(nn.Module):
     
     def _clean_memory_nan(self, policy: "F1_VLA", name: str):
         """Clean NaN/Inf from memory module parameters after checkpoint loading."""
-        # Memory is in policy.model.memory_bank (not policy.model.memory!)
+        # Memory is in policy.model.memory
         memory = None
-        if hasattr(policy, 'model') and hasattr(policy.model, 'memory_bank') and policy.model.memory_bank is not None:
-            memory = policy.model.memory_bank
-        elif hasattr(policy, 'memory_bank') and policy.memory_bank is not None:
-            memory = policy.memory_bank
+        if hasattr(policy, 'model') and hasattr(policy.model, 'memory') and policy.model.memory is not None:
+            memory = policy.model.memory
+        elif hasattr(policy, 'memory') and policy.memory is not None:
+            memory = policy.memory
         
         if memory is not None:
             
@@ -842,17 +842,12 @@ class TeacherStudentSplitGPU(nn.Module):
     ) -> Dict[str, Tensor]:
         """
         Forward with teacher and student on separate GPUs.
-        
-        IMPORTANT: Teacher memory is maintained across frames within an episode (same as training).
-        - frame_idx=0: Uses init_memory (learnable parameter)
-        - frame_idx>0: Uses memory from previous frame (stored in memory_bank)
-        - After forward: Memory is updated via GRU and stored for next frame
-        
-        Do NOT clear memory_bank before each forward - that would break temporal consistency!
         """
         # ==================== Teacher Forward (on teacher_device) ====================
-        # NOTE: Do NOT clear teacher memory bank! Teacher needs memory state from previous frames.
-        # Memory is updated inside forward_with_world_model and stored for next frame.
+        # CRITICAL: Clear teacher memory bank to prevent NaN accumulation
+        # Teacher is frozen and used for inference only, memory should not persist across batches
+        if hasattr(self.teacher, 'model') and hasattr(self.teacher.model, 'memory'):
+            self.teacher.model.memory.clear_memory_bank()
         
         teacher_batch = self._move_batch_to_device(batch, self.teacher_device)
         teacher_noise = noise.to(self.teacher_device) if noise is not None else None
@@ -860,6 +855,8 @@ class TeacherStudentSplitGPU(nn.Module):
         
         with torch.no_grad():
             self.teacher.eval()
+            # Temporarily disable memory update for teacher
+            original_use_memory = self.teacher.config.use_memory if hasattr(self.teacher.config, 'use_memory') else False
             
             teacher_outputs = self.teacher.forward_with_world_model(
                 batch=teacher_batch,

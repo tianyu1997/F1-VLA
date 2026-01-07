@@ -58,13 +58,29 @@ def apply_rope(x, positions, max_wavelength=10_000):
 class PaliGemmaWithExpertModel(PreTrainedModel):
     config_class = PretrainedConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
     _supports_cache_class = True
     _supports_quantized_cache = True
     _supports_static_cache = True
     _supports_flash_attn_2 = False
     _supports_sdpa = True
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        # Allow sub-models to handle it themselves via their own enable methods
+        pass
+        
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Activates gradient checkpointing for the current model.
+        """
+        self.paligemma.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        
+        for expert_name, expert in self.gemma_experts.items():
+            expert.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+            
+        if hasattr(self, "gemma_wm_expert"):
+            self.gemma_wm_expert.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config=config)
@@ -108,6 +124,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.freeze_gen_expert = False
 
         self.to_bfloat16_like_physical_intelligence()
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, (PaliGemmaForConditionalGeneration, GemmaForCausalLM)):
+            module.gradient_checkpointing = value
     
     @property
     def gemma_expert(self):
@@ -254,6 +274,128 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.model.embed_tokens(tokens)
 
+    def _fused_layer_forward(
+        self,
+        layer_idx,
+        attention_mask,
+        position_ids,
+        experts_only_memory,
+        models,
+        memory_kv_layer,
+        *inputs_embeds_tuple,
+    ):
+        inputs_embeds = list(inputs_embeds_tuple)
+        
+        # Determine batch_size from first non-None input
+        batch_size = next(hs.shape[0] for hs in inputs_embeds if hs is not None)
+        head_dim = self.paligemma.config.text_config.head_dim # Assuming consistent head_dim
+
+        query_states = []
+        key_states = []
+        value_states = []
+        
+        for i, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                continue
+            layer = models[i].layers[layer_idx]
+            hidden_states = layer.input_layernorm(hidden_states)
+
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+
+            hidden_states = hidden_states.to(dtype=torch.bfloat16)
+            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
+            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+
+            query_states.append(query_state)
+            key_states.append(key_state)
+            value_states.append(value_state)
+
+        # B,L,H,D with L sequence length, H number of heads, D head dim
+        # concatenate on the number of embeddings/tokens
+        query_states = torch.cat(query_states, dim=1)
+        key_states = torch.cat(key_states, dim=1)
+        value_states = torch.cat(value_states, dim=1)
+
+        query_states = apply_rope(query_states, position_ids)
+        key_states = apply_rope(key_states, position_ids)
+
+        # Prepend memory KV if provided (memory doesn't use RoPE)
+        if memory_kv_layer is not None:
+            mem_k, mem_v = memory_kv_layer
+            # mem_k, mem_v: (batch, mem_len, num_kv_heads, head_dim)
+            mem_k = mem_k.to(dtype=key_states.dtype, device=key_states.device)
+            mem_v = mem_v.to(dtype=value_states.dtype, device=value_states.device)
+            key_states = torch.cat([mem_k, key_states], dim=1)
+            value_states = torch.cat([mem_v, value_states], dim=1)
+            
+            # If experts_only_memory, mask out memory attention for paligemma queries
+            if experts_only_memory and attention_mask is not None:
+                # Get paligemma's sequence length (first in inputs_embeds)
+                pali_seq_len = inputs_embeds[0].shape[1] if inputs_embeds[0] is not None else 0
+                if pali_seq_len > 0:
+                    mem_len = mem_k.shape[1]
+                    # Mask out memory positions for paligemma queries
+                    # We need to clone to avoid modifying the original mask which might be used in other layers
+                    # However, inside checkpoint, inputs are immutable?
+                    # attention_mask here is passed from forward, shared across layers.
+                    # We should clone if we modify.
+                    attention_mask = attention_mask.clone()
+                    attention_mask[:, :pali_seq_len, :mem_len] = False
+
+        if self.config.attention_implementation == "eager":
+            att_output = self.eager_attention_forward(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+        elif self.config.attention_implementation == "sdpa":
+            att_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query_states.permute(0, 2, 1, 3),
+                key=key_states.permute(0, 2, 1, 3),
+                value=value_states.permute(0, 2, 1, 3),
+                attn_mask=attention_mask[:, None, :, :],
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=False,
+            )
+            att_output = att_output.permute(0, 2, 1, 3)
+            att_output = att_output.reshape(batch_size, -1, self.num_key_value_heads * self.num_key_value_groups * head_dim)
+        elif self.config.attention_implementation == "flex":
+            raise NotImplementedError("Flex attention is not implemented (yet)")
+        else:
+            raise ValueError(f"Unsupported attention implementation: {self.config.attention_implementation}")
+
+        # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
+        outputs_embeds = []
+        start = 0
+        for i, hidden_states in enumerate(inputs_embeds):
+            layer = models[i].layers[layer_idx]
+
+            if hidden_states is not None:
+                end = start + hidden_states.shape[1]
+
+                if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                    att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                out_emb = layer.self_attn.o_proj(att_output[:, start:end])
+
+                # first residual
+                out_emb += hidden_states
+                after_first_residual = out_emb.clone()
+
+                out_emb = layer.post_attention_layernorm(out_emb)
+                out_emb = layer.mlp(out_emb)
+
+                # second residual
+                out_emb += after_first_residual
+
+                outputs_embeds.append(out_emb)
+
+                start = end
+            else:
+                outputs_embeds.append(None)
+        
+        return tuple(outputs_embeds)
+
     # TODO: break down this huge forward into modules or functions
     def forward(
         self,
@@ -268,6 +410,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         actor_name: Optional[str] = None,  # Which actor to use (None = active actor)
         experts_only_memory: bool = True,  # If True, memory_kv only affects experts, not frozen paligemma
     ):
+        # Force use_cache=False if gradient_checkpointing is enabled
+        if self.is_gradient_checkpointing and self.training:
+            use_cache = False
+        
         # Select which actor expert to use
         if actor_name is not None:
             action_expert = self.get_actor(actor_name)
@@ -282,13 +428,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             models = [self.paligemma.language_model.model, action_expert.model]
             expert_model_indices = {1}  # only action_expert
 
-        for hidden_states in inputs_embeds:
-            # TODO this is very inefficient
-            # dtype is always the same, batch size too (if > 1 len)
-            # device could be trickier in multi gpu edge cases but that's it
-            if hidden_states is None:
-                continue
-            batch_size = hidden_states.shape[0]
+        # Get batch_size from first non-None input
+        batch_size = next(hs.shape[0] for hs in inputs_embeds if hs is not None)
 
         # Pre-process attention mask for memory prefix
         # Memory KV will be prepended to expert layers, so we extend mask once
@@ -300,11 +441,46 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             mem_mask = torch.ones(batch_size, seq_q, mem_len,
                                  dtype=attention_mask.dtype, device=attention_mask.device)
             attention_mask = torch.cat([mem_mask, attention_mask], dim=2)
+            
+        # Ensure attention_mask requires_grad is False (usually it is, but for checkpointing we want to be sure it's passed efficiently)
+        # Checkpointing will treat tensors with requires_grad=False as constants? No, as inputs.
+        
+        if self.is_gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning("Gradient checkpointing is enabled, use_cache will be forced to False.")
+                use_cache = False
 
         # RMSNorm
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         head_dim = self.paligemma.config.text_config.head_dim
+        
         for layer_idx in range(num_layers):
+            if use_cache:
+                # If use_cache is True, we CANNOT use gradient checkpointing effectively within this architecture
+                # so we fallback to manual inline implementation to support cache.
+                # (OR we could adapt _fused_layer_forward to return KV, but simplicity first)
+                pass # Use OLD logic below for use_cache path
+            
+            if self.is_gradient_checkpointing and self.training and not use_cache:
+                 memory_kv_layer = memory_kv[layer_idx] if (memory_kv is not None and layer_idx < len(memory_kv)) else None
+                 
+                 # Prepare args for checkpoint
+                 # Note: position_ids might be None? Check signature.
+                 outputs = torch.utils.checkpoint.checkpoint(
+                     self._fused_layer_forward,
+                     layer_idx,
+                     attention_mask,
+                     position_ids,
+                     experts_only_memory,
+                     models,
+                     memory_kv_layer,
+                     *inputs_embeds,
+                     use_reentrant=False 
+                 )
+                 inputs_embeds = list(outputs)
+                 continue
+
+            # --- ORIGINAL LOGIC (Fallback for inference / no-GC) ---
             query_states = []
             key_states = []
             value_states = []
@@ -435,7 +611,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     start = end
                 else:
                     outputs_embeds.append(None)
-
+            
             inputs_embeds = outputs_embeds
 
         # final norm

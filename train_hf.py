@@ -3,6 +3,7 @@ import logging
 import argparse
 from pathlib import Path
 from omegaconf import OmegaConf
+import torch
 
 import transformers
 from transformers import set_seed, HfArgumentParser
@@ -24,14 +25,34 @@ from f1_vla.src.processors.train_processors.optimizer_scheduler import create_op
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-logger = logging.getLogger()
+# Configure basic logging immediately
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
-def main(args, overrides):
+def main(args: argparse.Namespace, overrides: list):
     #########################################################
     # Set the policy config and training config
     #########################################################
+    logger.info(f"Using transformers version: {transformers.__version__}")
+    logger.info(f"Using torch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logger.info(f"CUDA Device Count: {torch.cuda.device_count()}")
+        
     config = OmegaConf.load(Path(args.config_file))
+
+    # Load separate dataset stats config if it exists
+    # This allows keeping large normalization vectors out of main config
+    stats_path = Path("f1_vla/config/dataset_stats.yaml")
+    if stats_path.exists():
+        logger.info(f"Loading dataset stats from {stats_path}")
+        stats_cfg = OmegaConf.load(stats_path)
+        config = OmegaConf.merge(config, stats_cfg)
+
     override_cfg = OmegaConf.from_dotlist(clean_overrides(overrides))
     config = OmegaConf.merge(config, override_cfg)
  
@@ -91,8 +112,9 @@ def main(args, overrides):
     logger.addHandler(handler)
 
     transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
+    # Disable default handler to prevent duplicate logs (since we configured root logger)
+    transformers.utils.logging.disable_default_handler()
+    # transformers.utils.logging.enable_explicit_format()
 
     set_seed(training_args.seed)
     logger.info(f"Training config: {args}")
@@ -186,22 +208,6 @@ def main(args, overrides):
     logger.info(f"len(training_dataset): {len(training_dataset)}")
 
     #########################################################
-    # Create model
-    #########################################################
-    logger.info("Creating model")
-    kwargs = {"config": policy_config}
-
-    kwargs["pretrained_name_or_path"] = policy_config.pretrained_path
-    kwargs["training_args"] = training_args
-    if policy_config.pretrained_path and not args.debug:
-        policy = F1_VLA.from_pretrained(**kwargs)
-        policy = load_ckpt(policy, config)
-    else:
-        policy = F1_VLA(**kwargs)
-
-    optimizer = create_optimizer(policy, training_args)
-
-    #########################################################
     # Resume from checkpoint
     #########################################################   
     last_checkpoint = None
@@ -217,6 +223,35 @@ def main(args, overrides):
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
+
+    #########################################################
+    # Create model
+    #########################################################
+    logger.info("Creating model")
+    logger.info(f"Policy config Pretrained path: {policy_config.pretrained_path}")
+    kwargs = {"config": policy_config}
+
+    kwargs["pretrained_name_or_path"] = policy_config.pretrained_path
+    kwargs["training_args"] = training_args
+
+    # Verify if we are resuming from a checkpoint
+    is_resuming = training_args.resume_from_checkpoint is not None or last_checkpoint is not None
+
+    if policy_config.pretrained_path and not args.debug:
+        if is_resuming:
+            logger.info("Resuming training detected. Initializing model directly (skipping pi0 load).")
+            policy = F1_VLA(**kwargs)
+            logger.info(f"Skipping base pretrained weights load: {config.exp.load_ckpt if hasattr(config.exp, 'load_ckpt') else 'N/A'}")
+        else:
+            logger.info("Calling F1_VLA.from_pretrained...")
+            policy = F1_VLA.from_pretrained(**kwargs)
+            logger.info("F1_VLA.from_pretrained returned.")
+            
+            policy = load_ckpt(policy, config)
+    else:
+        policy = F1_VLA(**kwargs)
+
+    optimizer = create_optimizer(policy, training_args)
 
     #########################################################
     # Create trainer
@@ -263,6 +298,10 @@ def main(args, overrides):
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         logger.info(f"Training from checkpoint: {checkpoint}")
+        
+        # NOTE: Removed forced ignore_data_skip=True for SequentialBatchSampler
+        # We rely on correct state restoration and HF's skipping mechanism.
+        # If sequential sampler is deterministic per epoch, skipping is safe.
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()

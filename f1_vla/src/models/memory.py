@@ -99,6 +99,13 @@ class KVMemoryBank(nn.Module):
             f"heads={num_kv_heads}, head_dim={head_dim}, "
             f"hidden_size={hidden_size}, memory_len={memory_len}"
         )
+
+    def _check_nan_inf(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        """Check for NaN/Inf values and replace them with zeros if found."""
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.error(f"[KVMemoryBank] {name} contains NaN/Inf! replacing with zeros.")
+            return torch.where(torch.isnan(tensor) | torch.isinf(tensor), torch.zeros_like(tensor), tensor)
+        return tensor
     
     def get_memory_token(
         self, 
@@ -256,9 +263,7 @@ class KVMemoryBank(nn.Module):
         dtype = memory_info.dtype
         
         # Check input for NaN/Inf
-        if torch.isnan(memory_info).any() or torch.isinf(memory_info).any():
-            logger.error(f"[KVMemoryBank] memory_info has NaN/Inf! Using zeros.")
-            memory_info = torch.zeros_like(memory_info)
+        memory_info = self._check_nan_inf(memory_info, "memory_info")
         
         # Move modules to device and convert input to float32 for computation
         memory_info_f32 = memory_info.float()
@@ -271,9 +276,7 @@ class KVMemoryBank(nn.Module):
         memory_info_proj = proj(memory_info_f32)  # (batch, head_dim * num_total_slots)
         
         # Check projection for NaN/Inf
-        if torch.isnan(memory_info_proj).any() or torch.isinf(memory_info_proj).any():
-            logger.error(f"[KVMemoryBank] memory_info_proj has NaN/Inf after projection! Using zeros.")
-            memory_info_proj = torch.zeros_like(memory_info_proj)
+        memory_info_proj = self._check_nan_inf(memory_info_proj, "memory_info_proj")
         
         # Clip projected values
         memory_info_proj.clamp_(-10.0, 10.0)
@@ -286,13 +289,8 @@ class KVMemoryBank(nn.Module):
         flat_slots = []
         for layer_idx, (k, v) in enumerate(previous_memory):
             # k, v: (batch, memory_len, heads, dim)
-            # Check for NaN/Inf and replace with zeros if found
-            if torch.isnan(k).any() or torch.isinf(k).any():
-                logger.error(f"[KVMemoryBank] previous_memory layer {layer_idx} key has NaN/Inf! Replacing with zeros.")
-                k = torch.zeros_like(k)
-            if torch.isnan(v).any() or torch.isinf(v).any():
-                logger.error(f"[KVMemoryBank] previous_memory layer {layer_idx} value has NaN/Inf! Replacing with zeros.")
-                v = torch.zeros_like(v)
+            k = self._check_nan_inf(k, f"previous_memory layer {layer_idx} key")
+            v = self._check_nan_inf(v, f"previous_memory layer {layer_idx} value")
             
             flat_slots.append(k.reshape(batch_size, -1, self.head_dim))
             flat_slots.append(v.reshape(batch_size, -1, self.head_dim))
@@ -342,7 +340,7 @@ class KVMemoryBank(nn.Module):
         slots_per_kv = self.num_kv_heads * self.memory_len
         
         idx = 0
-        for _ in range(self.num_layers):
+        for i in range(self.num_layers):
             # Extract K
             k_flat = updated_slots[:, idx:idx + slots_per_kv, :]
             idx += slots_per_kv
@@ -359,13 +357,9 @@ class KVMemoryBank(nn.Module):
                 self.num_kv_heads, self.head_dim
             ).contiguous()
             
-            # Final check: if NaN/Inf detected, use zeros
-            if torch.isnan(new_k).any() or torch.isinf(new_k).any():
-                logger.error(f"[KVMemoryBank] new_k has NaN/Inf in final reshape! Using zeros.")
-                new_k = torch.zeros_like(new_k)
-            if torch.isnan(new_v).any() or torch.isinf(new_v).any():
-                logger.error(f"[KVMemoryBank] new_v has NaN/Inf in final reshape! Using zeros.")
-                new_v = torch.zeros_like(new_v)
+            # Final check using helper
+            new_k = self._check_nan_inf(new_k, f"new_k layer {i}")
+            new_v = self._check_nan_inf(new_v, f"new_v layer {i}")
             
             new_memory.append((new_k, new_v))
         

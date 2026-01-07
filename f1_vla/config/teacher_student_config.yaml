@@ -22,6 +22,9 @@ dataset:
     height: 224
     width: 224
   world_model_suffix: history
+  
+  # Normalization stats loaded from f1_vla/config/dataset_stats.yaml
+  
   transforms:
     consistent_random_crop_stages:
       - stage1_pretrain_wm

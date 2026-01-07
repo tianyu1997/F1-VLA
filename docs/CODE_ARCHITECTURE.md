@@ -560,6 +560,28 @@ def __call__(self, samples):
 - [ ] Reward归一化/裁剪
 - [ ] Mode collapse检测
 
+### Bug 6: Explorer/VAE Image Normalization Mismatch
+
+```
+症状: Explorer Reward 计算极低或不收敛, VAE 重建质量差
+原因: 
+1. VAE (VQGAN) 期望输入范围为 [-1, 1]
+2. DataSet 输出范围为 [0, 1]
+3. Explorer 代码 (rollout buffer) 直接将 [0, 1] 图像传给 VAE
+
+解决:
+在传入 VAE 之前手动归一化:
+img_tensor = img_tensor * 2.0 - 1.0
+(已在 sequential_rollout_buffer.py 和 explorer_rollout.py 中修复)
+```
+
+### 6.6 State/Action 归一化检查 (Update 2026-01-06)
+
+**现状确认:**
+- `SequentialMEKVMDataset`: 加载的 State 和 Action 为 `.pt` 文件中的原始值 (Raw Values)。
+- `F1_VLA` Policy: `prepare_state` 和 `prepare_action` 仅做 `pad_vector`，未执行 `(x - mean) / std` 归一化。
+- **结论**: 当前训练依赖于 `.pt` 数据本身是否已归一化。若数据为原始物理量且范围较大，建议在 Dataset 中集成 `BaseTransform` 的 `normalize_state/action` 逻辑，或确认 Data Generation 阶段已做处理。
+
 ---
 
 *更新日期: 2026年1月6日 (Validated against codebase)*

@@ -45,6 +45,8 @@ class SequentialMEKVMDataset(Dataset):
         rank: int = 0,
         world_size: int = 1,
         camera_config: Optional[Dict[str, Any]] = None,
+        cache_max_size: int = 64,
+        norm_stats: Optional[Dict[str, List[float]]] = None,
     ):
         """
         Args:
@@ -56,9 +58,9 @@ class SequentialMEKVMDataset(Dataset):
             task_descriptions: Task descriptions for each data directory
             rank: Current process rank for distributed training
             world_size: Total number of processes
-            camera_config: Camera configuration dict with keys:
-                - mekvm_camera_keys: list of camera keys in ME_KVM format (e.g., ["head_rgb", "wrist_rgb"])
-                - world_model_camera: camera key for world model (e.g., "head_rgb")
+            camera_config: Camera configuration dict
+            cache_max_size: Maximum number of episodes to cache in memory
+            norm_stats: Dictionary containing 'state_mean', 'state_std', 'action_mean', 'action_std'
         """
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
@@ -70,6 +72,56 @@ class SequentialMEKVMDataset(Dataset):
         self.chunk_size = chunk_size
         self.rank = rank
         self.world_size = world_size
+        
+        # Normalization statistics
+        self.norm_stats = norm_stats
+        self.do_normalize = False
+        if norm_stats is not None:
+            logger.info(f"[Rank {rank}] Normalization stats provided. Checking keys...")
+            
+            # Helper to safely load tensor
+            def load_tensor(data, key_path, default=None):
+                val = data
+                for k in key_path:
+                    if isinstance(val, dict) and k in val:
+                        val = val[k]
+                    elif hasattr(val, k): # OmegaConf
+                        val = getattr(val, k)
+                    else:
+                        return default
+                return torch.tensor(val, dtype=torch.float32)
+
+            # Support both flat and nested structure
+            if 'state_mean' in norm_stats:
+                # Flat structure
+                required_keys = ['state_mean', 'state_std', 'action_mean', 'action_std']
+                if all(k in norm_stats for k in required_keys):
+                    self.state_mean = torch.tensor(norm_stats['state_mean'], dtype=torch.float32)
+                    self.state_std = torch.tensor(norm_stats['state_std'], dtype=torch.float32)
+                    self.action_mean = torch.tensor(norm_stats['action_mean'], dtype=torch.float32)
+                    self.action_std = torch.tensor(norm_stats['action_std'], dtype=torch.float32)
+                    self.do_normalize = True
+            elif 'state' in norm_stats and 'action' in norm_stats:
+                # Nested structure (from yaml)
+                try:
+                    self.state_mean = load_tensor(norm_stats, ['state', 'mean'])
+                    self.state_std = load_tensor(norm_stats, ['state', 'std'])
+                    self.action_mean = load_tensor(norm_stats, ['action', 'mean'])
+                    self.action_std = load_tensor(norm_stats, ['action', 'std'])
+                    self.do_normalize = True
+                except Exception as e:
+                    logger.warning(f"[Rank {rank}] Error parsing nested normalization stats: {e}")
+
+            if self.do_normalize:
+                # Check for zero std and replace with 1.0 to avoid division by zero
+                # Replace very small values with 1.0 (assuming they are constant features 0.0 with std 0.0, or 1.0 with std 0.0)
+                # Actually if std is 0, normalization (x-mean)/std implies x must be mean, so result 0/0.
+                # If we set std=1.0, result is (x-mean), which is 0. This is correct for constant features.
+                self.state_std[self.state_std < 1e-8] = 1.0
+                self.action_std[self.action_std < 1e-8] = 1.0
+                logger.info(f"[Rank {rank}] Normalization ENABLED.")
+            else:
+                logger.warning(f"[Rank {rank}] Missing normalization keys. Normalization DISABLED.")
         
         # Camera configuration
         if camera_config is None:
@@ -126,9 +178,13 @@ class SequentialMEKVMDataset(Dataset):
         self._cache = {}
         # Increase cache size to improve performance on servers with sufficient RAM
         # Assuming average episode size ~50MB, 64 episodes ~= 3.2GB RAM
-        self._cache_max_size = 64
+        self._cache_max_size = cache_max_size
         
-        logger.info(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples from {len(self.episode_files)} episodes")
+        # Calculate total frames for this rank (for debugging distributed balance)
+        total_frames = len(self.sample_index)
+        
+        logger.info(f"[Rank {rank}] SequentialMEKVMDataset: {len(self.sample_index)} samples (frames) from {len(self.episode_files)} episodes. Cache size={self._cache_max_size}")
+        logger.info(f"[Rank {rank}] Total frames: {total_frames}")
     
     def _load_episode_lengths(self) -> List[int]:
         """Load episode lengths for this rank's episodes, using cache when possible"""
@@ -178,6 +234,7 @@ class SequentialMEKVMDataset(Dataset):
             
             self._cache[ep_idx] = torch.load(
                 self.episode_files[ep_idx],
+                map_location='cpu',
                 weights_only=False
             )
         return self._cache[ep_idx]
@@ -228,6 +285,8 @@ class SequentialMEKVMDataset(Dataset):
         camera_images = {}  # camera_key -> (history_tensor, current_frame)
         for cam_key in self.camera_keys:
             if cam_key in obs:
+                # Normalize to [0, 1] for compatibility with ImageTransforms and Policy
+                # Policy will convert to [-1, 1] internally for Vision Encoder
                 cam_data = torch.from_numpy(obs[cam_key]).float() / 255.0
                 cam_data = self._resize_to_256(cam_data)
                 camera_images[cam_key] = cam_data
@@ -241,6 +300,8 @@ class SequentialMEKVMDataset(Dataset):
         
         # Current state
         state = torch.from_numpy(obs['state']).float()
+        if self.do_normalize:
+            state = (state - self.state_mean) / self.state_std
         
         # State history - aligned with image history (n_obs_img_steps frames)
         state_history = []
@@ -250,6 +311,9 @@ class SequentialMEKVMDataset(Dataset):
                 hist_state = torch.from_numpy(episode[0]['obs']['state']).float()
             else:
                 hist_state = torch.from_numpy(episode[hist_frame_idx]['obs']['state']).float()
+            
+            if self.do_normalize:
+                hist_state = (hist_state - self.state_mean) / self.state_std
             state_history.append(hist_state)
         state_history = torch.stack(state_history)  # (n_obs_img_steps, state_dim)
         
@@ -264,6 +328,19 @@ class SequentialMEKVMDataset(Dataset):
                 hist_action = torch.zeros(action_dim, dtype=torch.float32)
             else:
                 hist_action = torch.tensor(episode[hist_frame_idx]['action'], dtype=torch.float32)
+            
+            if self.do_normalize:
+                # For zero padding actions, we technically shouldn't normalize zeros, but 0 is usually close to mean if centered.
+                # However, normalized values might not be 0.
+                if hist_frame_idx >= 0:
+                    hist_action = (hist_action - self.action_mean) / self.action_std
+                else:
+                    # For padding frames, keep as 0 or normalize 0?
+                    # Usually better to keep as 0 if 0 represents "neutral" or "no action", 
+                    # but network expects normalized distribution.
+                    # Given Pad is 0, let's normalize it to consistency.
+                    hist_action = (hist_action - self.action_mean) / self.action_std
+            
             action_history.append(hist_action)
         action_history = torch.stack(action_history)  # (n_obs_img_steps, action_dim)
         
@@ -272,11 +349,17 @@ class SequentialMEKVMDataset(Dataset):
         for i in range(self.chunk_size):
             if frame_idx + i < len(episode):
                 action = episode[frame_idx + i]['action']
-                actions.append(action)
+                action_t = torch.tensor(action, dtype=torch.float32)
+                if self.do_normalize:
+                     action_t = (action_t - self.action_mean) / self.action_std
+                actions.append(action_t)
             else:
-                actions.append(actions[-1] if actions else episode[frame_idx]['action'])
+                last_action = actions[-1] if actions else torch.tensor(episode[frame_idx]['action'], dtype=torch.float32)
+                if not actions and self.do_normalize: # if actions was empty, last_action is raw
+                     last_action = (last_action - self.action_mean) / self.action_std
+                actions.append(last_action)
         
-        actions = torch.tensor(actions, dtype=torch.float32)
+        actions = torch.stack(actions)  # (chunk_size, action_dim)
         action_is_pad = torch.zeros(self.chunk_size, dtype=torch.bool)
         
         # Prediction images for world model (from world_model_camera)
@@ -285,6 +368,7 @@ class SequentialMEKVMDataset(Dataset):
             next_step = min(frame_idx + 1 + i, len(episode) - 1)
             next_obs = episode[next_step]['obs']
             if wm_cam_key in next_obs:
+                # Normalize to [0, 1]
                 next_img = torch.from_numpy(next_obs[wm_cam_key][-1]).float() / 255.0
             else:
                 next_img = torch.from_numpy(next_obs['head_rgb'][-1]).float() / 255.0
@@ -292,8 +376,8 @@ class SequentialMEKVMDataset(Dataset):
             pred_images.append(next_img)
         pred_images = torch.stack(pred_images)
         
-        # Combine history and prediction for world model
-        history_and_pred = torch.cat([wm_history, pred_images], dim=0)
+        # History for world model (only history, policy will append target)
+        history_only = wm_history
         
         # Build sample dict with all cameras
         sample = {
@@ -307,7 +391,7 @@ class SequentialMEKVMDataset(Dataset):
             # Task
             "task": self._get_task_description(ep_idx),
             # World model specific (always use image0 naming for WM)
-            "observation.images.image0_history": history_and_pred,
+            "observation.images.image0_history": history_only,
             "observation.images.image0_target": pred_images,
             # Memory indices
             "dataset_idx": torch.tensor(self.dataset_idx, dtype=torch.int64),
@@ -364,6 +448,7 @@ class SequentialBatchSampler(Sampler):
         drop_last: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        seed: int = 42,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -371,6 +456,8 @@ class SequentialBatchSampler(Sampler):
         self.drop_last = drop_last
         self.rank = rank
         self.world_size = world_size
+        self.seed = seed
+        self._epoch = 0  # Track epoch for deterministic shuffling
         
         # Build episode to sample mapping
         # episode_samples[ep_idx] = list of global sample indices for that episode
@@ -402,10 +489,16 @@ class SequentialBatchSampler(Sampler):
         - Episodes are processed in parallel
         - Frames within episodes are sequential
         """
-        # Optionally shuffle episode order (use same seed across ranks for consistency)
+        logger.info(f"[SequentialBatchSampler] Starting __iter__. num_episodes={self.local_num_episodes}, batch_size={self.batch_size}, epoch={self._epoch}")
+        
+        # Deterministic shuffling: use seed + epoch so all ranks produce consistent order
         episode_order = self.local_episode_ids.copy()
         if self.shuffle_episodes:
-            random.shuffle(episode_order)
+            rng = random.Random(self.seed + self._epoch)
+            rng.shuffle(episode_order)
+            logger.debug(f"[SequentialBatchSampler] Shuffled episodes with seed {self.seed + self._epoch}. First 5: {episode_order[:5]}")
+        
+        count_batches = 0
         
         # Process episodes in batches
         for batch_start in range(0, self.local_num_episodes, self.batch_size):
@@ -413,10 +506,15 @@ class SequentialBatchSampler(Sampler):
             batch_episodes = episode_order[batch_start:batch_end]
             
             if self.drop_last and len(batch_episodes) < self.batch_size:
+                logger.debug(f"[SequentialBatchSampler] Dropping last batch of size {len(batch_episodes)}")
                 continue
             
             # Get sample lists for each episode in batch
             batch_sample_lists = [self.episode_samples[ep_id] for ep_id in batch_episodes]
+            if not batch_sample_lists:
+                 logger.error(f"[SequentialBatchSampler] Found empty batch sample list! batch_episodes={batch_episodes}")
+                 continue
+                 
             max_len = max(len(samples) for samples in batch_sample_lists)
             
             # Yield frame by frame across episodes
@@ -428,6 +526,9 @@ class SequentialBatchSampler(Sampler):
                 
                 if batch_indices:
                     yield batch_indices
+                    count_batches += 1
+                    
+        logger.info(f"[SequentialBatchSampler] Finished __iter__. Yielded {count_batches} batches.")
     
     def __len__(self) -> int:
         # Accurate count: total batches for one pass through all episodes
@@ -444,6 +545,12 @@ class SequentialBatchSampler(Sampler):
             total_batches += max_len
         return total_batches
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch for deterministic shuffling across distributed workers."""
+        if self.rank == 0:
+             logger.info(f"SequentialBatchSampler from dataset: set epoch to {epoch} for shuffling")
+        self._epoch = epoch
+
 
 class SequentialCollateFn:
     """
@@ -455,7 +562,7 @@ class SequentialCollateFn:
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
     
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not batch:
             return {}
         
@@ -535,6 +642,8 @@ def create_sequential_mekvm_data(
     n_obs_img_steps = dataset_config.get('n_obs_img_steps', 4)
     n_pred_img_steps = dataset_config.get('n_pred_img_steps', 1)
     chunk_size = dataset_config.get('chunk_size', policy_config.chunk_size)
+    cache_max_size = dataset_config.get('cache_max_size', 64)
+    norm_stats = dataset_config.get('normalization', None)
     
     if task_descriptions is None:
         task_descriptions = ["perform the task"] * len(data_dirs)
@@ -555,6 +664,8 @@ def create_sequential_mekvm_data(
         rank=rank,
         world_size=world_size,
         camera_config=camera_config,
+        cache_max_size=cache_max_size,
+        norm_stats=norm_stats,
     )
     
     # Sample weights (uniform)

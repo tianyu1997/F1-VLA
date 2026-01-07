@@ -36,7 +36,7 @@ def load_ckpt(policy, config):
     # Safely check for load_ckpt key (OmegaConf may raise exception)
     try:
         load_ckpt_path = config.exp.load_ckpt if hasattr(config.exp, 'load_ckpt') else None
-    except:
+    except (AttributeError, KeyError, TypeError):
         load_ckpt_path = None
     
     if load_ckpt_path is not None:

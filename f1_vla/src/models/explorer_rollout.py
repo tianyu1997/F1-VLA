@@ -496,9 +496,17 @@ class ExplorerRolloutCollector:
             if next_img is not None:
                 if next_img.ndim == 4:
                     next_img = next_img[-1]
-                gt_emb = self.vae_extractor.encode_image(
-                    torch.from_numpy(next_img).unsqueeze(0).to(self.device)
-                )
+                
+                # Normalize to [-1, 1] for VAE
+                if next_img.dtype == np.uint8 or next_img.max() > 1.0:
+                    next_img_float = next_img.astype(np.float32) / 255.0
+                else:
+                    next_img_float = next_img.astype(np.float32)
+                
+                next_img_tensor = torch.from_numpy(next_img_float).float().unsqueeze(0).to(self.device)
+                next_img_tensor = next_img_tensor * 2.0 - 1.0
+                
+                gt_emb = self.vae_extractor.encode_image(next_img_tensor)
                 transition.gt_embedding = gt_emb
             
             # Get prediction embedding and uncertainty from WM
