@@ -25,13 +25,7 @@ from f1_vla.src.processors.train_processors.optimizer_scheduler import create_op
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Configure basic logging immediately
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 
 def main(args: argparse.Namespace, overrides: list):

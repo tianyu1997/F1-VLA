@@ -97,4 +97,9 @@ def compute_stats(data_dir):
         print("No action data found.")
 
 if __name__ == "__main__":
-    compute_stats("/mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to data directory")
+    args = parser.parse_args()
+    
+    compute_stats(args.data_dir)

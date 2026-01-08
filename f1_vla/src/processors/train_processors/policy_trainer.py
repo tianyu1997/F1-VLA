@@ -134,13 +134,39 @@ class EpisodeProgressCallback(TrainerCallback):
     
     def load_state(self, state: dict):
         """Load state from trainer_state.json when resuming from checkpoint."""
-        self.current_epoch = state.get("current_epoch", 0)
+        # Load total count which is the ground truth for "how much training happened"
         self.total_episode_count = state.get("total_episode_count", 0)
-        self.epoch_episode_count = state.get("epoch_episode_count", 0)
         self.last_log_episode = state.get("last_log_episode", 0)
         self.last_save_episode = state.get("last_save_episode", 0)
         self.last_eval_episode = state.get("last_eval_episode", 0)
-        self.seen_episodes = set(state.get("seen_episodes", []))
+        
+        # If we have a valid dataset size, recalculate epoch to handle dataset size changes
+        # This prevents "E20/1000" when we are effectively only at "E8/1000" due to larger dataset
+        if self.num_episodes > 0:
+            recal_epoch = self.total_episode_count // self.num_episodes
+            recal_ep_count = self.total_episode_count % self.num_episodes
+            
+            saved_epoch = state.get("current_epoch", 0)
+            
+            # Use recalculated values to be robust to dataset size changes
+            self.current_epoch = recal_epoch
+            self.epoch_episode_count = recal_ep_count
+            
+            if self.current_epoch != saved_epoch:
+                logger.warning(f"[EpisodeProgressCallback] Epoch count mismatch (saved={saved_epoch}, calc={self.current_epoch}). "
+                               f"Implies dataset size changed (current num_episodes={self.num_episodes}). "
+                               f"Using calculated epoch based on total_episodes={self.total_episode_count}.")
+        else:
+            self.current_epoch = state.get("current_epoch", 0)
+            self.epoch_episode_count = state.get("epoch_episode_count", 0)
+
+        # Reconstruct seen_episodes with dummies to preserve count but allow new ID tracking
+        # We use negative indices for past episodes in this epoch to avoid collision with real positive indices
+        self.seen_episodes = set()
+        if self.epoch_episode_count > 0:
+            for i in range(self.epoch_episode_count):
+                self.seen_episodes.add(-(i + 1))
+        
         self._restored_from_checkpoint = True
         logger.info(f"[EpisodeProgressCallback] Restored state: epoch={self.current_epoch}, "
                    f"total_episodes={self.total_episode_count}, epoch_episodes={self.epoch_episode_count}")
@@ -276,10 +302,24 @@ class EpisodeProgressCallback(TrainerCallback):
     
     def update_metrics(self, loss: float, wm_loss: float = 0.0, wm_acc: float = 0.0, action_loss: float = 0.0):
         """Update real-time metrics from compute_loss (every micro-batch)."""
-        self.current_loss = loss
-        self.current_wm_loss = wm_loss
-        self.current_wm_acc = wm_acc
-        self.current_action_loss = action_loss
+        # Initialize EMA variables if they don't exist
+        if not hasattr(self, 'ema_loss'):
+            self.ema_loss = loss
+            self.ema_wm_loss = wm_loss
+            self.ema_wm_acc = wm_acc
+            self.ema_action_loss = action_loss
+        
+        # Exponential moving average (alpha=0.01 for smooth updates over ~100 steps)
+        alpha = 0.02
+        self.ema_loss = (1 - alpha) * self.ema_loss + alpha * loss
+        self.ema_wm_loss = (1 - alpha) * self.ema_wm_loss + alpha * wm_loss
+        self.ema_wm_acc = (1 - alpha) * self.ema_wm_acc + alpha * wm_acc
+        self.ema_action_loss = (1 - alpha) * self.ema_action_loss + alpha * action_loss
+         
+        self.current_loss = self.ema_loss
+        self.current_wm_loss = self.ema_wm_loss
+        self.current_wm_acc = self.ema_wm_acc
+        self.current_action_loss = self.ema_action_loss
     
     def update_episode(self, episode_indices: list):
         """Update episode counter with all episode indices in the current batch."""

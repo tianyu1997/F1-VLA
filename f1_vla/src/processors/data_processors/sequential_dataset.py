@@ -213,10 +213,12 @@ class SequentialMEKVMDataset(Dataset):
                     episode_lengths.append(cache[ep_num])
                     continue
             
-            # Fallback: load the episode to get length
-            episode = torch.load(ep_file, weights_only=False)
-            episode_lengths.append(len(episode))
-            del episode
+            # Fallback: assume constant length 50 to skip slow loading
+            # episode = torch.load(ep_file, weights_only=False)
+            # episode_lengths.append(len(episode))
+            # del episode
+            episode_lengths.append(50)
+
         
         return episode_lengths
     

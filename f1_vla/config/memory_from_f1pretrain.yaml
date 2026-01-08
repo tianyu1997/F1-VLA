@@ -2,13 +2,22 @@ dataset:
   # Use ME_KVM data format - clean data only
   use_mekvm_format: True
   mekvm_data_dirs:
-    - /mnt/data2/ty/F1-VLA/ME_KVM_VLA/data/clean
+    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu0
+    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu1
+    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu2
+    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu3
 
   mekvm_task_descriptions:
     - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
     
   mekvm_weights:
-    - 1.0  # 100% clean data
+    - 0.25
+    - 0.25
+    - 0.25
+    - 0.25
     
   n_obs_img_steps: 4
   n_pred_img_steps: 1
@@ -54,9 +63,10 @@ exp:
     do_train: True
     do_eval: False
     num_train_epochs: 1000  # Set very high, max_steps controls actual training
-    per_device_train_batch_size: 1  # Reduced for memory with KVMemoryBank
+    per_device_train_batch_size: 1  # Reduced to 1 due to OOM
     per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 8  # 8 for faster training (fewer weight updates per epoch)
+    gradient_accumulation_steps: 8  # Increased to 8 to keep Global Batch Size = 32 (1 * 8 * 4)
+    gradient_checkpointing: True    # Enable Gradient Checkpointing
 
     # Use standard AdamW optimizer (avoid 8bit for memory training stability)
     optim: adamw_bnb_8bit
@@ -95,7 +105,7 @@ exp:
 
     # Episode-based logging/saving/eval
     logging_episodes: 50
-    save_episodes: 240  # 每个epoch保存一次，释放显存
+    save_episodes: 512  # 每个epoch保存一次，释放显存
     eval_episodes: 100
 
     label_names: 

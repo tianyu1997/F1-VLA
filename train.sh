@@ -27,14 +27,14 @@ set -e
 # ============================================
 # Default values
 # ============================================
-CONFIG_FILE="f1_vla/config/memory_wm_clean_only.yaml"
+CONFIG_FILE="/mnt/data2/ty/F1-VLA/f1_vla/config/memory_from_f1pretrain.yaml"
 GPU_IDS=""
 NUM_GPUS=""
-AUTO_MODE=false
+AUTO_MODE=true
 MAX_GPUS=4
 MASTER_PORT=29500
 # Default: Resume from checkpoint-episode-10000 with VAE decoder unfrozen
-RESUME_CKPT="/mnt/data2/ty/F1-VLA/outputs/memory_wm_clean_only/checkpoint-episode-256178"
+RESUME_CKPT="/mnt/data2/ty/F1-VLA/outputs/memory_from_f1pretrain/checkpoint-episode-4794"
 MEMORY_THRESHOLD=2000  # MB
 
 # ============================================
@@ -174,26 +174,26 @@ echo ""
 # ============================================
 # Build extra arguments
 # ============================================
-# EXTRA_ARGS=""
-# if [ -n "$RESUME_CKPT" ]; then
-#     # Check if checkpoint exists
-#     if [ ! -d "$RESUME_CKPT" ]; then
-#         echo "WARNING: Checkpoint not found: $RESUME_CKPT"
-#         echo "Available checkpoints in outputs/memory_wm_clean_only/:"
-#         ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
-#         echo ""
-#         read -p "Continue without resuming? (y/n) " -n 1 -r
-#         echo
-#         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-#             exit 1
-#         fi
-#         RESUME_CKPT=""
-#     else
-#         # Checkpoint exists, use it
-#         EXTRA_ARGS="exp.training_args.resume_from_checkpoint=$RESUME_CKPT"
-#         echo "Checkpoint verified: $RESUME_CKPT"
-#     fi
-# fi
+EXTRA_ARGS=""
+if [ -n "$RESUME_CKPT" ]; then
+    # Check if checkpoint exists
+    if [ ! -d "$RESUME_CKPT" ]; then
+        echo "WARNING: Checkpoint not found: $RESUME_CKPT"
+        # echo "Available checkpoints in outputs/memory_wm_clean_only/:"
+        # ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
+        echo ""
+        read -p "Continue without resuming? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+        RESUME_CKPT=""
+    else
+        # Checkpoint exists, use it
+        EXTRA_ARGS="exp.training_args.resume_from_checkpoint=$RESUME_CKPT"
+        echo "Checkpoint verified: $RESUME_CKPT"
+    fi
+fi
 
 # ============================================
 # Run training with torchrun
