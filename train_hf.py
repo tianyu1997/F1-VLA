@@ -63,15 +63,16 @@ def main(args: argparse.Namespace, overrides: list):
         # Use DictWithAttrAccess to match F1Config's expected format
         policy_config.memory_config = DictWithAttrAccess({
             "memory_len": int(mem_cfg.get('memory_len', 4)),
-            "bptt_steps": int(mem_cfg.get('bptt_steps', 8)),
+            # k_bptt: number of gradient frames, also window stride
+            "k_bptt": int(mem_cfg.get('k_bptt', 4)),
             "init_std": float(mem_cfg.get('init_std', 0.02)),
             "tokenizer_max_length": int(mem_cfg.get('tokenizer_max_length', 512)),
         })
-        logger.info(f"Memory enabled: memory_len={policy_config.memory_config.memory_len}, bptt_steps={policy_config.memory_config.bptt_steps}")
+        logger.info(f"Memory enabled: memory_len={policy_config.memory_config.memory_len}, k_bptt={policy_config.memory_config.k_bptt}")
     
     # Set VAE config from exp.vae_config (pixel_loss_weight, etc.)
-    if hasattr(config.exp, 'vae_config') and config.exp.vae_config:
-        vae_cfg = config.exp.vae_config
+    vae_cfg = getattr(config.exp, "vae_config", None)
+    if vae_cfg:
         if hasattr(vae_cfg, 'pixel_loss_weight'):
             policy_config.pixel_loss_weight = vae_cfg.pixel_loss_weight
         if hasattr(vae_cfg, 'pixel_loss_type'):
@@ -153,15 +154,24 @@ def main(args: argparse.Namespace, overrides: list):
         collate_fn = SequentialCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
         
         # Create sequential batch sampler (no longer needs rank/world_size since dataset is already sharded)
+        # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
+        # - First n_obs_img_steps frames: history context for memory warmup (loss detached)
+        # - Last k_bptt frames: compute gradients
+        n_obs = config.dataset.get('n_obs_img_steps', 4)
+        k_bptt = config.exp.memory_config.get('k_bptt', 4) if hasattr(config.exp, 'memory_config') else 4
+        window_length = n_obs + k_bptt  # e.g., 4 + 4 = 8 frames per window
+        
         sequential_sampler = SequentialBatchSampler(
             dataset=training_dataset,
             batch_size=training_args.per_device_train_batch_size,
-            chunk_size=config.exp.memory_config.get('bptt_steps', 1) if hasattr(config.exp, 'memory_config') else 1,
+            chunk_size=window_length,  # Total window length
+            stride=k_bptt,             # Window moves by k_bptt each step
             shuffle_episodes=True,
             drop_last=False,
             rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
             world_size=1,
         )
+        logger.info(f"Window config: n_obs={n_obs}, k_bptt={k_bptt}, window_length={window_length}, stride={k_bptt}")
         logger.info(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
     elif use_mekvm_format:
         # Use ME_KVM data format (standard random loading)

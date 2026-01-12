@@ -43,9 +43,11 @@ exp:
   use_memory: True
   memory_config:
     memory_len: 64    # Number of memory slots per layer (balanced speed/capacity)
-    bptt_steps: 8       # BPTT truncation length (INCREASED from 4->8 for better gradient flow)    
-    k_bptt: 6        # Truncated BPTT: only keep gradients for last k steps (reduces memory)    
-    init_std: 0.02      # Memory parameter initialization std
+    # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
+    # - 前 n_obs_img_steps 帧: 历史上下文，用于 memory warmup
+    # - 后 k_bptt 帧: 计算梯度的有效帧
+    k_bptt: 4         # Number of frames to compute gradients (also window stride)
+    init_std: 0.02    # Memory parameter initialization std
     tokenizer_max_length: 512
 
   # VAE training configuration
@@ -107,7 +109,7 @@ exp:
     # Episode-based logging/saving/eval
     logging_episodes: 50
     save_episodes: 512  # 每个epoch保存一次，释放显存
-    eval_episodes: 20
+    eval_episodes: 50
 
     label_names: 
       - action

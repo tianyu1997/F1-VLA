@@ -439,6 +439,12 @@ class SequentialBatchSampler(Sampler):
     - Handles variable episode lengths
     - Supports distributed training: each rank gets a subset of episodes
     
+    Window design for memory-based training:
+    - window_length = n_obs_img_steps + k_bptt (context + gradient frames)
+    - stride = k_bptt (only gradient frames advance each step)
+    - First n_obs_img_steps frames: history context (loss detached)
+    - Last k_bptt frames: compute gradients
+    
     Yields: List of global indices into the dataset
     """
     
@@ -447,6 +453,7 @@ class SequentialBatchSampler(Sampler):
         dataset: SequentialMEKVMDataset,
         batch_size: int,
         chunk_size: int = 1,
+        stride: int = None,  # Window stride, defaults to chunk_size if not specified
         shuffle_episodes: bool = True,
         drop_last: bool = False,
         rank: int = 0,
@@ -456,6 +463,7 @@ class SequentialBatchSampler(Sampler):
         self.dataset = dataset
         self.batch_size = batch_size
         self.chunk_size = max(1, chunk_size)
+        self.stride = stride if stride is not None else self.chunk_size  # Default: non-overlapping
         self.shuffle_episodes = shuffle_episodes
         self.drop_last = drop_last
         self.rank = rank
@@ -522,8 +530,9 @@ class SequentialBatchSampler(Sampler):
             max_len = max(len(samples) for samples in batch_sample_lists)
             
             # Yield frame by frame across episodes
-            # Yield in chunks of consecutive frames (chunk_size)
-            for window_start in range(0, max_len, self.chunk_size):
+            # Yield in chunks of consecutive frames (chunk_size) with stride
+            # stride < chunk_size enables overlapping windows for memory context
+            for window_start in range(0, max_len, self.stride):
                 window_end = window_start + self.chunk_size
                 batch_indices = []
                 for samples in batch_sample_lists:
@@ -549,7 +558,9 @@ class SequentialBatchSampler(Sampler):
             # Count frames in this batch
             batch_sample_lists = [self.episode_samples[self.local_episode_ids[i]] for i in batch_episodes]
             max_len = max(len(samples) for samples in batch_sample_lists)
-            total_batches += max_len // self.chunk_size
+            # Calculate number of windows with stride
+            if max_len >= self.chunk_size:
+                total_batches += (max_len - self.chunk_size) // self.stride + 1
         return total_batches
 
     def set_epoch(self, epoch: int) -> None:

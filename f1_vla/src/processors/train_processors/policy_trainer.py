@@ -717,38 +717,24 @@ class PolicyTrainer(Trainer):
                 self.log(loss_dict)
                 self.episode_progress_callback.mark_logged()
         
-        # Episode-based saving
-        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_save():
-            if self.state.is_world_process_zero:
-                episode_count = self.episode_progress_callback.total_episode_count
-                save_dir = os.path.join(self.args.output_dir, f"checkpoint-episode-{episode_count}")
-                self._save_full_checkpoint(save_dir)  # Use full save including optimizer/RNG
-                logger.info(f"Saved checkpoint at episode {episode_count}")
-            self.episode_progress_callback.mark_saved()
-        
-        # Episode-based evaluation with video generation
-        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_eval():
-            logger.info(f"[Eval] Triggering evaluation at episode {self.episode_progress_callback.total_episode_count}")
-            if self.state.is_world_process_zero and self.eval_dataset is not None:
-                episode_count = self.episode_progress_callback.total_episode_count
-                try:
-                    self._run_eval_with_video(episode_count)
-                except Exception as e:
-                    logger.warning(f"[Eval] Error during video generation: {e}")
-                    import traceback
-                    traceback.print_exc()
-            elif self.eval_dataset is None:
-                logger.warning("[Eval] eval_dataset is None, skipping video generation")
-            self.episode_progress_callback.mark_evaled()
+        # Episode-based saving and eval (shared with _compute_loss_chunked)
+        self._handle_episode_save_and_eval()
 
         return (loss, outputs) if return_outputs else loss
 
     def _compute_loss_chunked(self, model, inputs, chunk_size: int, return_outputs: bool = False):
-        """在单个 training step 内展开 chunk_size 帧，实现跨时间步 BPTT。
+        """在单个 training step 内展开 window_length 帧，实现跨时间步 BPTT。
 
-        - batch 维度被视为时间维度，长度为 chunk_size（来自 sampler）。
-        - memory_kv 在窗口内保持带梯度更新，窗口结束后才 detach 写回 memory bank。
-        - 使用 Truncated BPTT：只保留最近 k 步的梯度以控制显存。
+        Window 设计 (与 SequentialBatchSampler 配合):
+        - window_length = n_obs_img_steps + k_bptt (例如 4 + 4 = 8)
+        - 前 n_obs_img_steps 帧: 历史上下文，用于 memory warmup，loss 被 detach
+        - 后 k_bptt 帧: 计算梯度的有效帧
+        - stride = k_bptt: 相邻 window 重叠 n_obs_img_steps 帧
+        
+        这样设计确保:
+        1. 每个计算梯度的帧都有完整的 n_obs_img_steps 历史上下文
+        2. memory 从上下文帧 warmup 后再用于梯度帧
+        3. 相邻 window 的 memory 状态正确衔接
         
         NOTE: 当前实现假设 per_device_train_batch_size=1，即 batch 维度仅包含
               单个 episode 的连续帧。若 batch_size>1，sampler 会混合多个 episode。
@@ -771,22 +757,35 @@ class PolicyTrainer(Trainer):
         memory_manager = self.policy.model.memory_manager
         memory_bank = self.policy.model.memory_bank
 
-        # 初始化 memory（从 bank 取，已 detach）
-        frame0 = {k: (v[0:1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
-        memory_kv, memory_token, _ = memory_manager.process_batch(frame0, device, dtype)
-
-        # Truncated BPTT: 只保留最近 k 步的完整梯度
-        # 更早的步只保留 loss 用于平均，但 memory 会被 detach
-        # 从 config 读取 k_bptt，默认为 2
-        k_bptt_config = 2
+        # 从 config 读取参数
+        n_obs_img_steps = getattr(self, 'cur_n_obs_img_steps', 4)
+        k_bptt = 4  # 默认值
         if hasattr(self.policy.config, 'memory_config') and self.policy.config.memory_config:
-            k_bptt_config = getattr(self.policy.config.memory_config, 'k_bptt', 2) or 2
-        k_bptt = min(k_bptt_config, effective_steps)
+            k_bptt = getattr(self.policy.config.memory_config, 'k_bptt', 4) or 4
+        
+        # Episode 起始 frame_idx: 数据集从 n_obs_img_steps - 1 开始（确保有足够历史）
+        episode_start_frame = n_obs_img_steps - 1
+        
+        # 初始化 memory（从 bank 取，或使用 init_memory）
+        frame0 = {k: (v[0:1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+        memory_kv, memory_token, _ = memory_manager.process_batch(
+            frame0, device, dtype, 
+            episode_start_frame=episode_start_frame
+        )
+        
+        # Window 划分:
+        # - context_frames: 前 n_obs_img_steps 帧，用于 memory warmup，不计算梯度
+        # - gradient_frames: 后 k_bptt 帧，计算梯度
+        context_frames = min(n_obs_img_steps, effective_steps)
+        gradient_start = context_frames  # 梯度帧从这个位置开始
         
         losses = []
         final_wm_loss = None
         final_wm_acc = None
         final_action_loss = None
+        
+        # 检查是否是 episode 的起始 window
+        is_episode_start = frame0["frame_idx"][0].item() == episode_start_frame
 
         for t in range(effective_steps):
             batch_t = {k: (v[t:t+1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
@@ -803,11 +802,19 @@ class PolicyTrainer(Trainer):
                 skip_memory_store=True,
             )
             
-            # 只有最后 k 步保留完整 loss 梯度
-            if t >= effective_steps - k_bptt:
+            # Loss 梯度策略：
+            # - 前 n_obs_img_steps 帧 (t < gradient_start): 上下文帧，loss detach
+            # - 后 k_bptt 帧 (t >= gradient_start): 梯度帧，保留 loss 梯度
+            # 
+            # init_memory 梯度说明：
+            # init_memory 的梯度通过 memory 链传递（而非直接通过 loss）：
+            #   loss_t -> memory_t -> ... -> memory_0 -> init_memory
+            # 因此只要 memory 链保持梯度（is_episode_start 时），后续帧的 loss
+            # 就能将梯度传回 init_memory，无需对上下文帧的 loss 保留梯度。
+            if t >= gradient_start:
                 losses.append(out_t["loss"])
             else:
-                # 早期步：只累积 loss 值，不保留梯度（减少计算图）
+                # 上下文帧：只累积 loss 值用于监控，不参与梯度计算
                 losses.append(out_t["loss"].detach())
             
             # 记录最后一步的指标
@@ -819,13 +826,17 @@ class PolicyTrainer(Trainer):
             # 更新 memory
             memory_info = out_t.get("memory_info")
             if memory_info is not None:
-                # Truncated BPTT: 只有最近 k 步保持 memory 梯度
-                if t < effective_steps - k_bptt:
-                    # 早期步：detach memory 以截断梯度链
+                # Memory 梯度策略：
+                # - 上下文帧 (t < gradient_start): detach memory 以截断梯度链
+                # - 梯度帧 (t >= gradient_start): 保留 memory 梯度
+                # - 特例：episode 起始 window 的所有帧都保留梯度（让 init_memory 能学习）
+                if t >= gradient_start or is_episode_start:
+                    # 保留梯度：让 init_memory/memory_token 能学习
+                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
+                else:
+                    # 上下文帧：detach memory 以截断梯度链
                     memory_kv = memory_bank.update_memory(memory_kv, memory_info)
                     memory_kv = [(k.detach(), v.detach()) for k, v in memory_kv]
-                else:
-                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
 
         loss = torch.stack(losses).mean()
         outputs = {
@@ -858,7 +869,62 @@ class PolicyTrainer(Trainer):
                 action_loss=outputs["action_loss"].detach().cpu().item(),
             )
 
+        # Episode-based logging for chunked path
+        if self.state.is_local_process_zero and self.state.is_world_process_zero:
+            if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_log():
+                episode_log = {
+                    "episode": self.episode_progress_callback.total_episode_count,
+                    "epoch": self.episode_progress_callback.current_epoch + 1,
+                }
+                wm_log = {
+                    "wm_out_loss": outputs.get("wm_loss", torch.tensor(0)).cpu().item() if hasattr(outputs.get("wm_loss", 0), "cpu") else outputs.get("wm_loss", 0),
+                    "wm_acc_mean": outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item() if hasattr(outputs.get("wm_acc_mean", 0), "cpu") else outputs.get("wm_acc_mean", 0),
+                    "wm_acc_tail": outputs.get("wm_acc_tail", torch.tensor(0)).cpu().item() if hasattr(outputs.get("wm_acc_tail", 0), "cpu") else outputs.get("wm_acc_tail", 0),
+                }
+                if len(self.optimizer.param_groups) > 4:
+                    wm_log["wm_learning_rate"] = self.optimizer.param_groups[4]["lr"]
+                    vit_log = {"vit_learning_rate": self.optimizer.param_groups[0]["lr"]}
+                else:
+                    vit_log = {"learning_rate": self.optimizer.param_groups[0]["lr"]}
+                
+                loss_dict = {**episode_log, **wm_log, **vit_log}
+                self.log(loss_dict)
+                self.episode_progress_callback.mark_logged()
+
+        # Episode-based saving/eval (shared with compute_loss)
+        self._handle_episode_save_and_eval()
+
         return (loss, outputs) if return_outputs else loss
+    
+    def _handle_episode_save_and_eval(self):
+        """Handle episode-based saving and evaluation.
+        
+        This is called at the end of both compute_loss and _compute_loss_chunked.
+        Logging is handled separately due to different output formats.
+        """
+        # Episode-based saving
+        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_save():
+            if self.state.is_world_process_zero:
+                episode_count = self.episode_progress_callback.total_episode_count
+                save_dir = os.path.join(self.args.output_dir, f"checkpoint-episode-{episode_count}")
+                self._save_full_checkpoint(save_dir)
+                logger.info(f"Saved checkpoint at episode {episode_count}")
+            self.episode_progress_callback.mark_saved()
+        
+        # Episode-based evaluation with video generation
+        if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_eval():
+            logger.info(f"[Eval] Triggering evaluation at episode {self.episode_progress_callback.total_episode_count}")
+            if self.state.is_world_process_zero and self.eval_dataset is not None:
+                episode_count = self.episode_progress_callback.total_episode_count
+                try:
+                    self._run_eval_with_video(episode_count)
+                except Exception as e:
+                    logger.warning(f"[Eval] Error during video generation: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif self.eval_dataset is None:
+                logger.warning("[Eval] eval_dataset is None, skipping video generation")
+            self.episode_progress_callback.mark_evaled()
 
     def _fallback_compute_loss(self, model, inputs, return_outputs: bool = False):
         """当 batch 包含多个 episode 时的回退路径，逐帧处理。"""

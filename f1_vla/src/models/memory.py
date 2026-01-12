@@ -193,12 +193,13 @@ class KVMemoryBank(nn.Module):
         frame_indices: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        episode_start_frame: int = 0,  # 默认为0，但对于有历史的数据集应设为 n_obs_img_steps - 1
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Retrieve previous memory for each sample in the batch.
         
-        For frame_idx == 0, uses init_memory.
-        For frame_idx > 0, retrieves from memory bank.
+        For frame_idx == episode_start_frame (episode start), uses init_memory.
+        For frame_idx > episode_start_frame, retrieves from memory bank.
         
         Args:
             dataset_indices: (batch,) dataset index for each sample
@@ -223,13 +224,15 @@ class KVMemoryBank(nn.Module):
             # No clone() here - use tensors directly to maintain gradient connection
             memory_state.append([k, v])
         
-        # Override with stored memory for samples with frame_idx > 0
+        # Override with stored memory for samples with frame_idx > episode_start_frame
+        # At episode_start_frame, init_memory is used (with gradient for learning)
         for b in range(batch_size):
             ds_idx = dataset_indices[b].item()
             ep_idx = episode_indices[b].item()
             fr_idx = frame_indices[b].item()
             
-            if fr_idx > 0:
+            # Only retrieve from bank for frames after episode start
+            if fr_idx > episode_start_frame:
                 key = (ds_idx, ep_idx)
                 if key in self._memory_bank:
                     stored_memory = self._memory_bank[key]
@@ -525,17 +528,18 @@ class MemoryManager:
         dataset_idx: int,
         episode_idx: int,
         frame_idx: int,
+        episode_start_frame: int = 0,  # 数据集的 episode 起始 frame_idx
     ) -> bool:
         """
         Determine if gradients should be detached for BPTT.
         
-        Detach at frame_idx == 0 or when step_count reaches bptt_steps.
+        Detach at episode_start_frame or when step_count reaches bptt_steps.
         The check happens BEFORE update_step_count is called.
         """
-        # If forced, always detach beyond frame 0 to avoid cross-batch graph reuse
-        if self.detach_every_step and frame_idx > 0:
+        # If forced, always detach beyond episode start to avoid cross-batch graph reuse
+        if self.detach_every_step and frame_idx > episode_start_frame:
             return True
-        if frame_idx == 0:
+        if frame_idx == episode_start_frame:
             return True
         
         key = (dataset_idx, episode_idx)
@@ -550,13 +554,14 @@ class MemoryManager:
         dataset_idx: int,
         episode_idx: int,
         frame_idx: int,
+        episode_start_frame: int = 0,  # 数据集的 episode 起始 frame_idx
     ) -> None:
         """Update step count for BPTT tracking. Called AFTER forward pass."""
         key = (dataset_idx, episode_idx)
         
-        if frame_idx == 0:
+        if frame_idx == episode_start_frame:
             # Start of episode
-            self._step_counts[key] = 1  # First step after frame 0
+            self._step_counts[key] = 1  # First step after episode start
         else:
             current = self._step_counts.get(key, 0) + 1
             # FIX: Use >= to reset immediately when reaching bptt_steps
@@ -572,6 +577,7 @@ class MemoryManager:
         batch: Dict[str, Any],
         device: torch.device,
         dtype: torch.dtype,
+        episode_start_frame: int = 0,  # 数据集的 episode 起始 frame_idx
     ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, List[bool]]:
         """
         Process batch to get previous memory and memory token.
@@ -580,6 +586,8 @@ class MemoryManager:
             batch: Batch dictionary with dataset_idx, episode_idx, frame_idx
             device: Target device
             dtype: Target dtype
+            episode_start_frame: The frame_idx that marks episode start
+                                 (typically n_obs_img_steps - 1 for datasets with history)
             
         Returns:
             - previous_memory: Memory state for this batch
@@ -594,7 +602,8 @@ class MemoryManager:
         # Get previous memory
         previous_memory = self.memory_bank.get_previous_memory(
             dataset_indices, episode_indices, frame_indices,
-            device=device, dtype=dtype
+            device=device, dtype=dtype,
+            episode_start_frame=episode_start_frame,
         )
         
         # Get memory token
