@@ -117,7 +117,8 @@ class F1FlowMatching(nn.Module):
             memory_config = config.memory_config
             memory_len = memory_config.memory_len
             init_std = memory_config.init_std
-            bptt_steps = memory_config.bptt_steps
+            # k_bptt: number of gradient frames per window (bptt_steps is deprecated)
+            k_bptt = getattr(memory_config, 'k_bptt', getattr(memory_config, 'bptt_steps', 4))
             # HF Trainer trains per batch; keep graphs from previous batch detached to avoid double backward
             detach_every_step = True
             
@@ -131,7 +132,7 @@ class F1FlowMatching(nn.Module):
             )
             self.memory_manager = MemoryManager(
                 memory_bank=self.memory_bank,
-                bptt_steps=bptt_steps,
+                bptt_steps=k_bptt,  # Pass k_bptt as bptt_steps for backward compatibility
                 detach_every_step=detach_every_step,
             )
 
