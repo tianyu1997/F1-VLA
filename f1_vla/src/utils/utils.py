@@ -51,18 +51,21 @@ def load_ckpt(policy, config):
         logger.info(f"Loading pretrained checkpoint from: {ckpt_path}")
         
         # Load checkpoint with key mapping for backward compatibility
-        # Old checkpoints use: model.paligemma_with_expert.gemma_expert.xxx
-        # New model expects: model.paligemma_with_expert.gemma_experts.actor.xxx
+        # Key mappings:
+        # 1. model.paligemma_with_expert.gemma_expert.xxx -> model.paligemma_with_expert.gemma_experts.actor.xxx
+        # 2. model.vae.xxx is duplicated to vae.xxx (VAE is registered in both policy.vae and policy.model.vae)
         state_dict = {}
         with safe_open(ckpt_path, framework="pt") as f:
             for key in f.keys():
+                new_key = key
                 # Map old gemma_expert to new gemma_experts.actor
                 if '.gemma_expert.' in key and '.gemma_experts.' not in key and '.gemma_wm_expert.' not in key:
                     new_key = key.replace('.gemma_expert.', '.gemma_experts.actor.')
-                    state_dict[new_key] = f.get_tensor(key)
-                    # logger.debug(f"  Key mapping: {key} -> {new_key}")
-                else:
-                    state_dict[key] = f.get_tensor(key)
+                state_dict[new_key] = f.get_tensor(key)
+                # Duplicate model.vae.xxx to vae.xxx (VAE is registered twice in the model)
+                if key.startswith('model.vae.'):
+                    vae_key = key[6:]  # Remove 'model.' prefix -> 'vae.xxx'
+                    state_dict[vae_key] = f.get_tensor(key)
         
         # Check key compatibility after mapping
         model_keys = set(policy.state_dict().keys())
@@ -87,19 +90,20 @@ def load_ckpt(policy, config):
                 for k in sorted(other_missing)[:5]:
                     logger.info(f"    - {k}")
         
-        # Check for memory_info_proj shape mismatch (due to GRU fix)
-        memory_proj_keys = [k for k in model_keys if 'memory_info_proj' in k]
+        # Check for shape mismatch in keys that might change (memory_info_proj, temporal_conv, etc.)
+        mismatch_check_patterns = ['memory_info_proj', 'temporal_conv']
+        keys_to_check = [k for k in model_keys if any(p in k for p in mismatch_check_patterns)]
         skip_keys = []
-        if memory_proj_keys:
+        if keys_to_check:
             model_state = policy.state_dict()
-            for key in memory_proj_keys:
+            for key in keys_to_check:
                 if key in state_dict:
                     model_shape = model_state[key].shape
                     ckpt_shape = state_dict[key].shape
                     if model_shape != ckpt_shape:
                         skip_keys.append(key)
                         logger.warning(f"  SKIP {key}: shape mismatch (model={model_shape} vs ckpt={ckpt_shape})")
-                        logger.warning(f"    -> Will randomly initialize this layer (GRU mechanism updated)")
+                        logger.warning(f"    -> Will randomly initialize this layer")
         
         # Remove skipped keys from state_dict
         for key in skip_keys:

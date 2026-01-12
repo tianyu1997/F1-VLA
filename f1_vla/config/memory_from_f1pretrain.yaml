@@ -19,7 +19,7 @@ dataset:
     - 0.25
     - 0.25
     
-  n_obs_img_steps: 4
+  n_obs_img_steps: 2
   n_pred_img_steps: 1
   chunk_size: 4
 
@@ -42,13 +42,13 @@ exp:
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
   memory_config:
-    memory_len: 48    # Number of memory slots per layer (balanced speed/capacity)
+    memory_len: 8     # Reduced for memory efficiency
     # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
     # - 前 n_obs_img_steps 帧: 历史上下文，用于 memory warmup
     # - 后 k_bptt 帧: 计算梯度的有效帧
-    k_bptt: 2         # Number of frames to compute gradients (also window stride)
+    k_bptt: 2         # Reduced to 1 for memory efficiency (window=3)
     init_std: 0.02    # Memory parameter initialization std
-    tokenizer_max_length: 512
+    tokenizer_max_length: 256  # Reduced for memory efficiency
 
   # VAE training configuration
   vae_config:
@@ -169,4 +169,4 @@ policy:
   num_resolutions: 10
 
   resize_imgs_with_padding: "(224, 224)"
-  attention_implementation: eager
+  attention_implementation: flash_attention_2

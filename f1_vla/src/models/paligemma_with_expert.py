@@ -410,6 +410,48 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 )
                 att_output = att_output.permute(0, 2, 1, 3)
                 att_output = att_output.reshape(batch_size, -1, self.num_key_value_heads * self.num_key_value_groups * head_dim)
+            elif self.config.attention_implementation == "flash_attention_2":
+                from flash_attn import flash_attn_func
+
+                # Handle experts_only_memory logic with Flash Attention
+                # If active, we split the attention into two parts:
+                # 1. PaliGemma queries -> Keys without memory
+                # 2. Expert queries -> Full keys (with memory)
+                if experts_only_memory and memory_kv is not None and layer_idx < len(memory_kv):
+                    pali_seq_len = inputs_embeds[0].shape[1] if inputs_embeds[0] is not None else 0
+                    if pali_seq_len > 0:
+                        # Split queries
+                        q_pali = query_states[:, :pali_seq_len]
+                        q_experts = query_states[:, pali_seq_len:]
+
+                        # For Pali, use keys without memory
+                        # Memory is prepended, so slice off the first mem_len tokens
+                        mem_len_layer = memory_kv[layer_idx][0].shape[1]
+                        k_pali = key_states[:, mem_len_layer:]
+                        v_pali = value_states[:, mem_len_layer:]
+
+                        out_pali = flash_attn_func(q_pali, k_pali, v_pali, dropout_p=0.0, causal=False)
+                        
+                        # For Experts, use full keys (with memory)
+                        out_experts = flash_attn_func(q_experts, key_states, value_states, dropout_p=0.0, causal=False)
+                        
+                        att_output = torch.cat([out_pali, out_experts], dim=1)
+                    else:
+                        # Should rarely happen (no pali input?), treat as all experts
+                        att_output = flash_attn_func(query_states, key_states, value_states, dropout_p=0.0, causal=False)
+                else:
+                    att_output = flash_attn_func(
+                        query_states,
+                        key_states,
+                        value_states,
+                        dropout_p=0.0,
+                        softmax_scale=None,
+                        causal=False,
+                    )
+
+                att_output = att_output.reshape(
+                    batch_size, -1, self.num_key_value_heads * self.num_key_value_groups * head_dim
+                )
             elif self.config.attention_implementation == "flex":
                 raise NotImplementedError("Flex attention is not implemented (yet)")
             else:
