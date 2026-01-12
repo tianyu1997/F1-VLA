@@ -233,28 +233,22 @@ def main(args: argparse.Namespace, overrides: list):
     # Create model
     #########################################################
     logger.info("Creating model")
-    logger.info(f"Policy config Pretrained path: {policy_config.pretrained_path}")
     kwargs = {"config": policy_config}
-
-    kwargs["pretrained_name_or_path"] = policy_config.pretrained_path
     kwargs["training_args"] = training_args
 
     # Verify if we are resuming from a checkpoint
     is_resuming = training_args.resume_from_checkpoint is not None or last_checkpoint is not None
 
-    if policy_config.pretrained_path and not args.debug:
-        if is_resuming:
-            logger.info("Resuming training detected. Initializing model directly (skipping pi0 load).")
-            policy = F1_VLA(**kwargs)
-            logger.info(f"Skipping base pretrained weights load: {config.exp.load_ckpt if hasattr(config.exp, 'load_ckpt') else 'N/A'}")
-        else:
-            logger.info("Calling F1_VLA.from_pretrained...")
-            policy = F1_VLA.from_pretrained(**kwargs)
-            logger.info("F1_VLA.from_pretrained returned.")
-            
-            policy = load_ckpt(policy, config)
+    # Simplified loading: directly create model and load from load_ckpt (F1_pretrain)
+    # F1_pretrain contains: PaliGemma + VAE + Gen Expert weights
+    # No need to load from pi0 separately
+    policy = F1_VLA(**kwargs)
+    
+    if not is_resuming:
+        # Load weights from F1_pretrain (contains everything except Memory module)
+        policy = load_ckpt(policy, config)
     else:
-        policy = F1_VLA(**kwargs)
+        logger.info("Resuming training - weights will be loaded from checkpoint")
 
     optimizer = create_optimizer(policy, training_args)
 

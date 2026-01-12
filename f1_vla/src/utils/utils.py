@@ -50,55 +50,67 @@ def load_ckpt(policy, config):
         
         logger.info(f"Loading pretrained checkpoint from: {ckpt_path}")
         
-        # Check key compatibility before loading
-        model_keys = set(policy.state_dict().keys())
-        ckpt_keys = set()
+        # Load checkpoint with key mapping for backward compatibility
+        # Old checkpoints use: model.paligemma_with_expert.gemma_expert.xxx
+        # New model expects: model.paligemma_with_expert.gemma_experts.actor.xxx
+        state_dict = {}
         with safe_open(ckpt_path, framework="pt") as f:
-            ckpt_keys = set(f.keys())
+            for key in f.keys():
+                # Map old gemma_expert to new gemma_experts.actor
+                if '.gemma_expert.' in key and '.gemma_experts.' not in key and '.gemma_wm_expert.' not in key:
+                    new_key = key.replace('.gemma_expert.', '.gemma_experts.actor.')
+                    state_dict[new_key] = f.get_tensor(key)
+                    # logger.debug(f"  Key mapping: {key} -> {new_key}")
+                else:
+                    state_dict[key] = f.get_tensor(key)
+        
+        # Check key compatibility after mapping
+        model_keys = set(policy.state_dict().keys())
+        ckpt_keys = set(state_dict.keys())
         
         matched = model_keys & ckpt_keys
         missing = model_keys - ckpt_keys
         extra = ckpt_keys - model_keys
         
-        logger.info(f"  Model keys: {len(model_keys)}, Checkpoint keys: {len(ckpt_keys)}")
+        logger.info(f"  Model keys: {len(model_keys)}, Checkpoint keys (after mapping): {len(ckpt_keys)}")
         logger.info(f"  Matched: {len(matched)}, Missing in ckpt: {len(missing)}, Extra in ckpt: {len(extra)}")
         
         if missing:
-            logger.info(f"  NOTE: {len(missing)} keys not in checkpoint (VAE/PaliGemma loaded separately)")
+            # Memory module is new, so these keys are expected to be missing
+            memory_missing = [k for k in missing if 'memory' in k.lower()]
+            other_missing = [k for k in missing if 'memory' not in k.lower()]
+            if memory_missing:
+                logger.info(f"  Memory module keys (new, will be randomly initialized): {len(memory_missing)}")
+            if other_missing:
+                logger.info(f"  Other missing keys: {len(other_missing)}")
+                # Log first few for debugging
+                for k in sorted(other_missing)[:5]:
+                    logger.info(f"    - {k}")
         
         # Check for memory_info_proj shape mismatch (due to GRU fix)
         memory_proj_keys = [k for k in model_keys if 'memory_info_proj' in k]
         skip_keys = []
         if memory_proj_keys:
             model_state = policy.state_dict()
-            with safe_open(ckpt_path, framework="pt") as f:
-                for key in memory_proj_keys:
-                    if key in ckpt_keys:
-                        model_shape = model_state[key].shape
-                        ckpt_tensor = f.get_tensor(key)
-                        ckpt_shape = ckpt_tensor.shape
-                        if model_shape != ckpt_shape:
-                            skip_keys.append(key)
-                            logger.warning(f"  SKIP {key}: shape mismatch (model={model_shape} vs ckpt={ckpt_shape})")
-                            logger.warning(f"    -> Will randomly initialize this layer (GRU mechanism updated)")
+            for key in memory_proj_keys:
+                if key in state_dict:
+                    model_shape = model_state[key].shape
+                    ckpt_shape = state_dict[key].shape
+                    if model_shape != ckpt_shape:
+                        skip_keys.append(key)
+                        logger.warning(f"  SKIP {key}: shape mismatch (model={model_shape} vs ckpt={ckpt_shape})")
+                        logger.warning(f"    -> Will randomly initialize this layer (GRU mechanism updated)")
         
-        # Load checkpoint, skipping incompatible keys
-        if skip_keys:
-            import torch
-            state_dict = {}
-            with safe_open(ckpt_path, framework="pt") as f:
-                for key in f.keys():
-                    if key not in skip_keys:
-                        state_dict[key] = f.get_tensor(key)
-            
-            missing_keys, unexpected_keys = policy.load_state_dict(state_dict, strict=False)
-            logger.info(f"Loaded checkpoint with {len(skip_keys)} skipped keys (shape mismatch)")
-            logger.info(f"  Skipped: {skip_keys}")
-        else:
-            # Load with strict=False since VAE and PaliGemma are loaded separately
-            F1_VLA._load_as_safetensor(policy, ckpt_path, "cpu", strict=False)
+        # Remove skipped keys from state_dict
+        for key in skip_keys:
+            if key in state_dict:
+                del state_dict[key]
         
-        logger.info(f"Successfully loaded {len(matched) - len(skip_keys)} weights from pretrained checkpoint!")
+        # Load the state dict
+        missing_keys, unexpected_keys = policy.load_state_dict(state_dict, strict=False)
+        
+        loaded_count = len(matched) - len(skip_keys)
+        logger.info(f"Successfully loaded {loaded_count} weights from pretrained checkpoint!")
     else:
         logger.info("No pretrained checkpoint specified, training from scratch")
         

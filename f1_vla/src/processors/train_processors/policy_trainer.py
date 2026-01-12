@@ -549,10 +549,13 @@ class PolicyTrainer(Trainer):
             episode_indices = inputs['episode_idx'].cpu().tolist()
             self.episode_progress_callback.update_episode(episode_indices)
 
-        # Chunked BPTT path: sampler已按 bptt_steps 打包连续帧（batch 维度=时间维度）
+        # Chunked BPTT path: sampler已按 window_length 打包连续帧（batch 维度=时间维度）
+        # window_length = n_obs_img_steps + k_bptt
         chunk_size = 1
         if hasattr(self.policy.config, 'memory_config') and self.policy.config.memory_config:
-            chunk_size = getattr(self.policy.config.memory_config, 'bptt_steps', 1) or 1
+            k_bptt = getattr(self.policy.config.memory_config, 'k_bptt', 4) or 4
+            n_obs = getattr(self, 'cur_n_obs_img_steps', 4)
+            chunk_size = n_obs + k_bptt  # window_length
         if (self.use_memory and self.sequential_sampler is not None and chunk_size > 1
                 and isinstance(inputs, dict) and len(inputs) > 0):
             batch_dim = list(inputs.values())[0].shape[0] if isinstance(list(inputs.values())[0], torch.Tensor) else 0

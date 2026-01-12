@@ -40,7 +40,6 @@ class F1_VLA(nn.Module):
         self,
         config: F1Config,
         device: Optional[torch.device] = None,
-        skip_vae_ckpt: bool = False,  # Skip loading from vae_ckpt (used when loading from safetensors)
         **kwargs,
     ):
         super().__init__()
@@ -72,17 +71,8 @@ class F1_VLA(nn.Module):
             share_quant_resi=config.gen_expert_config.vae.share_quant_resi, 
             v_patch_nums=patch_nums
         )
-        # Load VAE weights from vae_ckpt ONLY if:
-        # 1. Not skipping (skip_vae_ckpt=False, i.e., fresh training)
-        # 2. vae_ckpt path exists
-        # When loading from safetensors (from_pretrained), skip this to avoid double-loading
-        if not skip_vae_ckpt and os.path.exists(config.gen_expert_config.vae.vae_ckpt):
-            logger.info(f"Loading VAE weights from: {config.gen_expert_config.vae.vae_ckpt}")
-            vae_ckpt = torch.load(config.gen_expert_config.vae.vae_ckpt, map_location=device, weights_only=False)
-            self.vae.load_state_dict(vae_ckpt, strict=True)
-            del vae_ckpt
-        elif skip_vae_ckpt:
-            logger.info("Skipping vae_ckpt loading (will load from safetensors)")
+        # VAE weights will be loaded from load_ckpt (F1_pretrain) which contains model.vae.* keys
+        # No separate vae_ckpt loading needed
         # Move VAE to target device
         self.vae = self.vae.to(device)
 
@@ -1003,9 +993,8 @@ class F1_VLA(nn.Module):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
-        # Skip loading VAE from vae_ckpt since we'll load from safetensors
-        # This avoids double-loading and ensures VAE weights match the checkpoint
-        instance = cls(config, skip_vae_ckpt=True, **kwargs)
+        # Create instance - VAE weights will be loaded from safetensors
+        instance = cls(config, **kwargs)
 
         if model_id.endswith(".json"):
             model_id = "/".join(model_id.split("/")[:-1])
