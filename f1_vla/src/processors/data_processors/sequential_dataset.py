@@ -446,6 +446,7 @@ class SequentialBatchSampler(Sampler):
         self,
         dataset: SequentialMEKVMDataset,
         batch_size: int,
+        chunk_size: int = 1,
         shuffle_episodes: bool = True,
         drop_last: bool = False,
         rank: int = 0,
@@ -454,6 +455,7 @@ class SequentialBatchSampler(Sampler):
     ):
         self.dataset = dataset
         self.batch_size = batch_size
+        self.chunk_size = max(1, chunk_size)
         self.shuffle_episodes = shuffle_episodes
         self.drop_last = drop_last
         self.rank = rank
@@ -520,13 +522,16 @@ class SequentialBatchSampler(Sampler):
             max_len = max(len(samples) for samples in batch_sample_lists)
             
             # Yield frame by frame across episodes
-            for frame_offset in range(max_len):
+            # Yield in chunks of consecutive frames (chunk_size)
+            for window_start in range(0, max_len, self.chunk_size):
+                window_end = window_start + self.chunk_size
                 batch_indices = []
                 for samples in batch_sample_lists:
-                    if frame_offset < len(samples):
-                        batch_indices.append(samples[frame_offset])
-                
-                if batch_indices:
+                    if window_end <= len(samples):
+                        # Append consecutive indices for this episode
+                        batch_indices.extend(samples[window_start:window_end])
+                # Require full chunk to keep sequence length consistent
+                if batch_indices and len(batch_indices) == self.chunk_size * len(batch_sample_lists):
                     yield batch_indices
                     count_batches += 1
                     
@@ -544,7 +549,7 @@ class SequentialBatchSampler(Sampler):
             # Count frames in this batch
             batch_sample_lists = [self.episode_samples[self.local_episode_ids[i]] for i in batch_episodes]
             max_len = max(len(samples) for samples in batch_sample_lists)
-            total_batches += max_len
+            total_batches += max_len // self.chunk_size
         return total_batches
 
     def set_epoch(self, epoch: int) -> None:

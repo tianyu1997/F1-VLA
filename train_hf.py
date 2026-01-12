@@ -156,6 +156,7 @@ def main(args: argparse.Namespace, overrides: list):
         sequential_sampler = SequentialBatchSampler(
             dataset=training_dataset,
             batch_size=training_args.per_device_train_batch_size,
+            chunk_size=config.exp.memory_config.get('bptt_steps', 1) if hasattr(config.exp, 'memory_config') else 1,
             shuffle_episodes=True,
             drop_last=False,
             rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
@@ -306,7 +307,9 @@ def main(args: argparse.Namespace, overrides: list):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=str, required=True)
+    # Accept both --config-file (original) and --config (used by train.sh)
+    parser.add_argument("--config-file", "--config", dest="config_file", type=str, required=True,
+                        help="Path to training config yaml")
     parser.add_argument('--debug', action='store_true', help='to enable debug mode')
     args, unknown = parser.parse_known_args()
     main(args, overrides=unknown)

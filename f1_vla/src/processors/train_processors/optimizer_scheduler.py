@@ -27,6 +27,12 @@ def create_optimizer(opt_model, args):
 
     # Group 2: world model expert parameters and world model related parameters
     gen_expert_parameters = [name for name, _ in opt_model.named_parameters() if "paligemma_with_expert.gemma_wm_expert" in name]
+    # Memory module parameters (KV memory bank + GRU update).
+    # These are critical for convergence when use_memory=True; if excluded, memory stays randomly initialized.
+    memory_parameters = [
+        name for name, _ in opt_model.named_parameters()
+        if any(x in name for x in ["memory_bank", "memory_manager", "memory_token", "memory_info_proj", "memory_gru", "init_memory"])
+    ]
     gen_parameters = [
         name for name, _ in opt_model.named_parameters() 
         if any(x in name for x in [
@@ -89,13 +95,13 @@ def create_optimizer(opt_model, args):
         },
     ])
 
-    # Group 2: world model expert and world model parameters
-    if len(gen_parameters) > 0:
+    # Group 2: world model expert, world model parameters, and memory module parameters
+    if len(gen_parameters) > 0 or len(gen_expert_parameters) > 0 or len(memory_parameters) > 0:
         optimizer_grouped_parameters.extend([
             {
                 "params": [
                     p for n, p in opt_model.named_parameters() 
-                    if n in decay_parameters and (n in gen_expert_parameters or n in gen_parameters) and p.requires_grad
+                    if n in decay_parameters and (n in gen_expert_parameters or n in gen_parameters or n in memory_parameters) and p.requires_grad
                 ],
                 "weight_decay": args.weight_decay,
                 "lr": args.gen_expert_lr,
@@ -103,7 +109,7 @@ def create_optimizer(opt_model, args):
             {
                 "params": [
                     p for n, p in opt_model.named_parameters() 
-                    if n not in decay_parameters and (n in gen_expert_parameters or n in gen_parameters) and p.requires_grad
+                    if n not in decay_parameters and (n in gen_expert_parameters or n in gen_parameters or n in memory_parameters) and p.requires_grad
                 ],
                 "weight_decay": 0.0,
                 "lr": args.gen_expert_lr,

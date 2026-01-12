@@ -31,19 +31,20 @@ dataset:
     width: 224
   world_model_suffix: history
   transforms:
-    consistent_random_crop_stages:
-      - stage1_pretrain_wm
+    consistent_random_crop_stages: []
+      # - stage1_pretrain_wm
 
 exp:
   stage: stage1_pretrain_wm
-  # Load from F1_pretrain (not checkpoint resume, fresh memory training)
-  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain
+  # Load from specific memory pretraining checkpoint
+  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain/model.safetensors
   
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
   memory_config:
-    memory_len: 32     # Number of memory slots per layer (balanced speed/capacity)
-    bptt_steps: 4       # BPTT truncation length (4 for faster training)
+    memory_len: 64     # Number of memory slots per layer (balanced speed/capacity)
+    bptt_steps: 8       # BPTT truncation length (INCREASED from 4->8 for better gradient flow)    
+    k_bptt: 8         # Truncated BPTT: only keep gradients for last k steps (reduces memory)    
     init_std: 0.02      # Memory parameter initialization std
     tokenizer_max_length: 512
 
@@ -56,13 +57,13 @@ exp:
     dropout: 0.0              # No dropout
 
   training_args:
-    output_dir: outputs/memory_from_f1pretrain
-    run_name: memory_from_f1pretrain_v1
-    # Fresh training - no resume
-    resume_from_checkpoint: null
+    output_dir: outputs/memory_from_f1pretrain_v3
+    run_name: memory_from_f1pretrain_v3
+    # Resume from specific checkpoint
+    # resume_from_checkpoint: null
     do_train: True
     do_eval: False
-    num_train_epochs: 1000  # Set very high, max_steps controls actual training
+    num_train_epochs: 500   # Increased to ensure training reaches max_steps
     per_device_train_batch_size: 1  # Reduced to 1 due to OOM
     per_device_eval_batch_size: 1
     gradient_accumulation_steps: 8  # Increased to 8 to keep Global Batch Size = 32 (1 * 8 * 4)
@@ -71,7 +72,7 @@ exp:
     # Use standard AdamW optimizer (avoid 8bit for memory training stability)
     optim: adamw_bnb_8bit
 
-    learning_rate: !!float 3e-5  # Slightly higher for fresh training
+    learning_rate: !!float 1e-5  # REDUCED from 3e-5 to 1e-5 for more stable training
     weight_decay: !!float 1e-4   # Standard regularization
     max_grad_norm: 1.0           # Gradient clipping
     adam_beta1: 0.9
@@ -79,8 +80,8 @@ exp:
     adam_epsilon: !!float 1e-8
     lr_scheduler_type: cosine
 
-    max_steps: 360000
-    warmup_steps: 3000           # Longer warmup for fresh memory training
+    max_steps: 20000             # Fine-tune for additional 20k steps
+    warmup_steps: 1000           # Short warmup for fine-tuning
     log_level: info
     log_level_replica: error
 
@@ -106,7 +107,7 @@ exp:
     # Episode-based logging/saving/eval
     logging_episodes: 50
     save_episodes: 512  # 每个epoch保存一次，释放显存
-    eval_episodes: 100
+    eval_episodes: 20
 
     label_names: 
       - action
@@ -118,19 +119,16 @@ exp:
 
     # World Model + PaliGemma Training (Action Expert frozen)
     gen_out_loss_ratio: 1.0
-    freeze_vision_encoder: False
+    freeze_vision_encoder: True
     freeze_gen_expert: False
     train_act_expert_only: False
     train_gen_expert_only: True
     train_state_proj: True
+    freeze_paligemma: True
 
-    image_transforms_enabled: True
-    image_transforms_type:
-      - brightness
-      - contrast
-      - saturation
-      - random_crop
-    image_transforms_max_num_transforms: 3
+    image_transforms_enabled: False
+    image_transforms_type: []
+    image_transforms_max_num_transforms: 0
     image_transforms_random_order: True
 
     und_expert_lr: !!float 1e-5

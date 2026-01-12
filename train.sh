@@ -34,8 +34,9 @@ AUTO_MODE=true
 MAX_GPUS=4
 MASTER_PORT=29500
 # Default: Resume from checkpoint-episode-10000 with VAE decoder unfrozen
-RESUME_CKPT="/mnt/data2/ty/F1-VLA/outputs/memory_from_f1pretrain/checkpoint-episode-4794"
-MEMORY_THRESHOLD=2000  # MB
+# RESUME_CKPT="/mnt/data2/ty/F1-VLA/outputs/memory_from_f1pretrain/checkpoint-episode-4794" 
+RESUME_CKPT=""
+MEMORY_THRESHOLD=1000  # MB
 
 # ============================================
 # Parse arguments

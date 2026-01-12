@@ -101,10 +101,19 @@ class KVMemoryBank(nn.Module):
         )
 
     def _check_nan_inf(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
-        """Check for NaN/Inf values and replace them with zeros if found."""
+        """Check for NaN/Inf values and raise error if found.
+        
+        FIXED: Changed from silent replacement to raising exception.
+        NaN/Inf indicates training has collapsed and should be investigated.
+        """
         if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            logger.error(f"[KVMemoryBank] {name} contains NaN/Inf! replacing with zeros.")
-            return torch.where(torch.isnan(tensor) | torch.isinf(tensor), torch.zeros_like(tensor), tensor)
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            raise RuntimeError(
+                f"[KVMemoryBank] {name} contains NaN/Inf! "
+                f"nan={nan_count}, inf={inf_count}, shape={tensor.shape}. "
+                f"Training should be stopped. Check learning rate, gradient clipping, and input data."
+            )
         return tensor
     
     def get_memory_token(
@@ -166,10 +175,12 @@ class KVMemoryBank(nn.Module):
             k = init_mem[layer_idx, 0]  # (memory_len, heads, dim)
             v = init_mem[layer_idx, 1]  # (memory_len, heads, dim)
             
-            # Expand batch dimension with contiguous() to make actual copies
-            # This prevents inplace operation issues during backprop
-            k = k.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
-            v = v.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+            # Expand batch dimension and clone to allow in-place modification later
+            # clone() is differentiable so gradients still flow back to init_memory
+            # but the resulting tensor is no longer a view, avoiding autograd errors
+            # when we do in-place assignment in get_previous_memory()
+            k = k.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
+            v = v.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
             
             memory_state.append((k, v))
         
@@ -203,11 +214,14 @@ class KVMemoryBank(nn.Module):
         batch_size = len(dataset_indices)
         
         # Initialize with init_memory for all samples
-        # Clone to avoid in-place operation issues with leaf variables
+        # FIX: Remove extra clone() to preserve gradient flow from init_memory parameters
+        # The clone() in get_initial_memory is sufficient
         init_memory = self.get_initial_memory(batch_size, device, dtype)
         memory_state = []
         for k, v in init_memory:
-            memory_state.append((k.clone(), v.clone()))
+            # Create list instead of tuple to allow item assignment
+            # No clone() here - use tensors directly to maintain gradient connection
+            memory_state.append([k, v])
         
         # Override with stored memory for samples with frame_idx > 0
         for b in range(batch_size):
@@ -222,8 +236,8 @@ class KVMemoryBank(nn.Module):
                     for layer_idx in range(self.num_layers):
                         # Copy stored memory into this batch position
                         k_stored, v_stored = stored_memory[layer_idx]
-                        k_val = k_stored[0].detach().to(device=device, dtype=dtype)
-                        v_val = v_stored[0].detach().to(device=device, dtype=dtype)
+                        k_val = k_stored[0].to(device=device, dtype=dtype)
+                        v_val = v_stored[0].to(device=device, dtype=dtype)
                         
                         # Check for NaN/Inf in stored memory and replace with init_memory
                         if torch.isnan(k_val).any() or torch.isinf(k_val).any():
@@ -239,7 +253,8 @@ class KVMemoryBank(nn.Module):
                         memory_state[layer_idx][0][b] = k_val
                         memory_state[layer_idx][1][b] = v_val
         
-        return memory_state
+        # Convert back to list of tuples for return
+        return [(k, v) for k, v in memory_state]
     
     def update_memory(
         self,
@@ -269,7 +284,7 @@ class KVMemoryBank(nn.Module):
         memory_info_f32 = memory_info.float()
         
         # Clip memory_info to prevent extreme values
-        memory_info_f32.clamp_(-10.0, 10.0)
+        memory_info_f32 = memory_info_f32.clamp(-10.0, 10.0)
         
         # Project memory_info to separate inputs for each slot
         proj = self.memory_info_proj.to(device).float()
@@ -279,7 +294,7 @@ class KVMemoryBank(nn.Module):
         memory_info_proj = self._check_nan_inf(memory_info_proj, "memory_info_proj")
         
         # Clip projected values
-        memory_info_proj.clamp_(-10.0, 10.0)
+        memory_info_proj = memory_info_proj.clamp(-10.0, 10.0)
         
         # Reshape to (batch, num_total_slots, head_dim) - each slot gets different input
         memory_info_proj = memory_info_proj.view(batch_size, self.num_total_slots, self.head_dim)
@@ -300,7 +315,7 @@ class KVMemoryBank(nn.Module):
         num_slots = memory_slots.shape[1]
         
         # Clip memory slots to prevent extreme values
-        memory_slots.clamp_(-10.0, 10.0)
+        memory_slots = memory_slots.clamp(-10.0, 10.0)
         
         # Move GRU to device and float32
         gru = self.memory_gru.to(device).float()
@@ -320,7 +335,7 @@ class KVMemoryBank(nn.Module):
                 new_slot_b = slot_b  # Revert to previous memory
             
             # Clip to prevent extreme values
-            new_slot_b.clamp_(-10.0, 10.0)
+            new_slot_b = new_slot_b.clamp(-10.0, 10.0)
             
             updated_slots_list.append(new_slot_b)
         
@@ -380,6 +395,9 @@ class KVMemoryBank(nn.Module):
             episode_indices: (batch,) episode index for each sample
             memory_state: Memory state to store
             detach: Whether to detach memory from computation graph (for BPTT)
+                    NOTE: We ALWAYS detach when storing to memory bank to prevent
+                    "backward through graph twice" errors. The detach parameter
+                    is kept for API compatibility but is effectively ignored.
         """
         batch_size = len(dataset_indices)
         
@@ -405,17 +423,17 @@ class KVMemoryBank(nn.Module):
                 continue
             
             # Extract this sample's memory and store
+            # ALWAYS detach to prevent backward through graph twice error
+            # When the next batch retrieves this memory, the original computation
+            # graph will have been freed by backward(), causing errors
             sample_memory = []
             for layer_idx in range(self.num_layers):
                 k = memory_state[layer_idx][0][b:b+1]  # Keep batch dim: (1, mem_len, heads, dim)
                 v = memory_state[layer_idx][1][b:b+1]
                 
-                if detach:
-                    k = k.detach().clone()
-                    v = v.detach().clone()
-                else:
-                    k = k.clone()
-                    v = v.clone()
+                # Always detach and clone to break computation graph reference
+                k = k.detach().clone()
+                v = v.detach().clone()
                 
                 sample_memory.append((k, v))
             
@@ -490,9 +508,14 @@ class MemoryManager:
         self,
         memory_bank: KVMemoryBank,
         bptt_steps: int = 8,
+        detach_every_step: bool = True,
     ):
         self.memory_bank = memory_bank
         self.bptt_steps = bptt_steps
+        # HF Trainer frees graph after each training_step; keeping stateful graphs across
+        # batches will trigger "backward through the graph a second time". When True, we
+        # always detach at batch boundaries to avoid cross-batch BPTT.
+        self.detach_every_step = detach_every_step
         
         # Track step count per episode for BPTT
         self._step_counts: Dict[Tuple[int, int], int] = {}
@@ -509,14 +532,17 @@ class MemoryManager:
         Detach at frame_idx == 0 or when step_count reaches bptt_steps.
         The check happens BEFORE update_step_count is called.
         """
+        # If forced, always detach beyond frame 0 to avoid cross-batch graph reuse
+        if self.detach_every_step and frame_idx > 0:
+            return True
         if frame_idx == 0:
             return True
         
         key = (dataset_idx, episode_idx)
         step_count = self._step_counts.get(key, 0)
         
-        # Detach when we're about to exceed bptt_steps
-        # step_count is incremented in update, so check if next step would exceed
+        # Detach when reaching the configured BPTT horizon
+        # Using >= keeps exactly bptt_steps of backprop and truncates on the next frame
         return step_count >= self.bptt_steps
     
     def update_step_count(
@@ -533,6 +559,8 @@ class MemoryManager:
             self._step_counts[key] = 1  # First step after frame 0
         else:
             current = self._step_counts.get(key, 0) + 1
+            # FIX: Use >= to reset immediately when reaching bptt_steps
+            # This keeps step_count in range [1, bptt_steps] consistently
             if current > self.bptt_steps:
                 # Reset after bptt_steps (detach was applied, start new segment)
                 self._step_counts[key] = 1

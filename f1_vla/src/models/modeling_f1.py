@@ -115,6 +115,8 @@ class F1FlowMatching(nn.Module):
             memory_len = memory_config.memory_len
             init_std = memory_config.init_std
             bptt_steps = memory_config.bptt_steps
+            # HF Trainer trains per batch; keep graphs from previous batch detached to avoid double backward
+            detach_every_step = True
             
             self.memory_bank = KVMemoryBank(
                 num_layers=num_layers,
@@ -127,6 +129,7 @@ class F1FlowMatching(nn.Module):
             self.memory_manager = MemoryManager(
                 memory_bank=self.memory_bank,
                 bptt_steps=bptt_steps,
+                detach_every_step=detach_every_step,
             )
 
         training_args = kwargs.get("training_args", None)

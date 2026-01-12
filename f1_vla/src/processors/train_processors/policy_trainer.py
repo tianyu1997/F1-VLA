@@ -50,6 +50,7 @@ class PolicyTrainingArguments(TrainingArguments):
 
     freeze_vision_encoder: bool = False
     freeze_gen_expert: bool = False
+    freeze_paligemma: bool = False  # Freeze entire PaliGemma (vision + language model)
     train_act_expert_only: bool = False
     train_gen_expert_only: bool = False
     train_state_proj: bool = True
@@ -134,86 +135,49 @@ class EpisodeProgressCallback(TrainerCallback):
     
     def load_state(self, state: dict):
         """Load state from trainer_state.json when resuming from checkpoint."""
-        # Load total count which is the ground truth for "how much training happened"
+        # Load total count which is the ground truth
         self.total_episode_count = state.get("total_episode_count", 0)
         self.last_log_episode = state.get("last_log_episode", 0)
         self.last_save_episode = state.get("last_save_episode", 0)
         self.last_eval_episode = state.get("last_eval_episode", 0)
         
-        # If we have a valid dataset size, recalculate epoch to handle dataset size changes
-        # This prevents "E20/1000" when we are effectively only at "E8/1000" due to larger dataset
+        # Calculate current epoch based on dataset size
         if self.num_episodes > 0:
-            recal_epoch = self.total_episode_count // self.num_episodes
-            recal_ep_count = self.total_episode_count % self.num_episodes
-            
-            saved_epoch = state.get("current_epoch", 0)
-            
-            # Use recalculated values to be robust to dataset size changes
-            self.current_epoch = recal_epoch
-            self.epoch_episode_count = recal_ep_count
-            
-            if self.current_epoch != saved_epoch:
-                logger.warning(f"[EpisodeProgressCallback] Epoch count mismatch (saved={saved_epoch}, calc={self.current_epoch}). "
-                               f"Implies dataset size changed (current num_episodes={self.num_episodes}). "
-                               f"Using calculated epoch based on total_episodes={self.total_episode_count}.")
+            self.current_epoch = self.total_episode_count // self.num_episodes
+            # We do NOT restore epoch_episode_count or seen_episodes complexly
+            # We simply start counting "seen in this session's epoch" from zero
+            # If HF skips batches correctly, we will just see the remainder of the epoch
+            self.epoch_episode_count = 0 
         else:
             self.current_epoch = state.get("current_epoch", 0)
-            self.epoch_episode_count = state.get("epoch_episode_count", 0)
+            self.epoch_episode_count = 0
 
-        # Reconstruct seen_episodes with dummies to preserve count but allow new ID tracking
-        # We use negative indices for past episodes in this epoch to avoid collision with real positive indices
         self.seen_episodes = set()
-        if self.epoch_episode_count > 0:
-            for i in range(self.epoch_episode_count):
-                self.seen_episodes.add(-(i + 1))
         
         self._restored_from_checkpoint = True
-        logger.info(f"[EpisodeProgressCallback] Restored state: epoch={self.current_epoch}, "
-                   f"total_episodes={self.total_episode_count}, epoch_episodes={self.epoch_episode_count}")
-        
+        logger.info(f"[EpisodeProgressCallback] Restored state: total_episodes={self.total_episode_count} -> calculated epoch={self.current_epoch}")
+    
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize progress bar at training start."""
         from tqdm import tqdm
         self._is_first_epoch_step = True  # Next on_epoch_begin is the first one after start/resume
         
         if state.is_local_process_zero:
-            # Calculate epoch from total_episode_count (more reliable than state.epoch for resume)
-            if not self._restored_from_checkpoint:
-                # Fresh start - calculate from state.epoch if available
-                # If resuming mid-epoch (e.g. 0.99), current_epoch should be -1 so on_epoch_begin makes it 0.
-                if state.epoch:
-                    # state.epoch is a float (e.g. 0.99)
-                    self.current_epoch = int(state.epoch) - 1
-                    
-                    # Estimate episode counts from fractional epoch
-                    if self.num_episodes > 0:
-                        # Improved estimation: uses epoch fraction directly
-                        self.total_episode_count = int(state.epoch * self.num_episodes)
-                        self.epoch_episode_count = self.total_episode_count % self.num_episodes
-                        
-                        self.last_log_episode = self.total_episode_count
-                        self.last_save_episode = self.total_episode_count
-                        self.last_eval_episode = self.total_episode_count
-                        
-                        # Fix: Populate seen_episodes with dummies so correct length is maintained
-                        # valid episode indices are >= 0, so we use negative dummies
-                        if self.epoch_episode_count > 0:
-                            for i in range(self.epoch_episode_count):
-                                self.seen_episodes.add(-(i + 1))
-                        
-                        logger.info(f"[EpisodeProgressCallback] Estimated from state.epoch={state.epoch:.4f}: "
-                                   f"current_epoch={self.current_epoch}, "
-                                   f"total_episodes={self.total_episode_count}, "
-                                   f"epoch_episodes={self.epoch_episode_count} "
-                                   f"(pre-filled {len(self.seen_episodes)} seen_episodes)")
+            # If fresh start (not restored), estimate from state.epoch
+            if not self._restored_from_checkpoint and state.epoch:
+                 self.total_episode_count = int(state.epoch * self.num_episodes)
+                 self.current_epoch = int(state.epoch)
+            
+            # Recalculate epoch one last time to be sure
+            if self.num_episodes > 0:
+                self.current_epoch = self.total_episode_count // self.num_episodes
+            
+            # Description
+            desc = f"E{self.current_epoch + 1}"
             
             # Initial progress within current epoch
-            initial_progress = self.epoch_episode_count
+            initial_progress = 0 # We always start bar from 0 for the "remainder" or "new epoch"
             
-            # Show epoch and episode progress (compact format)
-            desc = f"E{self.current_epoch + 2}/{self.num_epochs}" # Display next epoch since on_epoch_begin will increment
-            # Wait, pbar description is updated in on_epoch_begin anyway.
-            # Use num_episodes as total (per epoch)
             self.pbar = tqdm(
                 total=self.num_episodes,
                 initial=initial_progress,
@@ -221,49 +185,25 @@ class EpisodeProgressCallback(TrainerCallback):
                 dynamic_ncols=True,
                 leave=True,
                 unit="ep",
-                ncols=80,  # Fixed width for cleaner output
-                bar_format='{desc}|{bar:20}|{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]'
+                ncols=80,
+                bar_format='{desc}|{bar:20}|{n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]'
             )
             self.pbar.set_postfix_str('loss=0 acc=0%')
     
     def on_epoch_begin(self, args, state, control, **kwargs):
-        """Reset episode counter at epoch start.
+        """Reset episode counter at epoch start."""
+        # Update current epoch based on absolute total count
+        if self.num_episodes > 0:
+            self.current_epoch = self.total_episode_count // self.num_episodes
         
-        Note: We track epochs ourselves instead of relying on state.epoch 
-        because HuggingFace's state.epoch calculation can differ after resume.
-        """
-        # Always reset at epoch boundary provided by Trainer
-        # This handles cases where epoch_episode_count didn't exactly match num_episodes
-        # (e.g., due to drop_last, resuming mid-epoch, etc.)
-        self.current_epoch += 1
-        
-        # If this is the FIRST epoch begin call after resume, AND we have populated episodes,
-        # we check if we need to skip the reset (mid-epoch resume) or enforce it (epoch boundary).
-        if self._is_first_epoch_step:
-            self._is_first_epoch_step = False
-            # Check if we are really mid-epoch
-            is_mid_epoch = self.epoch_episode_count > 0 and self.epoch_episode_count < self.num_episodes
-            
-            if is_mid_epoch:
-                logger.info(f"[EpisodeProgressCallback] Resuming mid-epoch {self.current_epoch}. Skipping reset. "
-                           f"Already seen {self.epoch_episode_count} episodes.")
-                if self.pbar is not None and state.is_local_process_zero:
-                    self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
-                return
-            elif self.epoch_episode_count >= self.num_episodes:
-                 logger.info(f"[EpisodeProgressCallback] Resuming at end of epoch (count={self.epoch_episode_count}). Enforcing reset.")
-
-        # Log if we are correcting a count mismatch
-        if self.epoch_episode_count != self.num_episodes and self.epoch_episode_count > 0:
-            logger.warning(f"[EpisodeProgressCallback] Epoch {self.current_epoch} starting but previous epoch count was {self.epoch_episode_count}/{self.num_episodes}. Forcing reset.")
-
         self.seen_episodes.clear()
         self.epoch_episode_count = 0
+        
         if self.pbar is not None and state.is_local_process_zero:
             self.pbar.reset()
-            self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+            self.pbar.set_description(f"E{self.current_epoch + 1}")
         
-        # Clear memory bank at epoch boundary to prevent OOM
+        # Clear memory bank at epoch boundary
         if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
             model = self.policy.model
             if hasattr(model, 'memory_bank'):
@@ -608,14 +548,102 @@ class PolicyTrainer(Trainer):
             # Get all episode indices in the current batch
             episode_indices = inputs['episode_idx'].cpu().tolist()
             self.episode_progress_callback.update_episode(episode_indices)
+
+        # Chunked BPTT path: sampler已按 bptt_steps 打包连续帧（batch 维度=时间维度）
+        chunk_size = 1
+        if hasattr(self.policy.config, 'memory_config') and self.policy.config.memory_config:
+            chunk_size = getattr(self.policy.config.memory_config, 'bptt_steps', 1) or 1
+        if (self.use_memory and self.sequential_sampler is not None and chunk_size > 1
+                and isinstance(inputs, dict) and len(inputs) > 0):
+            batch_dim = list(inputs.values())[0].shape[0] if isinstance(list(inputs.values())[0], torch.Tensor) else 0
+            if batch_dim >= chunk_size:
+                return self._compute_loss_chunked(model, inputs, chunk_size, return_outputs)
         
         # apply image transforms to the inputs of understanding expert
-        if self.image_transforms is not None:
-            for key, value in inputs.items():
-                if "history" in key or "mask" in key:
-                    continue
-                if key.startswith("observation.images"):
-                    inputs[key] = self.image_transforms(value)
+        # Use MANUAL video transforms for consistency across time dimension
+        if (self.image_transforms is not None and 
+            hasattr(self.args, 'image_transforms_enabled') and 
+            self.args.image_transforms_enabled and 
+            hasattr(self.args, 'image_transforms_type')):
+            # Group keys by camera to handle temporal consistency
+            camera_groups = {}
+            for key in inputs.keys():
+                if key.startswith("observation.images.") and "mask" not in key:
+                    # Extract base name: remove_history suffix
+                    base_name = key.replace("_history", "")
+                    if base_name not in camera_groups:
+                        camera_groups[base_name] = []
+                    camera_groups[base_name].append(key)
+            
+            # Apply transforms per camera group
+            batch_size = list(inputs.values())[0].shape[0] if inputs else 0
+            
+            for base_name, keys in camera_groups.items():
+                # Pre-generate augmentation parameters for the whole batch for this camera
+                # This ensures consistent crop/brightness across history and current frame
+                batch_crops = []
+                batch_brights = []
+                
+                do_crop = 'random_crop' in self.args.image_transforms_type
+                do_bright = 'brightness' in self.args.image_transforms_type
+                
+                # Check dimensions from the first tensor in the group
+                ref_tensor = inputs[keys[0]]
+                H, W = ref_tensor.shape[-2:]
+                tgt_size = 224
+                
+                for b in range(batch_size):
+                    # Crop params
+                    if do_crop and H > tgt_size and W > tgt_size:
+                        top = torch.randint(0, H - tgt_size + 1, (1,)).item()
+                        left = torch.randint(0, W - tgt_size + 1, (1,)).item()
+                        batch_crops.append((top, left, tgt_size, tgt_size))
+                    else:
+                        # Center crop or Resize fallback if RandomCrop disabled or image small
+                        # Default to Center Crop for validation consistency if no random crop
+                        if H > tgt_size and W > tgt_size:
+                            top = (H - tgt_size) // 2
+                            left = (W - tgt_size) // 2
+                            batch_crops.append((top, left, tgt_size, tgt_size))
+                        else:
+                            batch_crops.append(None) # No crop needed/possible
+                            
+                    # Brightness params
+                    if do_bright:
+                        # factor in [0.8, 1.2]
+                        batch_brights.append(0.8 + 0.4 * torch.rand(1).item())
+                    else:
+                        batch_brights.append(1.0)
+                
+                # Apply parameters to all keys for this camera
+                for key in keys:
+                    src_tensor = inputs[key] # (B, ..., H, W)
+                    # Create output tensor with target size 224
+                    # Preserve all dimensions except last two
+                    out_shape = list(src_tensor.shape)
+                    out_shape[-2] = tgt_size
+                    out_shape[-1] = tgt_size
+                    out_tensor = torch.empty(out_shape, device=src_tensor.device, dtype=src_tensor.dtype)
+                    
+                    for b in range(batch_size):
+                        # Extract image (or video)
+                        img = src_tensor[b] # (..., H, W)
+                        
+                        # Apply Brightness
+                        if batch_brights[b] != 1.0:
+                            img = img * batch_brights[b]
+                            # Clamp? Usually fine for NN, but clean data implies 0-1
+                            # img = torch.clamp(img, 0., 1.) 
+                        
+                        # Apply Crop
+                        if batch_crops[b] is not None:
+                            t, l, h, w = batch_crops[b]
+                            img = img[..., t:t+h, l:l+w]
+                        
+                        out_tensor[b] = img
+                    
+                    # Update inputs
+                    inputs[key] = out_tensor
 
         outputs = self.policy.forward_with_world_model(
             inputs, 
@@ -713,6 +741,156 @@ class PolicyTrainer(Trainer):
                 logger.warning("[Eval] eval_dataset is None, skipping video generation")
             self.episode_progress_callback.mark_evaled()
 
+        return (loss, outputs) if return_outputs else loss
+
+    def _compute_loss_chunked(self, model, inputs, chunk_size: int, return_outputs: bool = False):
+        """在单个 training step 内展开 chunk_size 帧，实现跨时间步 BPTT。
+
+        - batch 维度被视为时间维度，长度为 chunk_size（来自 sampler）。
+        - memory_kv 在窗口内保持带梯度更新，窗口结束后才 detach 写回 memory bank。
+        - 使用 Truncated BPTT：只保留最近 k 步的梯度以控制显存。
+        
+        NOTE: 当前实现假设 per_device_train_batch_size=1，即 batch 维度仅包含
+              单个 episode 的连续帧。若 batch_size>1，sampler 会混合多个 episode。
+        """
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        time_len = list(inputs.values())[0].shape[0] if inputs else 0
+        effective_steps = min(time_len, chunk_size)
+        
+        # 验证：所有帧属于同一个 episode（仅支持 batch_size=1）
+        if "episode_idx" in inputs and isinstance(inputs["episode_idx"], torch.Tensor):
+            unique_eps = inputs["episode_idx"].unique()
+            if len(unique_eps) > 1:
+                logger.warning(
+                    f"[_compute_loss_chunked] Multiple episodes in batch ({len(unique_eps)}). "
+                    "Chunked BPTT assumes batch_size=1. Falling back to standard compute_loss."
+                )
+                return self._fallback_compute_loss(model, inputs, return_outputs)
+
+        memory_manager = self.policy.model.memory_manager
+        memory_bank = self.policy.model.memory_bank
+
+        # 初始化 memory（从 bank 取，已 detach）
+        frame0 = {k: (v[0:1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+        memory_kv, memory_token, _ = memory_manager.process_batch(frame0, device, dtype)
+
+        # Truncated BPTT: 只保留最近 k 步的完整梯度
+        # 更早的步只保留 loss 用于平均，但 memory 会被 detach
+        # 从 config 读取 k_bptt，默认为 2
+        k_bptt_config = 2
+        if hasattr(self.policy.config, 'memory_config') and self.policy.config.memory_config:
+            k_bptt_config = getattr(self.policy.config.memory_config, 'k_bptt', 2) or 2
+        k_bptt = min(k_bptt_config, effective_steps)
+        
+        losses = []
+        final_wm_loss = None
+        final_wm_acc = None
+        final_action_loss = None
+
+        for t in range(effective_steps):
+            batch_t = {k: (v[t:t+1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+            
+            out_t = self.policy.forward_with_world_model(
+                batch_t,
+                cur_n_obs_img_steps=self.cur_n_obs_img_steps,
+                cur_n_pred_img_steps=self.cur_n_pred_img_steps,
+                train_gen_expert_only=self.args.train_gen_expert_only,
+                gen_out_loss_ratio=self.args.gen_out_loss_ratio,
+                memory_kv=memory_kv,
+                memory_token=memory_token,
+                return_memory_info=True,
+                skip_memory_store=True,
+            )
+            
+            # 只有最后 k 步保留完整 loss 梯度
+            if t >= effective_steps - k_bptt:
+                losses.append(out_t["loss"])
+            else:
+                # 早期步：只累积 loss 值，不保留梯度（减少计算图）
+                losses.append(out_t["loss"].detach())
+            
+            # 记录最后一步的指标
+            if t == effective_steps - 1:
+                final_wm_loss = out_t.get("wm_loss")
+                final_wm_acc = out_t.get("wm_acc_mean")
+                final_action_loss = out_t.get("action_loss")
+
+            # 更新 memory
+            memory_info = out_t.get("memory_info")
+            if memory_info is not None:
+                # Truncated BPTT: 只有最近 k 步保持 memory 梯度
+                if t < effective_steps - k_bptt:
+                    # 早期步：detach memory 以截断梯度链
+                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
+                    memory_kv = [(k.detach(), v.detach()) for k, v in memory_kv]
+                else:
+                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
+
+        loss = torch.stack(losses).mean()
+        outputs = {
+            "loss": loss,
+            "wm_loss": final_wm_loss if final_wm_loss is not None else torch.tensor(0.0, device=device),
+            "wm_acc_mean": final_wm_acc if final_wm_acc is not None else torch.tensor(0.0, device=device),
+            "action_loss": final_action_loss if final_action_loss is not None else torch.tensor(0.0, device=device),
+        }
+
+        # 窗口结束：detach 后写回 bank，并重置 step_count，确保下一窗口重新累计
+        ds_idx = inputs.get("dataset_idx", frame0["dataset_idx"])
+        ep_idx = inputs.get("episode_idx", frame0["episode_idx"])
+        frame_idx = inputs.get("frame_idx", frame0["frame_idx"])
+        tail_batch = {
+            "dataset_idx": ds_idx[effective_steps-1:effective_steps],
+            "episode_idx": ep_idx[effective_steps-1:effective_steps],
+            "frame_idx": frame_idx[effective_steps-1:effective_steps],
+        }
+        memory_manager.store_updated_memory(tail_batch, memory_kv, detach=True)
+        for b in range(len(tail_batch["dataset_idx"])):
+            key = (tail_batch["dataset_idx"][b].item(), tail_batch["episode_idx"][b].item())
+            memory_manager._step_counts[key] = 0
+
+        # 进度条实时指标
+        if hasattr(self, 'episode_progress_callback') and self.state.is_local_process_zero:
+            self.episode_progress_callback.update_metrics(
+                loss=loss.detach().cpu().item(),
+                wm_loss=outputs["wm_loss"].detach().cpu().item(),
+                wm_acc=outputs["wm_acc_mean"].detach().cpu().item(),
+                action_loss=outputs["action_loss"].detach().cpu().item(),
+            )
+
+        return (loss, outputs) if return_outputs else loss
+
+    def _fallback_compute_loss(self, model, inputs, return_outputs: bool = False):
+        """当 batch 包含多个 episode 时的回退路径，逐帧处理。"""
+        device = next(model.parameters()).device
+        batch_size = list(inputs.values())[0].shape[0]
+        
+        losses = []
+        wm_losses = []
+        wm_accs = []
+        action_losses = []
+        
+        for t in range(batch_size):
+            batch_t = {k: (v[t:t+1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+            out_t = self.policy.forward_with_world_model(
+                batch_t,
+                cur_n_obs_img_steps=self.cur_n_obs_img_steps,
+                cur_n_pred_img_steps=self.cur_n_pred_img_steps,
+                train_gen_expert_only=self.args.train_gen_expert_only,
+                gen_out_loss_ratio=self.args.gen_out_loss_ratio,
+            )
+            losses.append(out_t["loss"])
+            wm_losses.append(out_t.get("wm_loss", torch.tensor(0.0, device=device)))
+            wm_accs.append(out_t.get("wm_acc_mean", torch.tensor(0.0, device=device)))
+            action_losses.append(out_t.get("action_loss", torch.tensor(0.0, device=device)))
+        
+        loss = torch.stack(losses).mean()
+        outputs = {
+            "loss": loss,
+            "wm_loss": torch.stack(wm_losses).mean(),
+            "wm_acc_mean": torch.stack(wm_accs).mean(),
+            "action_loss": torch.stack(action_losses).mean(),
+        }
         return (loss, outputs) if return_outputs else loss
     
     @torch.no_grad()

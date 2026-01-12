@@ -56,12 +56,18 @@ class F1_VLA(nn.Module):
         pn = config.gen_expert_config.pn
         patch_nums = tuple(map(int, pn.replace('-', '_').split('_')))
 
+        # VAE trainability is controlled by VQVAE's own flags.
+        # Do NOT forcibly freeze all params here; it breaks configurations that enable decoder training.
+        vae_test_mode = getattr(config, "vae_test_mode", getattr(config.gen_expert_config.vae, "test_mode", True))
+        vae_freeze_encoder = getattr(config, "vae_freeze_encoder", getattr(config.gen_expert_config.vae, "freeze_encoder", True))
+
         self.vae = VQVAE(
             vocab_size=config.gen_expert_config.vae.vocab_size, 
             z_channels=config.gen_expert_config.vae.z_channels, 
             ch=config.gen_expert_config.vae.ch, 
             dropout=getattr(config.gen_expert_config.vae, 'dropout', 0.0),
-            test_mode=config.gen_expert_config.vae.test_mode, 
+            test_mode=vae_test_mode,
+            freeze_encoder=vae_freeze_encoder,
             share_quant_resi=config.gen_expert_config.vae.share_quant_resi, 
             v_patch_nums=patch_nums
         )
@@ -72,14 +78,13 @@ class F1_VLA(nn.Module):
             del vae_ckpt
         # Move VAE to target device
         self.vae = self.vae.to(device)
-        for param in self.vae.parameters():
-            param.requires_grad = False
 
         self.use_only_3rd_hist_image = True
         self.last_l = patch_nums[-1] * patch_nums[-1]
 
         # Add label smoothing to prevent overfitting on discrete VAE tokens
-        self.gen_loss_fct = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.1)
+        # FIXED: Reduced from 0.1 to 0.02 for 4096-class VAE tokens (less aggressive regularization)
+        self.gen_loss_fct = nn.CrossEntropyLoss(reduction="none", label_smoothing=0)
 
         self.model = F1FlowMatching(config, patch_nums, self.vae, **kwargs)
 
@@ -432,8 +437,15 @@ class F1_VLA(nn.Module):
             (memory_kv, memory_token, should_detach) if memory enabled
             (None, None, False) if memory disabled
             
-        Note: memory_kv is detached when should_detach=True for BPTT.
-              With per-sample detach, we detach if ANY sample needs detach.
+        Gradient flow design:
+        - frame_idx == 0: Uses init_memory (nn.Parameter), keeps gradients for learning
+        - frame_idx > 0: Uses stored memory from memory bank (already detached in store_memory)
+        
+        The should_detach flag controls BPTT truncation - when True, gradients won't flow
+        back to previous time steps through the memory.
+        
+        Note: Memory from bank is already detached (done in store_memory), so only
+        init_memory contributes gradients. This is the correct BPTT behavior.
         """
         if not self.config.use_memory or self.model.memory_manager is None:
             return None, None, False
@@ -444,14 +456,14 @@ class F1_VLA(nn.Module):
         memory_kv, memory_token, should_detach_list = self.model.memory_manager.process_batch(batch, device, dtype)
         
         # Detach if ANY sample needs detach (conservative for BPTT correctness)
-        # This may detach more than necessary, but ensures gradient flow is correct
+        # This controls whether we detach AFTER forward, before storing back
         should_detach = any(should_detach_list)
         
-        # Detach memory for BPTT truncation
-        if should_detach and memory_kv is not None:
-            memory_kv = [
-                (k.detach(), v.detach()) for k, v in memory_kv
-            ]
+        # Note: We do NOT detach memory_kv here anymore because:
+        # 1. Memory from bank is already detached (in store_memory)
+        # 2. init_memory (used at frame_idx==0) should keep gradients for learning
+        # 3. The "backward through graph twice" error was caused by store_memory
+        #    not properly detaching, which is now fixed
         
         return memory_kv, memory_token, should_detach
     
@@ -477,6 +489,10 @@ class F1_VLA(nn.Module):
         train_gen_expert_only: bool = False, 
         gen_out_loss_ratio: float = 0.1,
         return_images: bool = False,  # Return gt/pred images for eval visualization
+        return_memory_info: bool = False,  # Return memory_info for custom BPTT handling
+        skip_memory_store: bool = False,   # Skip default store_updated_memory (for chunked BPTT)
+        memory_kv: list[tuple[Tensor, Tensor]] | None = None,
+        memory_token: Tensor | None = None,
     ) -> dict[str, Tensor]:
 
         #########################################################
@@ -526,7 +542,24 @@ class F1_VLA(nn.Module):
         #########################################################
         # Get memory state if enabled
         #########################################################
-        memory_kv, memory_token, should_detach = self._get_memory_state(batch)
+        # 允许外部传入 memory 以支持 chunked BPTT
+        if memory_kv is None and memory_token is None:
+            # 完全由内部获取 memory
+            memory_kv, memory_token, should_detach = self._get_memory_state(batch)
+        elif memory_kv is not None and memory_token is not None:
+            # 外部传入了完整的 memory 状态
+            should_detach = False
+        else:
+            # 部分传入的情况，补全缺失的部分
+            if self.config.use_memory and self.model.memory_manager is not None:
+                device = batch["observation.state"].device
+                dtype = next(self.model.parameters()).dtype
+                if memory_kv is None:
+                    memory_kv, _, _ = self.model.memory_manager.process_batch(batch, device, dtype)
+                if memory_token is None:
+                    batch_size = batch["observation.state"].shape[0]
+                    memory_token = self.model.memory_bank.get_memory_token(batch_size, device, dtype)
+            should_detach = False
 
         #########################################################
         # Forward and compute the loss
@@ -615,8 +648,8 @@ class F1_VLA(nn.Module):
         if frame_indices is not None and warmup_frames > 0:
             # Linear warmup from warmup_min_weight to 1.0 over warmup_frames
             # weight = warmup_min_weight + (1 - warmup_min_weight) * min(frame_idx / warmup_frames, 1.0)
-            frame_indices = frame_indices.float()
-            loss_weights = warmup_min_weight + (1.0 - warmup_min_weight) * torch.clamp(frame_indices / warmup_frames, max=1.0)
+            frame_indices_float = frame_indices.float()  # Don't overwrite original frame_indices
+            loss_weights = warmup_min_weight + (1.0 - warmup_min_weight) * torch.clamp(frame_indices_float / warmup_frames, max=1.0)
             loss_weights = loss_weights.view(B, 1).expand_as(gen_loss_ce)  # [B, gen_token_len]
             gen_loss_ce_weighted = (gen_loss_ce * loss_weights).mean()
             avg_loss_weight = loss_weights[:, 0].mean()  # Average weight across batch
@@ -626,6 +659,19 @@ class F1_VLA(nn.Module):
         
         # Final gen_loss with pixel loss
         gen_loss = gen_loss_ce_weighted + pixel_loss_weight * pixel_loss
+
+        # Update memory with GRU and store to memory bank
+        if self.config.use_memory and self.model.memory_manager is not None and not skip_memory_store:
+            dataset_indices = batch.get("dataset_idx")
+            episode_indices = batch.get("episode_idx")
+            frame_indices = batch.get("frame_idx")
+            
+            if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
+                # Update memory content using GRU if memory_info is available
+                if memory_info is not None and memory_kv is not None:
+                    updated_memory = self.model.memory_bank.update_memory(memory_kv, memory_info)
+                    # store_updated_memory will handle both storing and step count update
+                    self.model.memory_manager.store_updated_memory(batch, updated_memory, detach=should_detach)
 
         loss_dict = {}
         # Store past_key_values for memory distillation (student needs gradients)
@@ -641,26 +687,6 @@ class F1_VLA(nn.Module):
             loss_dict["loss"] = gen_loss
             loss_dict["wm_loss"] = gen_loss
             
-            # Update memory with GRU and store to memory bank
-            if self.config.use_memory and self.model.memory_manager is not None:
-                dataset_indices = batch.get("dataset_idx")
-                episode_indices = batch.get("episode_idx")
-                frame_indices = batch.get("frame_idx")
-                
-                if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
-                    # Update memory content using GRU if memory_info is available
-                    if memory_info is not None and memory_kv is not None:
-                        updated_memory = self.model.memory_bank.update_memory(memory_kv, memory_info)
-                        self._update_memory_state(batch, updated_memory, should_detach)
-                    
-                    # Update step count for BPTT tracking
-                    for b in range(len(dataset_indices)):
-                        self.model.memory_manager.update_step_count(
-                            dataset_indices[b].item(),
-                            episode_indices[b].item(),
-                            frame_indices[b].item()
-                        )
-            
             # Generate images for eval visualization if requested (for gen_expert_only mode)
             if return_images:
                 # Get predicted indices from logits
@@ -673,6 +699,10 @@ class F1_VLA(nn.Module):
                 
                 loss_dict["wm_gt_img"] = gt_images
                 loss_dict["wm_pred_img"] = pred_images
+            
+            # Add memory_info for chunked BPTT
+            if return_memory_info:
+                loss_dict["memory_info"] = memory_info
             
             return loss_dict
 
@@ -695,44 +725,39 @@ class F1_VLA(nn.Module):
         loss_dict["loss"] = loss_dict["action_loss"] + gen_out_loss_ratio * loss_dict["wm_loss"]
 
         #########################################################
-        # Update memory with GRU and store to memory bank
-        #########################################################
-        if self.config.use_memory and self.model.memory_manager is not None:
-            dataset_indices = batch.get("dataset_idx")
-            episode_indices = batch.get("episode_idx")
-            frame_indices = batch.get("frame_idx")
-            
-            if dataset_indices is not None and episode_indices is not None and frame_indices is not None:
-                # Update memory content using GRU if memory_info is available
-                if memory_info is not None and memory_kv is not None:
-                    # Use GRU to update memory based on memory_info
-                    updated_memory = self.model.memory_bank.update_memory(memory_kv, memory_info)
-                    # Store updated memory to memory bank
-                    self._update_memory_state(batch, updated_memory, should_detach)
-                
-                # Update step count for BPTT tracking
-                for b in range(len(dataset_indices)):
-                    self.model.memory_manager.update_step_count(
-                        dataset_indices[b].item(),
-                        episode_indices[b].item(),
-                        frame_indices[b].item()
-                    )
-
-        #########################################################
         # Generate images for eval visualization if requested
         #########################################################
         if return_images:
             # Get predicted indices from logits
             pred_indices = gen_logits.argmax(dim=-1)  # [B, gen_token_len]
             
-            # Decode ground truth images
-            gt_images = self._decode_indices_to_images(gt_world_model_indices, B, cur_n_pred_img_steps)
+            # For GT images: use ORIGINAL images from batch, NOT VAE reconstructions
+            # This avoids flickering caused by VAE reconstruction errors
+            if hasattr(self.config, 'camera_config') and self.config.camera_config:
+                wm_target_key = self.config.camera_config.get('world_model_target_key',
+                    "observation.images.image0_target")
+            else:
+                wm_target_key = "observation.images.image0_target"
+            
+            # Get original target images [B, n_pred, C, H, W] in range [0, 1]
+            gt_images_original = batch.get(wm_target_key)
+            
+            if gt_images_original is not None:
+                # Resize if needed (from 256x256 to match VAE output)
+                # Already in [0, 1] range from dataset
+                gt_images = gt_images_original
+            else:
+                # Fallback: decode from indices if original not available
+                gt_images = self._decode_indices_to_images(gt_world_model_indices, B, cur_n_pred_img_steps)
+            
             # Decode predicted images
             pred_images = self._decode_indices_to_images(pred_indices, B, cur_n_pred_img_steps)
             
             loss_dict["wm_gt_img"] = gt_images
             loss_dict["wm_pred_img"] = pred_images
 
+        if return_memory_info:
+            loss_dict["memory_info"] = memory_info
         return loss_dict
     
     def _decode_indices_to_images(self, indices: Tensor, batch_size: int, num_frames: int) -> Tensor:

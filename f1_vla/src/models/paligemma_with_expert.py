@@ -168,18 +168,28 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         train_act_expert_only=False,
         train_gen_expert_only=False,
         trainable_actors=None,  # List of actor names to train; None means train active actor
+        freeze_paligemma=False,  # Freeze entire PaliGemma (vision + language model)
     ):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_act_expert_only = train_act_expert_only
         self.train_gen_expert_only = train_gen_expert_only
         self.freeze_gen_expert = freeze_gen_expert
+        self.freeze_paligemma = freeze_paligemma
 
         logger.info(f"Freeze vision encoder: {freeze_vision_encoder}")
         logger.info(f"Freeze gen expert: {freeze_gen_expert}")
         logger.info(f"Train act expert only: {train_act_expert_only}")
         logger.info(f"Train gen expert only: {train_gen_expert_only}")
+        logger.info(f"Freeze PaliGemma: {freeze_paligemma}")
 
-        if freeze_vision_encoder:
+        # Freeze entire PaliGemma (overrides freeze_vision_encoder)
+        if freeze_paligemma:
+            self.paligemma.eval()
+            for params in self.paligemma.parameters():
+                params.requires_grad = False
+            logger.info("Frozen entire PaliGemma (vision + language model)")
+        elif freeze_vision_encoder:
+            # Only freeze vision encoder
             self.paligemma.vision_tower.eval()
             for params in self.paligemma.vision_tower.parameters():
                 params.requires_grad = False
@@ -219,14 +229,17 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
     def train(self, mode: bool = True):
         super().train(mode)
 
-        if self.freeze_vision_encoder:
+        if getattr(self, 'freeze_paligemma', False):
+            self.paligemma.eval()
+        elif self.freeze_vision_encoder:
             self.paligemma.vision_tower.eval()
 
         if self.train_act_expert_only:
             self.paligemma.eval()
 
         if self.train_gen_expert_only:
-            # PaliGemma stays in train mode (unfrozen)
+            # If freeze_paligemma, PaliGemma stays frozen
+            # Otherwise PaliGemma stays in train mode (unfrozen)
             # Keep all action experts in eval mode
             for expert in self.gemma_experts.values():
                 expert.eval()
