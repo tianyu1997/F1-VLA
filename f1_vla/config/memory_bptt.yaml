@@ -19,7 +19,7 @@ dataset:
     - 0.25
     - 0.25
     
-  n_obs_img_steps: 2
+  n_obs_img_steps: 4
   n_pred_img_steps: 1
   chunk_size: 4
 
@@ -42,11 +42,11 @@ exp:
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
   memory_config:
-    memory_len: 8     # Reduced for memory efficiency
+    memory_len: 16     # Reduced for memory efficiency
     # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
     # - 前 n_obs_img_steps 帧: 历史上下文，用于 memory warmup
     # - 后 k_bptt 帧: 计算梯度的有效帧
-    k_bptt: 1         # Reduced for memory efficiency (window=3)
+    k_bptt: 2         # Reduced for memory efficiency (window=6)
     init_std: 0.02    # Memory parameter initialization std
     tokenizer_max_length: 256  # Reduced for memory efficiency
 
@@ -162,11 +162,11 @@ policy:
 
   # Loss warmup已移除 - 所有帧平等训练
 
-  temporal_conv_kernel_size: 2
-  temporal_conv_stride: 2
+  temporal_conv_kernel_size: 4
+  temporal_conv_stride: 4
   vocab_size: 4096
   vae_dim: 32
   num_resolutions: 10
 
   resize_imgs_with_padding: "(224, 224)"
-  attention_implementation: sdpa
+  attention_implementation: flash_attention_2
