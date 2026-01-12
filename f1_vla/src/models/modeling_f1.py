@@ -103,12 +103,15 @@ class F1FlowMatching(nn.Module):
         if self.config.use_memory:
             from f1_vla.src.models.memory import KVMemoryBank, MemoryManager
             
-            # Get model dimensions from PaliGemma config
-            text_config = config.und_expert_config.text_config
-            num_layers = text_config.num_hidden_layers
-            num_kv_heads = text_config.num_key_value_heads
-            head_dim = text_config.head_dim
-            hidden_size = text_config.hidden_size
+            # Get model dimensions from World Model Expert config (NOT PaliGemma)
+            # Memory module operates on gen_expert: memory_token is prepended to gen_expert input,
+            # and memory_info is extracted from gen_expert output. This ensures memory has 
+            # gradient flow when PaliGemma is frozen.
+            gen_expert_config = config.gen_expert_config
+            num_layers = gen_expert_config.num_hidden_layers
+            num_kv_heads = gen_expert_config.num_key_value_heads
+            head_dim = gen_expert_config.head_dim
+            hidden_size = gen_expert_config.hidden_size
             
             # Get memory config
             memory_config = config.memory_config
@@ -143,18 +146,22 @@ class F1FlowMatching(nn.Module):
             self.train_act_expert_only = False
             self.train_gen_expert_only = False
             self.train_state_proj = True
+            self.freeze_paligemma = False
         else:
             self.freeze_vision_encoder = training_args.freeze_vision_encoder
             self.train_act_expert_only = training_args.train_act_expert_only
             self.train_gen_expert_only = training_args.train_gen_expert_only
             self.train_state_proj = training_args.train_state_proj
             self.freeze_gen_expert = training_args.freeze_gen_expert
+            # Propagate freeze_paligemma if provided in training args (defaults False)
+            self.freeze_paligemma = getattr(training_args, "freeze_paligemma", False)
 
         self.paligemma_with_expert.set_requires_grad(
             freeze_vision_encoder=self.freeze_vision_encoder,
             freeze_gen_expert=self.freeze_gen_expert,
             train_act_expert_only=self.train_act_expert_only,
             train_gen_expert_only=self.train_gen_expert_only,
+            freeze_paligemma=self.freeze_paligemma,
         )
         for params in self.state_proj.parameters():
             params.requires_grad = self.train_state_proj
@@ -455,19 +462,20 @@ class F1FlowMatching(nn.Module):
                 cfg_emb = self.cfg_embedding.expand(batch_size, seq_len, -1)
                 und_embs = torch.where(mask_flags, cfg_emb, und_embs)
 
-            # Append memory token to PaliGemma input (und_embs) at the end
-            # This allows the memory token to be processed by PaliGemma's full attention
-            # Memory info will be extracted from pali_out at the last position
+            # Append memory token to World Model Expert input (gen_embs) at the BEGINNING
+            # This ensures memory_info comes from trainable gen_expert, not frozen PaliGemma
             memory_info = None
-            memory_token_in_pali = False
+            memory_token_in_gen = False
             if memory_token is not None:
-                mem_tok = memory_token.expand(batch_size, -1, -1).to(dtype=und_embs.dtype, device=und_embs.device)
-                und_embs = torch.cat([und_embs, mem_tok], dim=1)  # Append to end
-                mem_tok_pad = torch.ones(batch_size, 1, dtype=und_pad_masks.dtype, device=und_pad_masks.device)
-                mem_tok_att = torch.zeros(batch_size, 1, dtype=und_att_masks.dtype, device=und_att_masks.device)  # Full attention
-                und_pad_masks = torch.cat([und_pad_masks, mem_tok_pad], dim=1)
-                und_att_masks = torch.cat([und_att_masks, mem_tok_att], dim=1)
-                memory_token_in_pali = True
+                # Project memory token from PaliGemma hidden_size to WM expert hidden_size
+                mem_tok = memory_token.expand(batch_size, -1, -1).to(dtype=gen_embs.dtype, device=gen_embs.device)
+                # Prepend to gen_embs so it attends to all PaliGemma context
+                gen_embs = torch.cat([mem_tok, gen_embs], dim=1)  # Prepend to beginning
+                mem_tok_pad = torch.ones(batch_size, 1, dtype=gen_pad_masks.dtype, device=gen_pad_masks.device)
+                mem_tok_att = torch.zeros(batch_size, 1, dtype=gen_att_masks.dtype, device=gen_att_masks.device)  # Full attention to prefix
+                gen_pad_masks = torch.cat([mem_tok_pad, gen_pad_masks], dim=1)
+                gen_att_masks = torch.cat([mem_tok_att, gen_att_masks], dim=1)
+                memory_token_in_gen = True
 
             pad_masks = torch.cat([und_pad_masks, gen_pad_masks], dim=1)
             att_masks = torch.cat([und_att_masks, gen_att_masks], dim=1)
@@ -486,11 +494,12 @@ class F1FlowMatching(nn.Module):
                 experts_only_memory=False,  # Allow paligemma to access memory KV as well
             )
             
-            # Extract memory_info from memory token position (last position of pali_out)
-            # PaliGemma processes the memory token with full visual+language context
-            if memory_token_in_pali:
-                memory_info = pali_out[:, -1, :]  # (batch, hidden_size) - last position
-                # Note: pali_out still includes the memory token but it doesn't affect gen_out
+            # Extract memory_info from memory token position (FIRST position of gen_out)
+            # gen_out comes from trainable World Model Expert, so gradients can flow back
+            if memory_token_in_gen:
+                memory_info = gen_out[:, 0, :]  # (batch, wm_hidden_size) - first position
+                # Remove memory token from gen_out for loss computation
+                gen_out = gen_out[:, 1:, :]
             
             gen_out = gen_out.to(dtype=torch.float32)
             gen_out = self.wm_out_proj(self.wm_out_layer_norm(gen_out))[:, -self.L:]
@@ -519,18 +528,18 @@ class F1FlowMatching(nn.Module):
                 images, img_masks, lang_tokens, lang_masks
             )
 
-            # Append memory token to PaliGemma input (und_embs) at the end
-            # This allows the memory token to be processed by PaliGemma's full attention
+            # Append memory token to World Model Expert input (gen_embs) at the BEGINNING
+            # This ensures memory_info comes from trainable gen_expert, not frozen PaliGemma
             memory_info = None
-            memory_token_in_pali = False
+            memory_token_in_gen = False
             if memory_token is not None:
-                mem_tok = memory_token.expand(bsize, -1, -1).to(dtype=und_embs.dtype, device=device)
-                und_embs = torch.cat([und_embs, mem_tok], dim=1)  # Append to end
-                mem_tok_pad = torch.ones(bsize, 1, dtype=und_pad_masks.dtype, device=device)
-                mem_tok_att = torch.zeros(bsize, 1, dtype=und_att_masks.dtype, device=device)  # Full attention
-                und_pad_masks = torch.cat([und_pad_masks, mem_tok_pad], dim=1)
-                und_att_masks = torch.cat([und_att_masks, mem_tok_att], dim=1)
-                memory_token_in_pali = True
+                mem_tok = memory_token.expand(bsize, -1, -1).to(dtype=gen_embs.dtype, device=device)
+                gen_embs = torch.cat([mem_tok, gen_embs], dim=1)  # Prepend to beginning
+                mem_tok_pad = torch.ones(bsize, 1, dtype=gen_pad_masks.dtype, device=device)
+                mem_tok_att = torch.zeros(bsize, 1, dtype=gen_att_masks.dtype, device=device)  # Full attention to prefix
+                gen_pad_masks = torch.cat([mem_tok_pad, gen_pad_masks], dim=1)
+                gen_att_masks = torch.cat([mem_tok_att, gen_att_masks], dim=1)
+                memory_token_in_gen = True
 
             # 2. prepare the mask and position ids
             # Calculate extra positions needed for the generation loop
@@ -562,10 +571,12 @@ class F1FlowMatching(nn.Module):
                 experts_only_memory=False,  # Allow paligemma to access memory KV as well
             )
             
-            # Extract memory_info from memory token position (last position of pali_out)
-            # PaliGemma processes the memory token with full visual+language context
-            if memory_token_in_pali:
-                memory_info = pali_out[:, -1, :]  # (batch, hidden_size) - last position
+            # Extract memory_info from memory token position (FIRST position of gen_out)
+            # gen_out comes from trainable World Model Expert, so gradients can flow back
+            if memory_token_in_gen:
+                memory_info = gen_out[:, 0, :]  # (batch, wm_hidden_size) - first position
+                # Remove memory token from gen_out to keep sequence alignment consistent
+                gen_out = gen_out[:, 1:, :]
 
             # 4. generate world model output
             all_gen_logits = []

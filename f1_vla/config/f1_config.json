@@ -25,6 +25,7 @@
         "num_hidden_layers": 18,
         "num_image_tokens": 256,
         "num_key_value_heads": 1,
+        "head_dim": 256,
         "torch_dtype": "float32",
         "vocab_size": 257152
     },

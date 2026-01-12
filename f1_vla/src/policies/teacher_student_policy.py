@@ -76,13 +76,20 @@ class TeacherStudentPolicy(nn.Module):
             training_args.train_gen_expert_only = True
             training_args.freeze_gen_expert = False
         
+        # Determine whether to skip vae_ckpt loading:
+        # - If checkpoint is provided, VAE will be loaded from safetensors, skip vae_ckpt
+        # - If no checkpoint, need to load from vae_ckpt for initialization
+        skip_vae_for_teacher = teacher_ckpt is not None
+        skip_vae_for_student = True  # Student always shares VAE with teacher
+        
         # Create teacher policy (will be frozen)
         logger.info("[TeacherStudentPolicy] Creating teacher policy...")
-        self.teacher = F1_VLA(config, **kwargs)
+        self.teacher = F1_VLA(config, skip_vae_ckpt=skip_vae_for_teacher, **kwargs)
         
         # Create student policy (gen expert trainable)
+        # Student will share VAE with teacher, so skip VAE loading entirely
         logger.info("[TeacherStudentPolicy] Creating student policy...")
-        self.student = F1_VLA(config, **kwargs)
+        self.student = F1_VLA(config, skip_vae_ckpt=skip_vae_for_student, **kwargs)
         
         # Load checkpoints based on provided paths
         # Logic: 
@@ -456,9 +463,13 @@ class StudentOnlyPolicy(nn.Module):
             training_args.train_gen_expert_only = True
             training_args.freeze_gen_expert = False
         
+        # Determine whether to skip vae_ckpt loading:
+        # - If checkpoint is provided, VAE will be loaded from safetensors
+        skip_vae_ckpt = student_ckpt is not None
+        
         # Create student policy
         logger.info("[StudentOnlyPolicy] Creating student policy (no teacher)...")
-        self.student = F1_VLA(config, **kwargs)
+        self.student = F1_VLA(config, skip_vae_ckpt=skip_vae_ckpt, **kwargs)
         
         # Load student checkpoint if provided
         if student_ckpt is not None:
@@ -601,9 +612,13 @@ class TeacherStudentSplitGPU(nn.Module):
             training_args.train_gen_expert_only = True
             training_args.freeze_gen_expert = False
         
+        # Determine whether to skip vae_ckpt loading
+        skip_vae_for_teacher = teacher_ckpt is not None
+        skip_vae_for_student = student_ckpt is not None or teacher_ckpt is not None
+        
         # ==================== Create Teacher on teacher_device ====================
         logger.info(f"[SplitGPU] Creating teacher on {teacher_device}...")
-        self.teacher = F1_VLA(config, device=self.teacher_device, **kwargs)
+        self.teacher = F1_VLA(config, device=self.teacher_device, skip_vae_ckpt=skip_vae_for_teacher, **kwargs)
         
         # Move teacher to its device first (before loading checkpoint)
         self.teacher = self.teacher.to(self.teacher_device)
@@ -639,7 +654,7 @@ class TeacherStudentSplitGPU(nn.Module):
         
         # ==================== Create Student on student_device ====================
         logger.info(f"[SplitGPU] Creating student on {student_device}...")
-        self.student = F1_VLA(config, device=self.student_device, **kwargs)
+        self.student = F1_VLA(config, device=self.student_device, skip_vae_ckpt=skip_vae_for_student, **kwargs)
         
         # Move student to its device first (before loading checkpoint)
         self.student = self.student.to(self.student_device)

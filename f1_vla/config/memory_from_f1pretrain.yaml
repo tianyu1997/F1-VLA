@@ -42,9 +42,9 @@ exp:
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
   memory_config:
-    memory_len: 64     # Number of memory slots per layer (balanced speed/capacity)
+    memory_len: 64    # Number of memory slots per layer (balanced speed/capacity)
     bptt_steps: 8       # BPTT truncation length (INCREASED from 4->8 for better gradient flow)    
-    k_bptt: 8         # Truncated BPTT: only keep gradients for last k steps (reduces memory)    
+    k_bptt: 6        # Truncated BPTT: only keep gradients for last k steps (reduces memory)    
     init_std: 0.02      # Memory parameter initialization std
     tokenizer_max_length: 512
 
@@ -117,24 +117,26 @@ exp:
     torch_compile: False
     stage: stage1_pretrain_wm
 
-    # World Model + PaliGemma Training (Action Expert frozen)
+    # World Model Training Only - 只训练World Model Expert和Memory模块
+    # 其他所有模块都被冻结
     gen_out_loss_ratio: 1.0
-    freeze_vision_encoder: True
-    freeze_gen_expert: False
-    train_act_expert_only: False
-    train_gen_expert_only: True
-    train_state_proj: True
-    freeze_paligemma: True
+    freeze_vision_encoder: True   # 冻结Vision Encoder
+    freeze_gen_expert: False      # World Model Expert可训练
+    train_act_expert_only: False  # 不只训练Action Expert
+    train_gen_expert_only: True   # 只训练Gen Expert(会自动冻结state_proj等)
+    train_state_proj: False       # 被train_gen_expert_only覆盖,显式设为False
+    freeze_paligemma: True        # 冻结整个PaliGemma(优先级最高)
 
     image_transforms_enabled: False
     image_transforms_type: []
     image_transforms_max_num_transforms: 0
     image_transforms_random_order: True
 
-    und_expert_lr: !!float 1e-5
-    act_expert_lr: !!float 0
-    vision_encoder_lr: !!float 2e-6
-    gen_expert_lr: !!float 5e-5
+    # PaliGemma已冻结(freeze_paligemma=True)，这些学习率不会生效
+    und_expert_lr: !!float 0        # PaliGemma Language Model - 已冻结
+    act_expert_lr: !!float 0         # Action Expert - 已冻结 (train_gen_expert_only=True)
+    vision_encoder_lr: !!float 0     # Vision Encoder - 已冻结
+    gen_expert_lr: !!float 5e-5      # World Model Expert - 唯一训练的部分
 
   max_eval_samples: 1000
   
@@ -156,9 +158,7 @@ policy:
   pn: "1_2_3_4_5_6_8_10_13_16"
   vae_ckpt: /mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth
 
-  # Episode-internal loss warmup: DISABLED for better memory initialization
-  loss_warmup_frames: 0       # DISABLED - all frames train equally
-  loss_warmup_min_weight: 1.0 # All frames have full weight
+  # Loss warmup已移除 - 所有帧平等训练
 
   temporal_conv_kernel_size: 4
   temporal_conv_stride: 4

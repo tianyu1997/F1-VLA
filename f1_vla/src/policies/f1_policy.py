@@ -40,6 +40,7 @@ class F1_VLA(nn.Module):
         self,
         config: F1Config,
         device: Optional[torch.device] = None,
+        skip_vae_ckpt: bool = False,  # Skip loading from vae_ckpt (used when loading from safetensors)
         **kwargs,
     ):
         super().__init__()
@@ -71,11 +72,17 @@ class F1_VLA(nn.Module):
             share_quant_resi=config.gen_expert_config.vae.share_quant_resi, 
             v_patch_nums=patch_nums
         )
-        if os.path.exists(config.gen_expert_config.vae.vae_ckpt):
-            # Load VAE weights directly to target device
+        # Load VAE weights from vae_ckpt ONLY if:
+        # 1. Not skipping (skip_vae_ckpt=False, i.e., fresh training)
+        # 2. vae_ckpt path exists
+        # When loading from safetensors (from_pretrained), skip this to avoid double-loading
+        if not skip_vae_ckpt and os.path.exists(config.gen_expert_config.vae.vae_ckpt):
+            logger.info(f"Loading VAE weights from: {config.gen_expert_config.vae.vae_ckpt}")
             vae_ckpt = torch.load(config.gen_expert_config.vae.vae_ckpt, map_location=device, weights_only=False)
             self.vae.load_state_dict(vae_ckpt, strict=True)
             del vae_ckpt
+        elif skip_vae_ckpt:
+            logger.info("Skipping vae_ckpt loading (will load from safetensors)")
         # Move VAE to target device
         self.vae = self.vae.to(device)
 
@@ -636,29 +643,8 @@ class F1_VLA(nn.Module):
         else:
             pixel_loss = torch.tensor(0.0, device=gen_loss_ce.device)
         
-        # Combine losses
-        gen_loss_combined = gen_loss_ce + pixel_loss_weight * pixel_loss
-        
-        # Episode-internal loss warmup: weight down loss for early frames
-        # Memory is inaccurate at episode start, so early frame predictions should contribute less
-        frame_indices = batch.get("frame_idx")
-        warmup_frames = getattr(self.config, 'loss_warmup_frames', 8)  # Default 8 frames warmup
-        warmup_min_weight = getattr(self.config, 'loss_warmup_min_weight', 0.1)  # Minimum weight for frame 0
-        
-        if frame_indices is not None and warmup_frames > 0:
-            # Linear warmup from warmup_min_weight to 1.0 over warmup_frames
-            # weight = warmup_min_weight + (1 - warmup_min_weight) * min(frame_idx / warmup_frames, 1.0)
-            frame_indices_float = frame_indices.float()  # Don't overwrite original frame_indices
-            loss_weights = warmup_min_weight + (1.0 - warmup_min_weight) * torch.clamp(frame_indices_float / warmup_frames, max=1.0)
-            loss_weights = loss_weights.view(B, 1).expand_as(gen_loss_ce)  # [B, gen_token_len]
-            gen_loss_ce_weighted = (gen_loss_ce * loss_weights).mean()
-            avg_loss_weight = loss_weights[:, 0].mean()  # Average weight across batch
-        else:
-            gen_loss_ce_weighted = gen_loss_ce.mean()
-            avg_loss_weight = torch.tensor(1.0, device=gen_loss_ce.device)
-        
-        # Final gen_loss with pixel loss
-        gen_loss = gen_loss_ce_weighted + pixel_loss_weight * pixel_loss
+        # Direct loss computation (loss warmup removed)
+        gen_loss = gen_loss_ce.mean() + pixel_loss_weight * pixel_loss
 
         # Update memory with GRU and store to memory bank
         if self.config.use_memory and self.model.memory_manager is not None and not skip_memory_store:
@@ -677,8 +663,7 @@ class F1_VLA(nn.Module):
         # Store past_key_values for memory distillation (student needs gradients)
         loss_dict["past_key_values"] = past_key_values
         loss_dict["wm_acc_mean"] = (gen_logits.argmax(dim=-1) == gt_world_model_indices).float().mean()
-        loss_dict["loss_weight"] = avg_loss_weight  # Monitor warmup weight
-        loss_dict["wm_loss_ce"] = gen_loss_ce_weighted  # Cross-entropy loss
+        loss_dict["wm_loss_ce"] = gen_loss_ce.mean()  # Cross-entropy loss
         loss_dict["wm_loss_pixel"] = pixel_loss  # Pixel reconstruction loss
         last_resolution_token_len = self.model.num_resolutions * self.model.num_resolutions
         loss_dict["wm_acc_tail"] = (gen_logits[:, -last_resolution_token_len:].argmax(dim=-1) == gt_world_model_indices[:, -last_resolution_token_len:]).float().mean()
@@ -1018,7 +1003,9 @@ class F1_VLA(nn.Module):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
-        instance = cls(config, **kwargs)
+        # Skip loading VAE from vae_ckpt since we'll load from safetensors
+        # This avoids double-loading and ensures VAE weights match the checkpoint
+        instance = cls(config, skip_vae_ckpt=True, **kwargs)
 
         if model_id.endswith(".json"):
             model_id = "/".join(model_id.split("/")[:-1])

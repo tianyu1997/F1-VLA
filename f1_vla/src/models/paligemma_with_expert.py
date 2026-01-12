@@ -206,9 +206,13 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         if hasattr(self.config, "gen_expert_config") and self.config.gen_expert_config is not None \
             and train_gen_expert_only:
-            logger.info("Training World Model Expert + PaliGemma (unfrozen)")
-            # PaliGemma is NOT frozen - allow it to learn with memory
-            # Only freeze all action experts
+            # NOTE: 如果 freeze_paligemma=True，PaliGemma已在上面被冻结
+            # 此处只冻结 Action Experts，World Model Expert 保持可训练
+            if not freeze_paligemma:
+                logger.info("Training World Model Expert + PaliGemma (unfrozen)")
+            else:
+                logger.info("Training World Model Expert ONLY (PaliGemma frozen)")
+            # Freeze all action experts
             for actor_name, expert in self.gemma_experts.items():
                 expert.eval()
                 for params in expert.parameters():
