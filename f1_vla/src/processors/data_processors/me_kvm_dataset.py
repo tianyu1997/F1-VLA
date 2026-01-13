@@ -138,13 +138,13 @@ class MEKVMDataset(Dataset):
         # wrist_rgb: (4, 3, 224, 224) - already has history dim
         obs = episode[step_idx]['obs']
         
-        # Images - convert from uint8 to float and normalize to [0, 1]
-        head_rgb = torch.from_numpy(obs['head_rgb']).float() / 255.0  # (4, 3, 224, 224)
-        wrist_rgb = torch.from_numpy(obs['wrist_rgb']).float() / 255.0  # (4, 3, 224, 224)
-        
-        # Resize to 256x256 for VAE compatibility (VAE expects 256x256 -> 16x16 feature map)
-        head_rgb = self._resize_to_256(head_rgb)  # (4, 3, 256, 256)
-        wrist_rgb = self._resize_to_256(wrist_rgb)  # (4, 3, 256, 256)
+        # Load all available camera images
+        camera_images = {}
+        for cam_key in ['head_rgb', 'wrist_rgb']:
+            if cam_key in obs:
+                img = torch.from_numpy(obs[cam_key]).float() / 255.0  # (4, 3, 224, 224)
+                img = self._resize_to_256(img)  # (4, 3, 256, 256)
+                camera_images[cam_key] = img
         
         # State
         state = torch.from_numpy(obs['state']).float()  # (32,)
@@ -162,32 +162,8 @@ class MEKVMDataset(Dataset):
         actions = torch.tensor(actions, dtype=torch.float32)  # (chunk_size, action_dim)
         action_is_pad = torch.zeros(self.chunk_size, dtype=torch.bool)
         
-        # For world model: get prediction images (next frames)
-        # Use head_rgb from next steps for prediction target
-        pred_images = []
-        for i in range(self.n_pred_img_steps):
-            next_step = min(step_idx + 1 + i, len(episode) - 1)
-            next_obs = episode[next_step]['obs']
-            # Take the last frame from head_rgb history
-            next_img = torch.from_numpy(next_obs['head_rgb'][-1]).float() / 255.0  # (3, 224, 224)
-            next_img = self._resize_to_256(next_img)  # (3, 256, 256)
-            pred_images.append(next_img)
-        pred_images = torch.stack(pred_images)  # (n_pred_img_steps, 3, 256, 256)
-        
-        # Combine history and prediction images for world model
-        # history: (n_obs_img_steps, 3, 256, 256), pred: (n_pred_img_steps, 3, 256, 256)
-        # Combined: (n_obs_img_steps + n_pred_img_steps, 3, 256, 256)
-        history_and_pred = torch.cat([head_rgb, pred_images], dim=0)  # (5, 3, 256, 256) for 4+1
-        
+        # Build sample with actual camera names
         sample = {
-            # Main observation image (last frame of history)
-            "observation.images.image0": head_rgb[-1],  # (3, 256, 256) - current frame
-            # History images + prediction targets for world model
-            # This is used by prepare_mix_history_images which needs all frames
-            "observation.images.image0_history": history_and_pred,  # (n_obs+n_pred, 3, 256, 256)
-            # Wrist camera
-            "observation.images.image1": wrist_rgb[-1],  # (3, 256, 256)
-            "observation.images.image1_history": wrist_rgb,  # (4, 3, 256, 256)
             # State
             "observation.state": state,  # (32,)
             # Actions
@@ -195,9 +171,32 @@ class MEKVMDataset(Dataset):
             "action_is_pad": action_is_pad,  # (chunk_size,)
             # Task
             "task": self.task_description,
-            # World model prediction target (kept for reference)
-            "observation.images.image0_target": pred_images,  # (n_pred_img_steps, 3, 256, 256)
         }
+        
+        # Add each camera's images using actual camera names
+        for cam_key, cam_img in camera_images.items():
+            # Current frame (last frame of history)
+            sample[f"observation.images.{cam_key}"] = cam_img[-1]  # (3, 256, 256)
+            # History for understanding (just the observation frames)
+            sample[f"observation.images.{cam_key}_history"] = cam_img  # (n_obs, 3, 256, 256)
+            
+            # For world model: get prediction images (next frames) for this camera
+            pred_images = []
+            for i in range(self.n_pred_img_steps):
+                next_step = min(step_idx + 1 + i, len(episode) - 1)
+                next_obs = episode[next_step]['obs']
+                # Take the last frame from this camera's history
+                next_img = torch.from_numpy(next_obs[cam_key][-1]).float() / 255.0  # (3, 224, 224)
+                next_img = self._resize_to_256(next_img)  # (3, 256, 256)
+                pred_images.append(next_img)
+            pred_images = torch.stack(pred_images)  # (n_pred_img_steps, 3, 256, 256)
+            
+            # World model prediction target for this camera
+            sample[f"observation.images.{cam_key}_target"] = pred_images  # (n_pred, 3, 256, 256)
+            
+            # Combined history + prediction for world model training
+            history_and_pred = torch.cat([cam_img, pred_images], dim=0)
+            sample[f"observation.images.{cam_key}_history_and_pred"] = history_and_pred
         
         return sample
 
@@ -273,6 +272,8 @@ class MEKVMCollateFn:
     max_action_dim: int = 50
     suffix: str = "history"
     image_size: tuple = (224, 224)
+    # Camera keys to look for in data
+    camera_keys: tuple = ("head_rgb", "wrist_rgb")
     
     def __call__(self, items):
         dataset_idx = [x[0] for x in items]
@@ -280,19 +281,18 @@ class MEKVMCollateFn:
         
         batch = {"dataset_idx": torch.tensor(dataset_idx, dtype=torch.long)}
         
-        # Observation images
-        batch["observation.images.image0"] = torch.stack([x["observation.images.image0"] for x in items])
-        batch["observation.images.image0_mask"] = torch.ones(len(items), dtype=torch.bool)
-        batch["observation.images.image0_history"] = torch.stack([x["observation.images.image0_history"] for x in items])
-        
-        # Target images for world model
-        if "observation.images.image0_target" in items[0]:
-            batch["observation.images.image0_target"] = torch.stack([x["observation.images.image0_target"] for x in items])
-        
-        if "observation.images.image1" in items[0]:
-            batch["observation.images.image1"] = torch.stack([x["observation.images.image1"] for x in items])
-            batch["observation.images.image1_mask"] = torch.ones(len(items), dtype=torch.bool)
-            batch["observation.images.image1_history"] = torch.stack([x["observation.images.image1_history"] for x in items])
+        # Observation images - use actual camera names
+        for cam_key in self.camera_keys:
+            img_key = f"observation.images.{cam_key}"
+            if img_key in items[0]:
+                batch[img_key] = torch.stack([x[img_key] for x in items])
+                batch[f"{img_key}_mask"] = torch.ones(len(items), dtype=torch.bool)
+                batch[f"{img_key}_history"] = torch.stack([x[f"{img_key}_history"] for x in items])
+                
+                # Target images for world model
+                target_key = f"{img_key}_target"
+                if target_key in items[0]:
+                    batch[target_key] = torch.stack([x[target_key] for x in items])
         
         # State with padding
         states = [x["observation.state"] for x in items]

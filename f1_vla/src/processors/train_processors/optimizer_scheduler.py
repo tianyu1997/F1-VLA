@@ -30,19 +30,20 @@ def create_optimizer(opt_model, args):
 
     # Group 2: world model expert parameters and world model related parameters
     gen_expert_parameters = [name for name in params_dict.keys() if "paligemma_with_expert.gemma_wm_expert" in name]
-    # Memory module parameters (KV memory bank + GRU update).
+    # Memory module parameters (KV memory bank + GRU update) - now separate group with independent lr
     # These are critical for convergence when use_memory=True; if excluded, memory stays randomly initialized.
     memory_parameters = [
         name for name in params_dict.keys()
         if any(x in name for x in ["memory_bank", "memory_manager", "memory_token", "memory_info_proj", "memory_gru", "init_memory"])
     ]
+    # World model related parameters (excluding memory)
     gen_parameters = [
         name for name in params_dict.keys()
         if any(x in name for x in [
             "temporal_conv", "wm_embeddings", "wm_hist_pos_embs", 
             "wm_sos_token_embs", "wm_cond_pos_embs", "wm_output_position_embedding",
             "lvl_embed", "wm_out_layer_norm", "wm_out_proj"
-        ])
+        ]) and name not in memory_parameters  # Exclude memory params
     ]
 
     # Group 3: gemma expert parameters and action-related parameters
@@ -99,13 +100,13 @@ def create_optimizer(opt_model, args):
         },
     ])
 
-    # Group 2: world model expert, world model parameters, and memory module parameters
-    if len(gen_parameters) > 0 or len(gen_expert_parameters) > 0 or len(memory_parameters) > 0:
+    # Group 2: world model expert and world model parameters (excluding memory)
+    if len(gen_parameters) > 0 or len(gen_expert_parameters) > 0:
         optimizer_grouped_parameters.extend([
             {
                 "params": [
                     p for n, p in opt_model.named_parameters() 
-                    if n in decay_parameters and (n in gen_expert_parameters or n in gen_parameters or n in memory_parameters) and p.requires_grad
+                    if n in decay_parameters and (n in gen_expert_parameters or n in gen_parameters) and n not in memory_parameters and p.requires_grad
                 ],
                 "weight_decay": args.weight_decay,
                 "lr": args.gen_expert_lr,
@@ -113,10 +114,33 @@ def create_optimizer(opt_model, args):
             {
                 "params": [
                     p for n, p in opt_model.named_parameters() 
-                    if n not in decay_parameters and (n in gen_expert_parameters or n in gen_parameters or n in memory_parameters) and p.requires_grad
+                    if n not in decay_parameters and (n in gen_expert_parameters or n in gen_parameters) and n not in memory_parameters and p.requires_grad
                 ],
                 "weight_decay": 0.0,
                 "lr": args.gen_expert_lr,
+            },
+        ])
+
+    # Group 2.5: Memory module parameters with independent learning rate
+    # Memory needs higher lr since it's initialized from scratch (not pretrained)
+    memory_lr = getattr(args, 'memory_lr', args.gen_expert_lr)  # Fallback to gen_expert_lr if not set
+    if len(memory_parameters) > 0:
+        optimizer_grouped_parameters.extend([
+            {
+                "params": [
+                    p for n, p in opt_model.named_parameters() 
+                    if n in decay_parameters and n in memory_parameters and p.requires_grad
+                ],
+                "weight_decay": args.weight_decay,
+                "lr": memory_lr,
+            },
+            {
+                "params": [
+                    p for n, p in opt_model.named_parameters() 
+                    if n not in decay_parameters and n in memory_parameters and p.requires_grad
+                ],
+                "weight_decay": 0.0,
+                "lr": memory_lr,
             },
         ])
 

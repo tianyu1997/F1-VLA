@@ -70,6 +70,7 @@ class PolicyTrainingArguments(TrainingArguments):
     act_expert_lr: float = 0.0
     gen_expert_lr: float = 0.0
     vision_encoder_lr: float = 0.0
+    memory_lr: float = 0.0  # Independent learning rate for Memory module (init_memory, memory_token, GRU)
     
     # Episode-based logging and saving
     logging_episodes: int = 10  # Log every N episodes
@@ -203,10 +204,10 @@ class EpisodeProgressCallback(TrainerCallback):
             self.pbar.reset()
             self.pbar.set_description(f"E{self.current_epoch + 1}")
         
-        # Clear memory bank at epoch boundary
+        # Clear memory bank at epoch boundary (only if memory is enabled)
         if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
             model = self.policy.model
-            if hasattr(model, 'memory_bank'):
+            if hasattr(model, 'memory_bank') and model.memory_bank is not None:
                 old_size = len(model.memory_bank._memory_bank)
                 model.memory_bank._memory_bank.clear()
                 logger.info(f"[EpisodeProgressCallback] Cleared {old_size} memory states at epoch {self.current_epoch} start")
@@ -734,10 +735,17 @@ class PolicyTrainer(Trainer):
         - 后 k_bptt 帧: 计算梯度的有效帧
         - stride = k_bptt: 相邻 window 重叠 n_obs_img_steps 帧
         
-        这样设计确保:
-        1. 每个计算梯度的帧都有完整的 n_obs_img_steps 历史上下文
-        2. memory 从上下文帧 warmup 后再用于梯度帧
-        3. 相邻 window 的 memory 状态正确衔接
+        方案A梯度流设计 (修复 init_memory 无法学习问题):
+        ====================================================
+        问题: 非 episode 起始 window 的 context frames 会 detach memory，
+              导致 init_memory 只在 episode 第一个 window 获得梯度。
+              
+        方案A解决方案:
+        1. Window 内部始终保持完整梯度链（不在 context frames detach）
+        2. Loss 只在 gradient frames 计算（context frames loss detach）
+        3. 这样 init_memory 的梯度通过 memory 链从 gradient frames 传回:
+           gradient_loss -> memory_t -> memory_{t-1} -> ... -> init_memory
+        4. 只在 window 边界（存入 bank 时）detach，防止跨 window 梯度累积
         
         NOTE: 当前实现假设 per_device_train_batch_size=1，即 batch 维度仅包含
               单个 episode 的连续帧。若 batch_size>1，sampler 会混合多个 episode。
@@ -770,6 +778,8 @@ class PolicyTrainer(Trainer):
         episode_start_frame = n_obs_img_steps - 1
         
         # 初始化 memory（从 bank 取，或使用 init_memory）
+        # 关键：对于 episode 起始帧，get_previous_memory 会返回 init_memory（带梯度）
+        # 对于其他帧，返回 bank 中存储的值（已 detach）
         frame0 = {k: (v[0:1] if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
         memory_kv, memory_token, _ = memory_manager.process_batch(
             frame0, device, dtype, 
@@ -777,17 +787,18 @@ class PolicyTrainer(Trainer):
         )
         
         # Window 划分:
-        # - context_frames: 前 n_obs_img_steps 帧，用于 memory warmup，不计算梯度
+        # - context_frames: 前 n_obs_img_steps 帧，用于 memory warmup
         # - gradient_frames: 后 k_bptt 帧，计算梯度
         context_frames = min(n_obs_img_steps, effective_steps)
         gradient_start = context_frames  # 梯度帧从这个位置开始
         
         losses = []
+        gradient_losses = []  # 只存储 gradient frames 的 loss（用于反向传播）
         final_wm_loss = None
         final_wm_acc = None
         final_action_loss = None
         
-        # 检查是否是 episode 的起始 window
+        # 检查是否是 episode 的起始 window (frame_idx == episode_start_frame)
         is_episode_start = frame0["frame_idx"][0].item() == episode_start_frame
 
         for t in range(effective_steps):
@@ -805,19 +816,17 @@ class PolicyTrainer(Trainer):
                 skip_memory_store=True,
             )
             
-            # Loss 梯度策略：
-            # - 前 n_obs_img_steps 帧 (t < gradient_start): 上下文帧，loss detach
-            # - 后 k_bptt 帧 (t >= gradient_start): 梯度帧，保留 loss 梯度
+            # Loss 策略 (方案A):
+            # - Context frames (t < gradient_start): loss detach，但 memory 保持梯度
+            # - Gradient frames (t >= gradient_start): loss 保留梯度
             # 
-            # init_memory 梯度说明：
-            # init_memory 的梯度通过 memory 链传递（而非直接通过 loss）：
-            #   loss_t -> memory_t -> ... -> memory_0 -> init_memory
-            # 因此只要 memory 链保持梯度（is_episode_start 时），后续帧的 loss
-            # 就能将梯度传回 init_memory，无需对上下文帧的 loss 保留梯度。
+            # 关键点：即使 loss detach，memory_info -> memory_kv 的梯度链仍保持！
+            # 梯度通过 gradient frames 的 loss 回传到 memory 链，再到 init_memory
             if t >= gradient_start:
                 losses.append(out_t["loss"])
+                gradient_losses.append(out_t["loss"])
             else:
-                # 上下文帧：只累积 loss 值用于监控，不参与梯度计算
+                # Context frame: loss 不参与梯度，但用于监控
                 losses.append(out_t["loss"].detach())
             
             # 记录最后一步的指标
@@ -826,22 +835,24 @@ class PolicyTrainer(Trainer):
                 final_wm_acc = out_t.get("wm_acc_mean")
                 final_action_loss = out_t.get("action_loss")
 
-            # 更新 memory
+            # 更新 memory (方案A核心修改)
+            # =================================
+            # 关键改变：Window 内部始终保持 memory 梯度链！
+            # 不再在 context frames detach memory，让梯度能从 gradient frames 传回 init_memory
             memory_info = out_t.get("memory_info")
             if memory_info is not None:
-                # Memory 梯度策略：
-                # - 上下文帧 (t < gradient_start): detach memory 以截断梯度链
-                # - 梯度帧 (t >= gradient_start): 保留 memory 梯度
-                # - 特例：episode 起始 window 的所有帧都保留梯度（让 init_memory 能学习）
-                if t >= gradient_start or is_episode_start:
-                    # 保留梯度：让 init_memory/memory_token 能学习
-                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
-                else:
-                    # 上下文帧：detach memory 以截断梯度链
-                    memory_kv = memory_bank.update_memory(memory_kv, memory_info)
-                    memory_kv = [(k.detach(), v.detach()) for k, v in memory_kv]
+                # 方案A：Window 内所有帧都保持 memory 梯度
+                # 梯度流：gradient_loss -> memory_t -> memory_{t-1} -> ... -> memory_0 -> init_memory
+                memory_kv = memory_bank.update_memory(memory_kv, memory_info)
+                # 不再 detach！让梯度链完整
 
-        loss = torch.stack(losses).mean()
+        # 计算 loss: 只用 gradient frames 的 loss（方案A）
+        if gradient_losses:
+            loss = torch.stack(gradient_losses).mean()
+        else:
+            # Edge case: 如果没有 gradient frames（window 太短），使用所有 loss
+            loss = torch.stack(losses).mean()
+            
         outputs = {
             "loss": loss,
             "wm_loss": final_wm_loss if final_wm_loss is not None else torch.tensor(0.0, device=device),
@@ -849,7 +860,8 @@ class PolicyTrainer(Trainer):
             "action_loss": final_action_loss if final_action_loss is not None else torch.tensor(0.0, device=device),
         }
 
-        # 窗口结束：detach 后写回 bank，并重置 step_count，确保下一窗口重新累计
+        # Window 边界：detach 后写回 bank
+        # 这是唯一 detach 的地方，防止跨 window 的梯度累积（避免 OOM 和 backward twice 错误）
         ds_idx = inputs.get("dataset_idx", frame0["dataset_idx"])
         ep_idx = inputs.get("episode_idx", frame0["episode_idx"])
         frame_idx = inputs.get("frame_idx", frame0["frame_idx"])

@@ -37,7 +37,7 @@ dataset:
 exp:
   stage: stage1_pretrain_wm
   # Load from specific memory pretraining checkpoint
-  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain/model.safetensors
+  load_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_bptt4/checkpoint-episode-2560
   
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
@@ -59,8 +59,8 @@ exp:
     dropout: 0.0              # No dropout
 
   training_args:
-    output_dir: outputs/memory_from_f1pretrain_v3
-    run_name: memory_from_f1pretrain_v3
+    output_dir: outputs/memory_wrist_only
+    run_name: memory_wrist_only
     # Resume from specific checkpoint
     # resume_from_checkpoint: null
     do_train: True
@@ -82,8 +82,8 @@ exp:
     adam_epsilon: !!float 1e-8
     lr_scheduler_type: cosine
 
-    max_steps: 50000             # Fine-tune for additional 20k steps
-    warmup_steps: 2000           # Short warmup for fine-tuning
+    max_steps: 10000             # Fine-tune for additional 20k steps
+    warmup_steps: 200           # Short warmup for fine-tuning
     log_level: info
     log_level_replica: error
 
@@ -108,7 +108,7 @@ exp:
 
     # Episode-based logging/saving/eval
     logging_episodes: 50
-    save_episodes: 512  # 每个epoch保存一次，释放显存
+    save_episodes: 200  # 每个epoch保存一次，释放显存
     eval_episodes: 50
 
     label_names: 
@@ -145,7 +145,6 @@ exp:
   
   camera_config:
     und_camera_keys:
-      - head_rgb
       - wrist_rgb
     wm_camera_key: wrist_rgb
 

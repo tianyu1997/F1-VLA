@@ -83,12 +83,14 @@ def load_ckpt(policy, config):
             memory_missing = [k for k in missing if 'memory' in k.lower()]
             other_missing = [k for k in missing if 'memory' not in k.lower()]
             if memory_missing:
-                logger.info(f"  Memory module keys (new, will be randomly initialized): {len(memory_missing)}")
+                pass 
+                # logger.info(f"  Memory module keys (new, will be randomly initialized): {len(memory_missing)}")
             if other_missing:
-                logger.info(f"  Other missing keys: {len(other_missing)}")
+                pass
+                # logger.info(f"  Other missing keys: {len(other_missing)}")
                 # Log first few for debugging
-                for k in sorted(other_missing)[:5]:
-                    logger.info(f"    - {k}")
+                # for k in sorted(other_missing)[:5]:
+                #     logger.info(f"    - {k}")
         
         # Check for shape mismatch in keys that might change (memory_info_proj, temporal_conv, etc.)
         mismatch_check_patterns = ['memory_info_proj', 'temporal_conv']
@@ -110,6 +112,19 @@ def load_ckpt(policy, config):
             if key in state_dict:
                 del state_dict[key]
         
+        # [Fix for missing embed_tokens.weight]
+        # In some checkpoints, weights are tied (lm_head == embed_tokens) and only one is saved.
+        # If embed_tokens is missing but lm_head exists, we duplicate it.
+        embed_token_keys = [k for k in missing if 'embed_tokens.weight' in k]
+        for missing_embed_key in embed_token_keys:
+            # Construct corresponding lm_head key
+            # Pattern: ...language_model.model.embed_tokens.weight -> ...language_model.lm_head.weight
+            if 'language_model.model.embed_tokens.weight' in missing_embed_key:
+                lm_head_key = missing_embed_key.replace('language_model.model.embed_tokens.weight', 'language_model.lm_head.weight')
+                if lm_head_key in state_dict:
+                    state_dict[missing_embed_key] = state_dict[lm_head_key]
+                    # logger.info(f"  [Fix] Recovered missing {missing_embed_key} from {lm_head_key}")
+
         # Load the state dict
         missing_keys, unexpected_keys = policy.load_state_dict(state_dict, strict=False)
         

@@ -304,12 +304,15 @@ class KVMemoryBank(nn.Module):
         
         # Flatten all memory slots for GRU update
         # Each slot will now be updated with its own specific input vector
+        # IMPORTANT: We flatten as (batch, memory_len * num_kv_heads, head_dim)
+        # So when reshaping back, we use view(batch, memory_len, num_kv_heads, head_dim)
         flat_slots = []
         for layer_idx, (k, v) in enumerate(previous_memory):
-            # k, v: (batch, memory_len, heads, dim)
+            # k, v: (batch, memory_len, num_kv_heads, head_dim)
             k = self._check_nan_inf(k, f"previous_memory layer {layer_idx} key")
             v = self._check_nan_inf(v, f"previous_memory layer {layer_idx} value")
             
+            # Flatten: (batch, memory_len, num_kv_heads, head_dim) -> (batch, memory_len * num_kv_heads, head_dim)
             flat_slots.append(k.reshape(batch_size, -1, self.head_dim))
             flat_slots.append(v.reshape(batch_size, -1, self.head_dim))
         
@@ -355,13 +358,16 @@ class KVMemoryBank(nn.Module):
         
         # Reshape back to layer-wise K, V format
         new_memory = []
-        slots_per_kv = self.num_kv_heads * self.memory_len
+        # slots_per_kv: number of slots for one K or V tensor
+        # Each K/V was flattened as (batch, memory_len * num_kv_heads, head_dim)
+        slots_per_kv = self.memory_len * self.num_kv_heads
         
         idx = 0
         for i in range(self.num_layers):
-            # Extract K
+            # Extract K: (batch, memory_len * num_kv_heads, head_dim)
             k_flat = updated_slots[:, idx:idx + slots_per_kv, :]
             idx += slots_per_kv
+            # Reshape back: (batch, memory_len, num_kv_heads, head_dim)
             new_k = k_flat.view(
                 batch_size, self.memory_len,
                 self.num_kv_heads, self.head_dim
@@ -511,7 +517,7 @@ class MemoryManager:
         self,
         memory_bank: KVMemoryBank,
         bptt_steps: int = 8,
-        detach_every_step: bool = True,
+        detach_every_step: bool = False,
     ):
         self.memory_bank = memory_bank
         self.bptt_steps = bptt_steps

@@ -126,8 +126,9 @@ def main(args: argparse.Namespace, overrides: list):
     use_memory = config.exp.get('use_memory', False)
     
     # Determine data loading mode
-    if use_mekvm_format and use_memory:
-        # Sequential data loading for memory-based training
+    if use_mekvm_format:
+        # Use Sequential dataset for BOTH memory and non-memory modes
+        # SequentialMEKVMDataset has better caching and supports camera config
         from f1_vla.src.processors.data_processors.sequential_dataset import (
             create_sequential_mekvm_data, SequentialCollateFn, SequentialBatchSampler
         )
@@ -153,43 +154,31 @@ def main(args: argparse.Namespace, overrides: list):
         )
         collate_fn = SequentialCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
         
-        # Create sequential batch sampler (no longer needs rank/world_size since dataset is already sharded)
-        # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
-        # - First n_obs_img_steps frames: history context for memory warmup (loss detached)
-        # - Last k_bptt frames: compute gradients
-        n_obs = config.dataset.get('n_obs_img_steps', 4)
-        k_bptt = config.exp.memory_config.get('k_bptt', 4) if hasattr(config.exp, 'memory_config') else 4
-        window_length = n_obs + k_bptt  # e.g., 4 + 4 = 8 frames per window
-        
-        sequential_sampler = SequentialBatchSampler(
-            dataset=training_dataset,
-            batch_size=training_args.per_device_train_batch_size,
-            chunk_size=window_length,  # Total window length
-            stride=k_bptt,             # Window moves by k_bptt each step
-            shuffle_episodes=True,
-            drop_last=False,
-            rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
-            world_size=1,
-        )
-        logger.info(f"Window config: n_obs={n_obs}, k_bptt={k_bptt}, window_length={window_length}, stride={k_bptt}")
-        logger.info(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
-    elif use_mekvm_format:
-        # Use ME_KVM data format (standard random loading)
-        from f1_vla.src.processors.data_processors.me_kvm_dataset import MEKVMCollateFn
-        sequential_sampler = None
-        (
-            training_dataset,
-            image_transforms,
-            training_ds_sample_weights,
-            cur_n_obs_img_steps,
-            cur_n_pred_img_steps
-        ) = create_mekvm_data(
-            policy_config=policy_config,
-            dataset_config=config.dataset,
-            training_args=training_args,
-            stage=config.exp.stage,
-        )
-        collate_fn = MEKVMCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
+        if use_memory:
+            # Create sequential batch sampler for memory-based training
+            # Window design: window_length = n_obs_img_steps + k_bptt, stride = k_bptt
+            # - First n_obs_img_steps frames: history context for memory warmup (loss detached)
+            # - Last k_bptt frames: compute gradients
+            n_obs = config.dataset.get('n_obs_img_steps', 4)
+            k_bptt = config.exp.memory_config.get('k_bptt', 4) if hasattr(config.exp, 'memory_config') else 4
+            window_length = n_obs + k_bptt  # e.g., 4 + 4 = 8 frames per window
+            
+            sequential_sampler = SequentialBatchSampler(
+                dataset=training_dataset,
+                batch_size=training_args.per_device_train_batch_size,
+                chunk_size=window_length,  # Total window length
+                stride=k_bptt,             # Window moves by k_bptt each step
+                shuffle_episodes=True,
+                drop_last=False,
+                rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
+                world_size=1,
+            )
+            logger.info(f"Window config: n_obs={n_obs}, k_bptt={k_bptt}, window_length={window_length}, stride={k_bptt}")
+            logger.info(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
+        else:
+            # Non-memory mode: use standard random sampling
+            sequential_sampler = None
+            logger.info(f"Using RANDOM data loading (no memory) with SequentialMEKVMDataset (rank={rank}, world_size={world_size})")
     else:
         # Use LeRobot data format
         sequential_sampler = None

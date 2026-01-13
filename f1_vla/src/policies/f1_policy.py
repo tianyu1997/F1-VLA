@@ -189,7 +189,7 @@ class F1_VLA(nn.Module):
         
         Args:
             batch: Input batch with observations. Can be:
-                   - Full F1-VLA batch format with "observation.images.image0", etc.
+                   - Full F1-VLA batch format with "observation.images.{camera_name}", etc.
                    - Simplified format with "state_emb" or "observation.state" for RL
             actor_name: Name of the actor to use (if None, uses active actor)
             return_action_stats: If True, return additional stats for RL
@@ -213,7 +213,11 @@ class F1_VLA(nn.Module):
             output_dict = {}
             
             # Check if we have full image data or just state embeddings (RL mode)
-            has_images = "observation.images.image0" in batch
+            # Look for any observation.images.* key that's not a mask or history
+            has_images = any(
+                k.startswith("observation.images.") and not k.endswith(("_mask", "_history", "_target", "_history_and_pred"))
+                for k in batch.keys()
+            )
             
             if has_images:
                 # Full forward path with images
@@ -435,14 +439,17 @@ class F1_VLA(nn.Module):
             (None, None, False) if memory disabled
             
         Gradient flow design:
-        - frame_idx == 0: Uses init_memory (nn.Parameter), keeps gradients for learning
-        - frame_idx > 0: Uses stored memory from memory bank (already detached in store_memory)
+        - frame_idx == episode_start_frame: Uses init_memory (nn.Parameter), keeps gradients for learning
+        - frame_idx > episode_start_frame: Uses stored memory from memory bank (already detached in store_memory)
         
         The should_detach flag controls BPTT truncation - when True, gradients won't flow
         back to previous time steps through the memory.
         
         Note: Memory from bank is already detached (done in store_memory), so only
         init_memory contributes gradients. This is the correct BPTT behavior.
+        
+        IMPORTANT: episode_start_frame should be n_obs_img_steps - 1, not 0!
+        The dataset starts frame_idx from n_obs_img_steps - 1 to ensure enough history.
         """
         if not self.config.use_memory or self.model.memory_manager is None:
             return None, None, False
@@ -450,7 +457,17 @@ class F1_VLA(nn.Module):
         device = batch["observation.state"].device
         dtype = next(self.model.parameters()).dtype
         
-        memory_kv, memory_token, should_detach_list = self.model.memory_manager.process_batch(batch, device, dtype)
+        # Get n_obs_img_steps from memory_config or default to 4
+        # The dataset starts frame_idx from n_obs_img_steps - 1, not 0!
+        n_obs_img_steps = 4  # Default
+        if hasattr(self.config, 'memory_config') and self.config.memory_config:
+            # Try to get from config, but it's typically in dataset config
+            pass
+        episode_start_frame = n_obs_img_steps - 1  # Frame 3 for n_obs=4
+        
+        memory_kv, memory_token, should_detach_list = self.model.memory_manager.process_batch(
+            batch, device, dtype, episode_start_frame=episode_start_frame
+        )
         
         # Detach if ANY sample needs detach (conservative for BPTT correctness)
         # This controls whether we detach AFTER forward, before storing back
@@ -551,8 +568,13 @@ class F1_VLA(nn.Module):
             if self.config.use_memory and self.model.memory_manager is not None:
                 device = batch["observation.state"].device
                 dtype = next(self.model.parameters()).dtype
+                # Use correct episode_start_frame (n_obs_img_steps - 1)
+                n_obs = cur_n_obs_img_steps if cur_n_obs_img_steps else 4
+                episode_start_frame = n_obs - 1
                 if memory_kv is None:
-                    memory_kv, _, _ = self.model.memory_manager.process_batch(batch, device, dtype)
+                    memory_kv, _, _ = self.model.memory_manager.process_batch(
+                        batch, device, dtype, episode_start_frame=episode_start_frame
+                    )
                 if memory_token is None:
                     batch_size = batch["observation.state"].shape[0]
                     memory_token = self.model.memory_bank.get_memory_token(batch_size, device, dtype)
@@ -710,9 +732,9 @@ class F1_VLA(nn.Module):
             # This avoids flickering caused by VAE reconstruction errors
             if hasattr(self.config, 'camera_config') and self.config.camera_config:
                 wm_target_key = self.config.camera_config.get('world_model_target_key',
-                    "observation.images.image0_target")
+                    "observation.images.head_rgb_target")
             else:
-                wm_target_key = "observation.images.image0_target"
+                wm_target_key = "observation.images.head_rgb_target"
             
             # Get original target images [B, n_pred, C, H, W] in range [0, 1]
             gt_images_original = batch.get(wm_target_key)
@@ -791,18 +813,29 @@ class F1_VLA(nn.Module):
         # Use camera config if available, otherwise fall back to default keys
         if hasattr(self.config, 'camera_config') and self.config.camera_config:
             img_keys = self.config.camera_config.get('understanding_image_keys', 
-                ["observation.images.image0", "observation.images.image1"])
+                ["observation.images.head_rgb", "observation.images.wrist_rgb"])
         else:
-            img_keys = [
-                "observation.images.image0",
-                "observation.images.image1",
-                "observation.images.image2",
-            ]
+            # Fallback: try to detect available camera keys in batch
+            img_keys = []
+            for key in batch.keys():
+                if key.startswith("observation.images.") and not key.endswith(("_mask", "_history", "_target", "_history_and_pred")):
+                    img_keys.append(key)
+            if not img_keys:
+                img_keys = ["observation.images.head_rgb", "observation.images.wrist_rgb"]
+
+        # Get a reference image for creating zeros
+        ref_key = None
+        for key in img_keys:
+            if key in batch:
+                ref_key = key
+                break
 
         for key in img_keys:
             if key not in batch:
-                img = torch.zeros_like(batch["observation.images.image0"])
-                mask = torch.zeros_like(batch["observation.images.image0_mask"])
+                if ref_key is None:
+                    continue  # Skip if no reference available
+                img = torch.zeros_like(batch[ref_key])
+                mask = torch.zeros_like(batch[f"{ref_key}_mask"])
                 # Take only the last frame (current observation) for understanding expert
                 if len(img.shape) == 5:
                     img = img[:, -1]  # (b, t, c, h, w) -> (b, c, h, w)
@@ -836,12 +869,12 @@ class F1_VLA(nn.Module):
         # Use camera config if available
         if hasattr(self.config, 'camera_config') and self.config.camera_config:
             wm_input_key = self.config.camera_config.get('world_model_input_key', 
-                "observation.images.image0_history")
+                "observation.images.head_rgb_history")
             wm_target_key = self.config.camera_config.get('world_model_target_key',
-                "observation.images.image0_target")
+                "observation.images.head_rgb_target")
         else:
-            wm_input_key = "observation.images.image0_history"
-            wm_target_key = "observation.images.image0_target"
+            wm_input_key = "observation.images.head_rgb_history"
+            wm_target_key = "observation.images.head_rgb_target"
         
         # Get history images (n_obs_img_steps frames)
         hist_img = batch[wm_input_key]  # (B, n_obs, C, H, W)

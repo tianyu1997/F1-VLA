@@ -482,16 +482,15 @@ class SequentialBatchSampler(Sampler):
         self.num_episodes = len(self.episode_samples)
         self.episode_ids = list(self.episode_samples.keys())
         
-        # Distribute episodes across ranks
-        # Each rank gets every world_size-th episode
-        self.local_episode_ids = [
-            ep_id for i, ep_id in enumerate(self.episode_ids)
-            if i % self.world_size == self.rank
-        ]
+        # BUG FIX: Dataset is already sharded by rank in create_sequential_mekvm_data()
+        # Each rank only loads its portion of episodes, so sampler should NOT re-shard.
+        # Previously this caused each rank to only access 1/world_size^2 of data!
+        # Now we use all episodes in the dataset (which is already the rank's shard).
+        self.local_episode_ids = self.episode_ids  # Use ALL episodes in this dataset
         self.local_num_episodes = len(self.local_episode_ids)
         
         if self.world_size > 1:
-            logger.info(f"[Rank {self.rank}] SequentialBatchSampler: {self.local_num_episodes}/{self.num_episodes} episodes assigned to this rank")
+            logger.info(f"[Rank {self.rank}] SequentialBatchSampler: {self.local_num_episodes} episodes (dataset already sharded)")
     
     def __iter__(self) -> Iterator[List[int]]:
         """

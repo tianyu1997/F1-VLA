@@ -107,15 +107,15 @@ class F1Config(PretrainedConfig):
             und_camera_keys = list(und_camera_keys)
         wm_camera_idx = und_camera_keys.index(wm_camera_key) if wm_camera_key in und_camera_keys else 0
         
-        # Auto-generate observation image keys from camera list
-        # World model always uses image0 naming (dataset convention)
+        # Use actual camera names directly
         self.camera_config = DictWithAttrAccess({
             "und_camera_keys": list(und_camera_keys),  # Ensure plain list
             "wm_camera_key": str(wm_camera_key),
             "wm_camera_idx": int(wm_camera_idx),
-            "understanding_image_keys": [f"observation.images.image{i}" for i in range(len(und_camera_keys))],
-            "world_model_input_key": "observation.images.image0_history",
-            "world_model_target_key": "observation.images.image0_target",
+            # Use actual camera names for image keys
+            "understanding_image_keys": [f"observation.images.{cam}" for cam in und_camera_keys],
+            "world_model_input_key": f"observation.images.{wm_camera_key}_history",
+            "world_model_target_key": f"observation.images.{wm_camera_key}_target",
         })
 
         # Memory configuration

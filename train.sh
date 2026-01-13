@@ -27,10 +27,10 @@ set -e
 # ============================================
 # Default values
 # ============================================
-CONFIG_FILE="/mnt/data2/ty/F1-VLA/f1_vla/config/memory_from_f1pretrain.yaml"
+CONFIG_FILE="/mnt/data2/ty/F1-VLA/f1_vla/config/memory_bptt.yaml"
 GPU_IDS=""
 NUM_GPUS=""
-AUTO_MODE=true
+AUTO_MODE=false
 MAX_GPUS=4
 MASTER_PORT=29500
 # Default: Resume from checkpoint-episode-10000 with VAE decoder unfrozen

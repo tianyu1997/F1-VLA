@@ -27,6 +27,7 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from flash_attn import flash_attn_func
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -411,8 +412,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 att_output = att_output.permute(0, 2, 1, 3)
                 att_output = att_output.reshape(batch_size, -1, self.num_key_value_heads * self.num_key_value_groups * head_dim)
             elif self.config.attention_implementation == "flash_attention_2":
-                from flash_attn import flash_attn_func
-
+                
                 # Handle experts_only_memory logic with Flash Attention
                 # If active, we split the attention into two parts:
                 # 1. PaliGemma queries -> Keys without memory
