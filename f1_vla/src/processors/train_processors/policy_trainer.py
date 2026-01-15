@@ -4,7 +4,7 @@ import random
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Union, Tuple
+from typing import Optional, List, Union, Tuple, Dict
 
 import torch
 
@@ -90,15 +90,21 @@ class EpisodeProgressCallback(TrainerCallback):
     """
     
     def __init__(self, policy=None, num_episodes: int = 0, total_steps: int = 0, batch_size: int = 4, num_epochs: int = 1,
-                 logging_episodes: int = 10, save_episodes: int = 100, eval_episodes: int = 50):
+                 logging_interval: int = 10, save_interval: int = 100, eval_interval: int = 50, use_memory: bool = True,
+                 num_samples: int = 0):
         self.policy = policy
         self.num_episodes = num_episodes
         self.total_steps = total_steps
         self.batch_size = batch_size
         self.num_epochs = num_epochs
-        self.logging_episodes = logging_episodes
-        self.save_episodes = save_episodes
-        self.eval_episodes = eval_episodes
+        self.logging_interval = logging_interval  # Memory: episodes, No-memory: steps
+        self.save_interval = save_interval  # Memory: episodes, No-memory: steps
+        self.eval_interval = eval_interval  # Memory: episodes, No-memory: steps
+        self.use_memory = use_memory
+        self.num_samples = num_samples  # Total samples in dataset (for no-memory mode)
+        
+        # Calculate steps per epoch for no-memory mode
+        self.steps_per_epoch = (num_samples + batch_size - 1) // batch_size if num_samples > 0 else 0
         
         # Number of episode batches (groups of batch_size episodes)
         self.num_episode_batches = (num_episodes + batch_size - 1) // batch_size
@@ -108,6 +114,7 @@ class EpisodeProgressCallback(TrainerCallback):
         self.seen_episodes = set()  # Track all seen episode indices
         self.epoch_episode_count = 0  # Episodes seen in current epoch
         self.total_episode_count = 0  # Total episodes across all epochs
+        self.epoch_step_count = 0  # Steps in current epoch (for no-memory mode)
         self.last_log_episode = 0
         self.last_save_episode = 0
         self.last_eval_episode = 0
@@ -128,6 +135,7 @@ class EpisodeProgressCallback(TrainerCallback):
             "current_epoch": self.current_epoch,
             "total_episode_count": self.total_episode_count,
             "epoch_episode_count": self.epoch_episode_count,
+            "epoch_step_count": self.epoch_step_count,
             "last_log_episode": self.last_log_episode,
             "last_save_episode": self.last_save_episode,
             "last_eval_episode": self.last_eval_episode,
@@ -141,6 +149,7 @@ class EpisodeProgressCallback(TrainerCallback):
         self.last_log_episode = state.get("last_log_episode", 0)
         self.last_save_episode = state.get("last_save_episode", 0)
         self.last_eval_episode = state.get("last_eval_episode", 0)
+        self.epoch_step_count = state.get("epoch_step_count", 0)
         
         # Calculate current epoch based on dataset size
         if self.num_episodes > 0:
@@ -148,7 +157,7 @@ class EpisodeProgressCallback(TrainerCallback):
             # We do NOT restore epoch_episode_count or seen_episodes complexly
             # We simply start counting "seen in this session's epoch" from zero
             # If HF skips batches correctly, we will just see the remainder of the epoch
-            self.epoch_episode_count = 0 
+            self.epoch_episode_count = state.get("epoch_episode_count", 0)
         else:
             self.current_epoch = state.get("current_epoch", 0)
             self.epoch_episode_count = 0
@@ -156,7 +165,8 @@ class EpisodeProgressCallback(TrainerCallback):
         self.seen_episodes = set()
         
         self._restored_from_checkpoint = True
-        logger.info(f"[EpisodeProgressCallback] Restored state: total_episodes={self.total_episode_count} -> calculated epoch={self.current_epoch}")
+        logger.info(f"[EpisodeProgressCallback] Restored state: total_episodes={self.total_episode_count}, "
+                    f"epoch={self.current_epoch}, epoch_step={self.epoch_step_count}")
     
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize progress bar at training start."""
@@ -170,39 +180,57 @@ class EpisodeProgressCallback(TrainerCallback):
                  self.current_epoch = int(state.epoch)
             
             # Recalculate epoch one last time to be sure
-            if self.num_episodes > 0:
+            if self.num_episodes > 0 and not self._restored_from_checkpoint:
                 self.current_epoch = self.total_episode_count // self.num_episodes
             
             # Description
             desc = f"E{self.current_epoch + 1}"
+            if self.num_epochs > 1:
+                desc = f"E{self.current_epoch + 1}/{self.num_epochs}"
             
-            # Initial progress within current epoch
-            initial_progress = 0 # We always start bar from 0 for the "remainder" or "new epoch"
+            # Both memory and no-memory modes: use episodes as progress unit for consistency
+            pbar_total = self.num_episodes
+            pbar_unit = "ep"
+            initial_progress = self.epoch_episode_count if self._restored_from_checkpoint else 0
+            
+            logger.info(f"[on_train_begin] use_memory={self.use_memory}, restored={self._restored_from_checkpoint}, "
+                        f"current_epoch={self.current_epoch}, total_episodes={self.total_episode_count}, "
+                        f"pbar_total={pbar_total}, initial_progress={initial_progress}")
             
             self.pbar = tqdm(
-                total=self.num_episodes,
+                total=pbar_total,
                 initial=initial_progress,
                 desc=desc,
                 dynamic_ncols=True,
                 leave=True,
-                unit="ep",
+                unit=pbar_unit,
                 ncols=80,
                 bar_format='{desc}|{bar:20}|{n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]'
             )
             self.pbar.set_postfix_str('loss=0 acc=0%')
     
     def on_epoch_begin(self, args, state, control, **kwargs):
-        """Reset episode counter at epoch start."""
-        # Update current epoch based on absolute total count
-        if self.num_episodes > 0:
+        """Reset counters at epoch start.
+        
+        For memory mode: HF Trainer controls epochs, progress = episodes
+        For no-memory mode: HF Trainer controls epochs, progress = steps
+        """
+        if state.epoch is not None:
+            self.current_epoch = int(state.epoch)
+        elif self.num_episodes > 0:
             self.current_epoch = self.total_episode_count // self.num_episodes
         
+        # Reset epoch counters
         self.seen_episodes.clear()
         self.epoch_episode_count = 0
+        self.epoch_step_count = 0
         
         if self.pbar is not None and state.is_local_process_zero:
             self.pbar.reset()
-            self.pbar.set_description(f"E{self.current_epoch + 1}")
+            desc = f"E{self.current_epoch + 1}"
+            if self.num_epochs > 1:
+                desc = f"E{self.current_epoch + 1}/{self.num_epochs}"
+            self.pbar.set_description(desc)
         
         # Clear memory bank at epoch boundary (only if memory is enabled)
         if hasattr(self, 'policy') and hasattr(self.policy, 'model'):
@@ -221,16 +249,23 @@ class EpisodeProgressCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         """Update progress bar after each step."""
         if self.pbar is not None and state.is_local_process_zero:
-            # Update display with real-time metrics (compact format)
-            self.pbar.set_postfix_str(f'L={self.current_wm_loss:.3f} A={self.current_wm_acc:.1%}')
+            # Update postfix with current metrics (without refresh)
+            self.pbar.set_postfix_str(f'L={self.current_wm_loss:.3f} A={self.current_wm_acc:.1%}', refresh=False)
+            
+            # Track step count for no-memory mode
+            if not self.use_memory:
+                self.epoch_step_count += 1
+            
+            # Refresh to show updated metrics (progress bar update happens in update_episode)
+            self.pbar.refresh()
     
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Update metrics display when logging (for logged metrics)."""
         if self.pbar is not None and state.is_local_process_zero and logs is not None:
-            # Compact postfix format
+            # Compact postfix format - update without refresh (on_step_end handles refresh)
             loss = logs.get('wm_out_loss', logs.get('loss', 0))
             acc = logs.get('wm_acc_mean', 0)
-            self.pbar.set_postfix_str(f'L={loss:.3f} A={acc:.1%}')
+            self.pbar.set_postfix_str(f'L={loss:.3f} A={acc:.1%}', refresh=False)
 
         # Lightweight GPU memory snapshot for visibility (once per log event)
         if state.is_local_process_zero and torch.cuda.is_available():
@@ -251,7 +286,7 @@ class EpisodeProgressCallback(TrainerCallback):
             self.ema_action_loss = action_loss
         
         # Exponential moving average (alpha=0.01 for smooth updates over ~100 steps)
-        alpha = 0.02
+        alpha = 0.05
         self.ema_loss = (1 - alpha) * self.ema_loss + alpha * loss
         self.ema_wm_loss = (1 - alpha) * self.ema_wm_loss + alpha * wm_loss
         self.ema_wm_acc = (1 - alpha) * self.ema_wm_acc + alpha * wm_acc
@@ -263,7 +298,10 @@ class EpisodeProgressCallback(TrainerCallback):
         self.current_action_loss = self.ema_action_loss
     
     def update_episode(self, episode_indices: list):
-        """Update episode counter with all episode indices in the current batch."""
+        """Update episode counter with all episode indices in the current batch.
+        
+        Both memory and no-memory modes now use episodes as progress unit for consistency.
+        """
         # Track all unique episodes seen in this epoch
         new_episodes_count = 0
         for ep_idx in episode_indices:
@@ -275,36 +313,48 @@ class EpisodeProgressCallback(TrainerCallback):
             self.epoch_episode_count = len(self.seen_episodes)
             self.total_episode_count += new_episodes_count
             
+            # Update progress bar by episodes (both memory and no-memory modes)
             if self.pbar is not None:
-                # Update progress bar by number of new episodes
                 self.pbar.update(new_episodes_count)
-                self.pbar.set_description(f"E{self.current_epoch + 1}/{self.num_epochs}")
+                desc = f"E{self.current_epoch + 1}"
+                if self.num_epochs > 1:
+                    desc = f"E{self.current_epoch + 1}/{self.num_epochs}"
+                self.pbar.set_description(desc)
         
         return new_episodes_count
     
     def should_log(self) -> bool:
-        """Check if should log based on episode count."""
-        if self.logging_episodes <= 0:
+        """Check if should log based on episode interval.
+        
+        Both memory and no-memory modes now use episode-based intervals for consistency.
+        """
+        if self.logging_interval <= 0:
             return False
         episodes_since_log = self.total_episode_count - self.last_log_episode
-        return episodes_since_log >= self.logging_episodes
+        return episodes_since_log >= self.logging_interval
     
     def should_save(self) -> bool:
-        """Check if should save based on episode count."""
-        if self.save_episodes <= 0:
+        """Check if should save based on episode interval.
+        
+        Both memory and no-memory modes now use episode-based intervals for consistency.
+        """
+        if self.save_interval <= 0:
             return False
         episodes_since_save = self.total_episode_count - self.last_save_episode
-        return episodes_since_save >= self.save_episodes
+        return episodes_since_save >= self.save_interval
     
     def should_eval(self) -> bool:
-        """Check if should eval based on episode count."""
-        if self.eval_episodes <= 0:
+        """Check if should eval based on episode interval.
+        
+        Both memory and no-memory modes now use episode-based intervals for consistency.
+        """
+        if self.eval_interval <= 0:
             return False
         episodes_since_eval = self.total_episode_count - self.last_eval_episode
-        should = episodes_since_eval >= self.eval_episodes
+        should = episodes_since_eval >= self.eval_interval
         if should:
             logger.info(f"[EpisodeProgressCallback] should_eval=True: total={self.total_episode_count}, "
-                       f"last_eval={self.last_eval_episode}, since_eval={episodes_since_eval}, threshold={self.eval_episodes}")
+                       f"last_eval={self.last_eval_episode}, since_eval={episodes_since_eval}, threshold={self.eval_interval}")
         return should
     
     def mark_logged(self):
@@ -372,11 +422,12 @@ class PolicyTrainer(Trainer):
         cur_n_pred_img_steps=None, 
         training_ds_sample_weights=None,
         sequential_sampler=None,  # For memory-based sequential training
+        episode_sampler=None,  # For no-memory episode-sequential I/O
         use_memory=False,
         num_episodes=0,  # Total number of episodes for progress display
-        logging_episodes=10,  # Log every N episodes
-        save_episodes=100,  # Save every N episodes  
-        eval_episodes=50,  # Eval every N episodes
+        logging_interval=10,  # Memory: episodes, No-memory: steps
+        save_interval=100,  # Memory: episodes, No-memory: steps
+        eval_interval=50,  # Memory: episodes, No-memory: steps
         eval_dataset=None,  # Dataset for evaluation
         *args, 
         **kwargs
@@ -386,6 +437,7 @@ class PolicyTrainer(Trainer):
         self.use_world_model = use_world_model
         self.use_memory = use_memory
         self.sequential_sampler = sequential_sampler
+        self.episode_sampler = episode_sampler
         self.num_episodes = num_episodes
         self.eval_dataset = eval_dataset
         logger.info(f"[PolicyTrainer] eval_dataset received: {eval_dataset is not None}, type: {type(eval_dataset)}")
@@ -404,15 +456,22 @@ class PolicyTrainer(Trainer):
         total_steps = training_args.max_steps if training_args else 0
         batch_size = training_args.per_device_train_batch_size if training_args else 4
         num_epochs = int(training_args.num_train_epochs) if training_args else 1
+        
+        # Get train_dataset to determine num_samples for no-memory mode
+        train_dataset = kwargs.get('train_dataset')
+        num_samples = len(train_dataset) if train_dataset is not None else 0
+        
         self.episode_progress_callback = EpisodeProgressCallback(
             policy=policy,
             num_episodes=num_episodes,
             total_steps=total_steps,
             batch_size=batch_size,
             num_epochs=num_epochs,
-            logging_episodes=logging_episodes,
-            save_episodes=save_episodes,
-            eval_episodes=eval_episodes,
+            logging_interval=logging_interval,
+            save_interval=save_interval,
+            eval_interval=eval_interval,
+            use_memory=use_memory,
+            num_samples=num_samples,
         )
         move_callbacks.append(self.episode_progress_callback)
 
@@ -435,6 +494,35 @@ class PolicyTrainer(Trainer):
         if getattr(self.args, "max_grad_norm", None) in (None, 0):
             self.args.max_grad_norm = 1.0
             logger.info("[PolicyTrainer] max_grad_norm not set; defaulting to 1.0 for gradient clipping")
+        
+        # Store last computed metrics for no-memory mode step-based logging
+        self._last_wm_loss = 0.0
+        self._last_wm_acc = 0.0
+        self._last_wm_acc_tail = 0.0
+    
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        """Override log to add custom metrics for no-memory mode.
+        
+        In no-memory mode, HF Trainer handles step-based logging via logging_strategy: "steps".
+        We inject our custom metrics (wm_loss, wm_acc) here so they appear in logs.
+        """
+        # Add custom metrics if not already present and we have them
+        if not self.use_memory:  # Only for no-memory mode
+            if "wm_out_loss" not in logs and hasattr(self, '_last_wm_loss') and self._last_wm_loss > 0:
+                logs["wm_out_loss"] = self._last_wm_loss
+            if "wm_acc_mean" not in logs and hasattr(self, '_last_wm_acc'):
+                logs["wm_acc_mean"] = self._last_wm_acc
+            if "wm_acc_tail" not in logs and hasattr(self, '_last_wm_acc_tail'):
+                logs["wm_acc_tail"] = self._last_wm_acc_tail
+            # Add learning rates
+            if "wm_learning_rate" not in logs and self.optimizer is not None:
+                if len(self.optimizer.param_groups) > 4:
+                    logs["wm_learning_rate"] = self.optimizer.param_groups[4]["lr"]
+                    logs["vit_learning_rate"] = self.optimizer.param_groups[0]["lr"]
+                else:
+                    logs["learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        
+        super().log(logs, start_time)
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         if output_dir is None:
@@ -457,14 +545,25 @@ class PolicyTrainer(Trainer):
         # 1. Save model, args, trainer_state (via standard _save)
         self._save(output_dir)
         
-        # 2. Save optimizer and scheduler (only on main process)
+        # 2. Save episode progress state
+        if self.episode_progress_callback and self.is_world_process_zero():
+            try:
+                state = self.episode_progress_callback.state()
+                state_path = os.path.join(output_dir, "episode_progress.json")
+                with open(state_path, "w") as f:
+                    json.dump(state, f)
+                logger.info(f"Saved episode progress to {state_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save episode progress: {e}")
+        
+        # 3. Save optimizer and scheduler (only on main process)
         if self.is_world_process_zero() and not self.args.save_only_model:
             if self.optimizer is not None:
                 torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
             if self.lr_scheduler is not None:
                 torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
         
-        # 3. Save RNG state (only on main process for now, mirroring HF behavior)
+        # 4. Save RNG state (only on main process for now, mirroring HF behavior)
         if self.is_world_process_zero() and not self.args.save_only_model:
             rng_states = {
                 "python": random.getstate(),
@@ -478,6 +577,72 @@ class PolicyTrainer(Trainer):
                     rng_states["cuda"] = torch.cuda.get_rng_state_all()
             
             torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+
+    def _restore_episode_progress(self, resume_from_checkpoint: str):
+        """Restore episode progress callback state from checkpoint.
+        
+        Called explicitly before train() to ensure state is restored
+        even if HF Trainer's _load_from_checkpoint is not called.
+        """
+        if not self.episode_progress_callback:
+            logger.warning(f"[Resume] No episode_progress_callback!")
+            return
+            
+        state_path = os.path.join(resume_from_checkpoint, "episode_progress.json")
+        logger.info(f"[Resume] Checking for state file at: {state_path}")
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, "r") as f:
+                    state = json.load(f)
+                self.episode_progress_callback.load_state(state)
+                logger.info(f"[Resume] Loaded episode progress from {state_path}")
+                return
+            except Exception as e:
+                logger.warning(f"[Resume] Failed to load episode progress from {state_path}: {e}")
+        else:
+            logger.info(f"[Resume] No state file found, trying to infer from checkpoint name")
+        
+        # Fallback: infer from checkpoint directory name
+        try:
+            dir_name = os.path.basename(resume_from_checkpoint.rstrip('/'))
+            logger.info(f"[Resume] Checkpoint dir name: {dir_name}")
+            if dir_name.startswith("checkpoint-episode-"):
+                ep_count = int(dir_name.split("-")[-1])
+                self.episode_progress_callback.total_episode_count = ep_count
+                self.episode_progress_callback.last_save_episode = ep_count
+                self.episode_progress_callback.last_log_episode = ep_count
+                self.episode_progress_callback.last_eval_episode = ep_count
+                self.episode_progress_callback._restored_from_checkpoint = True
+                
+                # Calculate current epoch and epoch progress
+                num_eps = self.episode_progress_callback.num_episodes
+                if num_eps > 0:
+                    self.episode_progress_callback.current_epoch = ep_count // num_eps
+                    epoch_ep_count = ep_count % num_eps
+                    if epoch_ep_count == 0 and ep_count > 0:
+                        # Exactly at epoch boundary
+                        epoch_ep_count = num_eps
+                        self.episode_progress_callback.current_epoch -= 1
+                    
+                    self.episode_progress_callback.epoch_episode_count = epoch_ep_count
+                    
+                    # For no-memory mode, estimate step count from episode count
+                    # Each episode has avg num_samples/num_episodes frames
+                    if not self.episode_progress_callback.use_memory:
+                        avg_frames_per_ep = self.episode_progress_callback.num_samples / num_eps if num_eps > 0 else 0
+                        epoch_samples = epoch_ep_count * avg_frames_per_ep
+                        self.episode_progress_callback.epoch_step_count = int(epoch_samples / self.episode_progress_callback.batch_size)
+                    
+                    for i in range(epoch_ep_count):
+                        self.episode_progress_callback.seen_episodes.add(-(i + 1))
+                
+                logger.info(f"[Resume] Inferred: ep_count={ep_count}, num_episodes={num_eps}, "
+                            f"epoch={self.episode_progress_callback.current_epoch}, epoch_ep_count={self.episode_progress_callback.epoch_episode_count}, "
+                            f"epoch_step_count={self.episode_progress_callback.epoch_step_count}")
+            else:
+                logger.warning(f"[Resume] Checkpoint name doesn't start with 'checkpoint-episode-': {dir_name}")
+        except Exception as e:
+            logger.warning(f"[Resume] Failed to infer episode count from checkpoint name: {e}")
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         super()._load_from_checkpoint(resume_from_checkpoint, model)
@@ -529,9 +694,19 @@ class PolicyTrainer(Trainer):
     
     
     def get_train_dataloader(self):
-        """Override to use sequential sampler for memory-based training."""
+        """Override to use custom sampler.
+        
+        IMPORTANT: The dataset is already sharded by rank (each rank loads only its episodes).
+        We must NOT use HF Trainer's DistributedSampler which would shard again.
+        
+        - Memory mode: Use sequential_sampler (SequentialBatchSampler)
+        - No memory mode: Use episode_sampler (EpisodeSequentialSampler) for sequential I/O
+        """
+        from torch.utils.data import DataLoader, RandomSampler
+        
         if self.sequential_sampler is not None:
-            from torch.utils.data import DataLoader
+            # Memory mode: use sequential batch sampler
+            logger.info(f"[DataLoader] Memory mode: using SequentialBatchSampler, dataset size={len(self.train_dataset)}")
             return DataLoader(
                 self.train_dataset,
                 batch_sampler=self.sequential_sampler,
@@ -541,7 +716,29 @@ class PolicyTrainer(Trainer):
                 persistent_workers=self.args.dataloader_persistent_workers if self.args.dataloader_num_workers > 0 else False,
                 prefetch_factor=self.args.dataloader_prefetch_factor if self.args.dataloader_num_workers > 0 else None,
             )
-        return super().get_train_dataloader()
+        
+        # No memory mode: use episode-sequential sampler for better disk I/O
+        # Episodes are shuffled but frames within episodes are sequential
+        if self.episode_sampler is not None:
+            sampler = self.episode_sampler
+            logger.info(f"[DataLoader] No-memory mode: using EpisodeSequentialSampler for sequential I/O, "
+                        f"dataset size={len(self.train_dataset)}, batch_size={self.args.per_device_train_batch_size}")
+        else:
+            # Fallback to RandomSampler (NOT DistributedSampler since data is pre-sharded)
+            sampler = RandomSampler(self.train_dataset)
+            logger.info(f"[DataLoader] No-memory mode: using RandomSampler, "
+                        f"dataset size={len(self.train_dataset)}, batch_size={self.args.per_device_train_batch_size}")
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+            persistent_workers=self.args.dataloader_persistent_workers if self.args.dataloader_num_workers > 0 else False,
+            prefetch_factor=self.args.dataloader_prefetch_factor if self.args.dataloader_num_workers > 0 else None,
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # Update episode progress if available
@@ -659,6 +856,12 @@ class PolicyTrainer(Trainer):
 
         loss = outputs["loss"]
         
+        # Store metrics for no-memory mode step-based logging (used in self.log() override)
+        if not self.use_memory:
+            self._last_wm_loss = outputs.get("wm_loss", torch.tensor(0)).cpu().item()
+            self._last_wm_acc = outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item()
+            self._last_wm_acc_tail = outputs.get("wm_acc_tail", torch.tensor(0)).cpu().item()
+        
         # Update real-time metrics for progress bar (every micro-batch for real-time display)
         if hasattr(self, 'episode_progress_callback') and self.state.is_local_process_zero:
             wm_loss = outputs.get("wm_loss", torch.tensor(0)).cpu().item()
@@ -682,7 +885,7 @@ class PolicyTrainer(Trainer):
                 }
                 episode_log = {
                     "episode": self.episode_progress_callback.total_episode_count,
-                    "epoch": self.episode_progress_callback.current_epoch + 1,
+                    "train_epoch": self.episode_progress_callback.current_epoch + 1,
                 }
                 if self.policy.use_world_model:
                     wm_log = {
@@ -889,7 +1092,7 @@ class PolicyTrainer(Trainer):
             if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_log():
                 episode_log = {
                     "episode": self.episode_progress_callback.total_episode_count,
-                    "epoch": self.episode_progress_callback.current_epoch + 1,
+                    "train_epoch": self.episode_progress_callback.current_epoch + 1,
                 }
                 wm_log = {
                     "wm_out_loss": outputs.get("wm_loss", torch.tensor(0)).cpu().item() if hasattr(outputs.get("wm_loss", 0), "cpu") else outputs.get("wm_loss", 0),

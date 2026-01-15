@@ -41,6 +41,7 @@ def load_ckpt(policy, config):
     
     if load_ckpt_path is not None:
         import os
+        import time
         from safetensors import safe_open
         
         ckpt_path = config.exp.load_ckpt
@@ -50,22 +51,48 @@ def load_ckpt(policy, config):
         
         logger.info(f"Loading pretrained checkpoint from: {ckpt_path}")
         
+        # Check if file exists and is valid before attempting to load
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+        
+        file_size = os.path.getsize(ckpt_path)
+        logger.info(f"  Checkpoint file size: {file_size / (1024**3):.2f} GB")
+        
         # Load checkpoint with key mapping for backward compatibility
         # Key mappings:
         # 1. model.paligemma_with_expert.gemma_expert.xxx -> model.paligemma_with_expert.gemma_experts.actor.xxx
         # 2. model.vae.xxx is duplicated to vae.xxx (VAE is registered in both policy.vae and policy.model.vae)
+        
+        # Retry logic for multi-GPU loading to avoid race conditions
+        max_retries = 3
+        retry_delay = 2.0
         state_dict = {}
-        with safe_open(ckpt_path, framework="pt") as f:
-            for key in f.keys():
-                new_key = key
-                # Map old gemma_expert to new gemma_experts.actor
-                if '.gemma_expert.' in key and '.gemma_experts.' not in key and '.gemma_wm_expert.' not in key:
-                    new_key = key.replace('.gemma_expert.', '.gemma_experts.actor.')
-                state_dict[new_key] = f.get_tensor(key)
-                # Duplicate model.vae.xxx to vae.xxx (VAE is registered twice in the model)
-                if key.startswith('model.vae.'):
-                    vae_key = key[6:]  # Remove 'model.' prefix -> 'vae.xxx'
-                    state_dict[vae_key] = f.get_tensor(key)
+        
+        for attempt in range(max_retries):
+            try:
+                with safe_open(ckpt_path, framework="pt") as f:
+                    for key in f.keys():
+                        new_key = key
+                        # Map old gemma_expert to new gemma_experts.actor
+                        if '.gemma_expert.' in key and '.gemma_experts.' not in key and '.gemma_wm_expert.' not in key:
+                            new_key = key.replace('.gemma_expert.', '.gemma_experts.actor.')
+                        state_dict[new_key] = f.get_tensor(key)
+                        # Duplicate model.vae.xxx to vae.xxx (VAE is registered twice in the model)
+                        if key.startswith('model.vae.'):
+                            vae_key = key[6:]  # Remove 'model.' prefix -> 'vae.xxx'
+                            state_dict[vae_key] = f.get_tensor(key)
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"  Attempt {attempt + 1}/{max_retries} failed to load checkpoint: {e}")
+                    logger.warning(f"  Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"  Failed to load checkpoint after {max_retries} attempts")
+                    logger.error(f"  Last error: {e}")
+                    logger.error(f"  File path: {ckpt_path}")
+                    logger.error(f"  File size: {file_size} bytes")
+                    raise
         
         # Check key compatibility after mapping
         model_keys = set(policy.state_dict().keys())
@@ -209,11 +236,11 @@ def set_camera_config(policy_config, exp_config):
         # Find wm_camera index in und_camera_keys (for image key naming)
         wm_camera_idx = und_camera_keys.index(wm_camera_key) if wm_camera_key in und_camera_keys else 0
         
-        # Auto-generate observation image keys
-        understanding_image_keys = [f"observation.images.image{i}" for i in range(len(und_camera_keys))]
-        # World model always uses image0 naming (dataset convention)
-        world_model_input_key = "observation.images.image0_history"
-        world_model_target_key = "observation.images.image0_target"
+        # Use actual camera names for observation keys (e.g., observation.images.wrist_rgb)
+        understanding_image_keys = [f"observation.images.{cam}" for cam in und_camera_keys]
+        # World model uses actual camera name (e.g., observation.images.wrist_rgb_history)
+        world_model_input_key = f"observation.images.{wm_camera_key}_history"
+        world_model_target_key = f"observation.images.{wm_camera_key}_target"
         
         policy_config.camera_config = DictWithAttrAccess({
             "und_camera_keys": und_camera_keys,

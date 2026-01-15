@@ -5,42 +5,58 @@
 # 模型配置
 # =============================================================================
 model:
-  # F1-VLA模型路径
-  pretrained_path: "/mnt/data2/ty/F1-VLA/F1_pretrain"
+  # F1-VLA checkpoint路径（包含完整模型：policy + VAE + WM）
+  ckpt_path: "/mnt/data2/ty/F1-VLA/F1_pretrain"
   
-  # VAE配置
-  vae:
-    checkpoint_path: "/mnt/data2/ty/F1-VLA/var/vae_ch160v4096z32.pth"
-    vocab_size: 4096
-    z_channels: 32
-    ch: 160
-    
-  # World Model配置
-  world_model:
-    checkpoint_path: "/mnt/data2/ty/F1-VLA/wm"
+  # VAE 配置
+  vae_z_channels: 32  # VAE latent channels for embedding extraction
     
   # Actor配置
   actors:
     # 原始Actor (用于对比)
     actor:
-      checkpoint_path: null  # 使用预训练权重
+      checkpoint_path: null  # 可选：保存的actor checkpoint路径
       trainable: false
-    # Explorer Actor (随机初始化)
+    # Explorer Actor
     explorer:
-      checkpoint_path: null  # 随机初始化
+      checkpoint_path: null  # 可选：保存的explorer checkpoint路径
       trainable: true
+      
+  # Explorer 初始化方式
+  # 可选值：
+  #   - "auto": 自动选择 (优先级: explorer -> actor -> gemma_expert)
+  #   - "explorer": 仅从 explorer checkpoint 加载（必须提供 explorer.checkpoint_path）
+  #   - "actor": 仅从 actor checkpoint 加载（必须提供 actor.checkpoint_path）
+  #   - "gemma_expert": 从预训练的 gemma_expert 复制权重
+  #   - "random": 随机初始化
+  explorer_init_from: "auto"
       
   # 当前使用的actor
   active_actor: "explorer"
 
 # =============================================================================
-# 环境配置
+# 数据集配置 (offline RL)
+# =============================================================================
+dataset:
+  # 数据目录列表 (offline RL mode)
+  data_dirs:
+    - "/mnt/data2/ty/F1-VLA/data/clean"
+  task_descriptions: null  # 可选：每个数据目录对应的任务描述
+  n_obs_img_steps: 4       # 观测历史帧数
+  n_pred_img_steps: 1      # 预测未来帧数
+  chunk_size: 4            # 动作块大小
+  batch_size: 2            # Phase 2 batch size (small for adversarial training)
+  camera_keys: ["head_rgb", "wrist_rgb"]   # 可用相机列表，顺序将影响默认选择
+  wm_camera_key: "head_rgb"                 # 用于WM和reward的主相机
+
+# =============================================================================
+# 环境配置 (online RL, deprecated - use dataset instead)
 # =============================================================================
 environment:
-  # 环境类型
-  type: "mock"  # Changed to mock for testing (options: robotwin, libero, simpler, mock)
+  # 环境类型: dataset (offline RL), robotwin (online RL), mock (testing)
+  type: "dataset"  # Changed to dataset for offline RL
   
-  # RoboTwin环境配置
+  # RoboTwin环境配置 (only for online RL)
   robotwin:
     task: "block_hammer_beat"
     headless: true
@@ -50,6 +66,7 @@ environment:
   observation:
     image_size: 224
     history_length: 4  # L=4
+    wm_camera_key: "head_rgb"  # 与dataset.wm_camera_key保持一致
     
   # 动作配置
   action:

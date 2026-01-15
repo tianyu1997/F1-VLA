@@ -130,7 +130,8 @@ def main(args: argparse.Namespace, overrides: list):
         # Use Sequential dataset for BOTH memory and non-memory modes
         # SequentialMEKVMDataset has better caching and supports camera config
         from f1_vla.src.processors.data_processors.sequential_dataset import (
-            create_sequential_mekvm_data, SequentialCollateFn, SequentialBatchSampler
+            create_sequential_mekvm_data, SequentialCollateFn, SequentialBatchSampler,
+            EpisodeSequentialSampler
         )
         
         # Get distributed training info FIRST
@@ -173,15 +174,24 @@ def main(args: argparse.Namespace, overrides: list):
                 rank=0,  # Each dataset is already a shard, so sampler treats it as rank 0
                 world_size=1,
             )
+            episode_sampler = None  # Memory mode doesn't use episode_sampler
             logger.info(f"Window config: n_obs={n_obs}, k_bptt={k_bptt}, window_length={window_length}, stride={k_bptt}")
             logger.info(f"Using SEQUENTIAL data loading for memory-based training (rank={rank}, world_size={world_size})")
         else:
-            # Non-memory mode: use standard random sampling
-            sequential_sampler = None
-            logger.info(f"Using RANDOM data loading (no memory) with SequentialMEKVMDataset (rank={rank}, world_size={world_size})")
+            # Non-memory mode: use episode-sequential sampling for better disk I/O
+            # Episodes are shuffled, but frames within episodes are sequential
+            # This enables sequential disk reads and efficient caching
+            episode_sampler = EpisodeSequentialSampler(
+                dataset=training_dataset,
+                shuffle_episodes=True,
+                seed=42,
+            )
+            sequential_sampler = None  # Will pass episode_sampler separately
+            logger.info(f"Using EPISODE-SEQUENTIAL data loading (no memory) for better I/O (rank={rank}, world_size={world_size})")
     else:
         # Use LeRobot data format
         sequential_sampler = None
+        episode_sampler = None
         data_config = create_data_config(config.dataset, policy_config, config.exp)
         (
             training_dataset, 
@@ -251,10 +261,11 @@ def main(args: argparse.Namespace, overrides: list):
     elif hasattr(training_dataset, 'num_episodes'):
         num_episodes = training_dataset.num_episodes
     
-    # Get episode-based settings from config
-    logging_episodes = config.exp.training_args.get("logging_episodes", 100)
-    save_episodes = config.exp.training_args.get("save_episodes", 500)
-    eval_episodes = config.exp.training_args.get("eval_episodes", 500)
+    # Get interval settings from config
+    # Both memory and no-memory modes now use episode-based intervals for consistency
+    logging_interval = config.exp.training_args.get("logging_episodes", 100)
+    save_interval = config.exp.training_args.get("save_episodes", 500)
+    eval_interval = config.exp.training_args.get("eval_episodes", 500)
     
     trainer = PolicyTrainer(
         policy=policy,
@@ -268,11 +279,12 @@ def main(args: argparse.Namespace, overrides: list):
         cur_n_pred_img_steps=cur_n_pred_img_steps,
         training_ds_sample_weights=training_ds_sample_weights,
         sequential_sampler=sequential_sampler if use_memory else None,
+        episode_sampler=episode_sampler,  # For no-memory episode-sequential I/O
         use_memory=use_memory,
         num_episodes=num_episodes,
-        logging_episodes=logging_episodes,
-        save_episodes=save_episodes,
-        eval_episodes=eval_episodes,
+        logging_interval=logging_interval,  # Episodes interval for logging
+        save_interval=save_interval,  # Episodes interval for saving
+        eval_interval=eval_interval,  # Episodes interval for evaluation
         eval_dataset=training_dataset,  # Use same dataset for eval (can be changed)
     )
 
@@ -287,9 +299,15 @@ def main(args: argparse.Namespace, overrides: list):
             checkpoint = last_checkpoint
         logger.info(f"Training from checkpoint: {checkpoint}")
         
-        # NOTE: Removed forced ignore_data_skip=True for SequentialBatchSampler
-        # We rely on correct state restoration and HF's skipping mechanism.
-        # If sequential sampler is deterministic per epoch, skipping is safe.
+        # Manually restore episode progress callback state before training
+        # HF Trainer's _load_from_checkpoint may not be called in all cases
+        if checkpoint is not None:
+            logger.info(f"[Resume] Attempting to restore episode progress from: {checkpoint}")
+            if hasattr(trainer, 'episode_progress_callback'):
+                logger.info(f"[Resume] episode_progress_callback exists, calling _restore_episode_progress")
+                trainer._restore_episode_progress(checkpoint)
+            else:
+                logger.warning(f"[Resume] No episode_progress_callback on trainer!")
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()

@@ -130,8 +130,26 @@ fi
 # ============================================
 # Setup environment
 # ============================================
-source ~/.bashrc
-conda activate f1 2>/dev/null || source ~/miniconda3/etc/profile.d/conda.sh && conda activate f1
+# Robust conda activation (works with different conda installations)
+if [ -f ~/.bashrc ]; then
+    source ~/.bashrc
+fi
+
+# Try multiple conda activation methods
+if ! command -v conda &> /dev/null; then
+    # Try common conda paths
+    for CONDA_PATH in ~/miniconda3 ~/anaconda3 /opt/conda ~/mambaforge; do
+        if [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ]; then
+            source "$CONDA_PATH/etc/profile.d/conda.sh"
+            break
+        fi
+    done
+fi
+
+# Activate the environment
+conda activate f1 2>/dev/null || {
+    echo "Warning: Failed to activate conda environment 'f1'. Proceeding with current environment."
+}
 
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 export TOKENIZERS_PARALLELISM=false

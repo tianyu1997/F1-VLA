@@ -735,25 +735,26 @@ def compute_batch_rewards(
     action_penalty_all = torch.stack(action_penalty_all, dim=1)  # (B, T)
     
     # Compute rewards for t = 0 to T-2 (need t+1 and t+2)
+    # Reward for action a_t is based on state s_{t+1}
     rewards = []
     r1_all, r2_all, r3_all, r4_all = [], [], [], []
     
     for t in range(T - 1):
-        # r1: uncertainty_{t+1}
-        r1 = unc_all[:, t]
+        # r1: uncertainty_{t+1} - reward for action a_t based on next state
+        r1 = unc_all[:, t + 1] if t + 1 < T else unc_all[:, t]
         
-        # r2: MSE_{t+1}
-        r2 = mse_all[:, t]
+        # r2: MSE_{t+1} - prediction error at next state
+        r2 = mse_all[:, t + 1] if t + 1 < T else mse_all[:, t]
         
-        # r3: MSE_{t+1} - MSE_{t+2} (if t+2 available)
-        if t + 1 < T:
-            r3 = mse_all[:, t] - mse_all[:, t + 1]
+        # r3: MSE_{t+1} - MSE_{t+2} (improvement, if t+2 available)
+        if t + 2 < T:
+            r3 = mse_all[:, t + 1] - mse_all[:, t + 2]
         else:
             r3 = torch.zeros_like(r1)
         
-        # r4: unc_{t+1} - unc_{t+2} (if t+2 available)
-        if t + 1 < T:
-            r4 = unc_all[:, t] - unc_all[:, t + 1]
+        # r4: unc_{t+1} - unc_{t+2} (uncertainty reduction, if t+2 available)
+        if t + 2 < T:
+            r4 = unc_all[:, t + 1] - unc_all[:, t + 2]
         else:
             r4 = torch.zeros_like(r1)
         

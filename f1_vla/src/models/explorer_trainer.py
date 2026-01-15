@@ -736,6 +736,10 @@ class ExplorerRLTrainer:
                 clip_frac = ((ratio - 1.0).abs() > self.config.clip_epsilon).float().mean().item()
                 avg_advantage = mb_advantages.mean().item()
         
+        # Update learning rate scheduler after each train_step
+        if self.scheduler is not None:
+            self.scheduler.step()
+        
         return {
             'policy_loss': total_policy_loss / num_batches,
             'value_loss': total_value_loss / num_batches,
@@ -745,6 +749,7 @@ class ExplorerRLTrainer:
             'clip_fraction': clip_frac,
             'advantage_mean': avg_advantage,
             'std': std.mean().item(),
+            'learning_rate': self.optimizer.param_groups[0]['lr'],  # Track LR for monitoring
         }
     
     def save_checkpoint(self, checkpoint_path: str):

@@ -73,14 +73,13 @@ from f1_vla.src.models.f1_integration import (
 class ExplorerTrainConfig:
     """Complete training configuration."""
     
-    # Model paths
-    pretrained_path: str = ""
-    vae_checkpoint: str = ""
-    wm_checkpoint: str = ""
+    # Model paths - 单一checkpoint路径（包含完整模型）
+    ckpt_path: str = ""
     
-    # VAE config
-    vae_vocab_size: int = 4096
-    vae_z_channels: int = 32
+    # Actor loading config
+    explorer_checkpoint: str = None  # Path to saved explorer weights
+    actor_checkpoint: str = None     # Path to saved actor weights  
+    explorer_init_from: str = "auto" # "auto", "explorer", "actor", "gemma_expert", "random"
     
     # Dataset config (for sequential data loading)
     data_dirs: List[str] = None  # List of directories containing episode_*.pt files
@@ -150,13 +149,16 @@ class ExplorerTrainConfig:
         # Model config
         if 'model' in config_dict:
             model = config_dict['model']
-            flat_config['pretrained_path'] = model.get('pretrained_path', '')
-            if 'vae' in model:
-                flat_config['vae_checkpoint'] = model['vae'].get('checkpoint_path', '')
-                flat_config['vae_vocab_size'] = model['vae'].get('vocab_size', 4096)
-                flat_config['vae_z_channels'] = model['vae'].get('z_channels', 32)
-            if 'world_model' in model:
-                flat_config['wm_checkpoint'] = model['world_model'].get('checkpoint_path', '')
+            flat_config['ckpt_path'] = model.get('ckpt_path', '')
+            
+            # Actor loading config
+            flat_config['explorer_init_from'] = model.get('explorer_init_from', 'auto')
+            if 'actors' in model:
+                actors = model['actors']
+                if 'explorer' in actors:
+                    flat_config['explorer_checkpoint'] = actors['explorer'].get('checkpoint_path', None)
+                if 'actor' in actors:
+                    flat_config['actor_checkpoint'] = actors['actor'].get('checkpoint_path', None)
         
         # Environment config
         if 'environment' in config_dict:
@@ -329,153 +331,64 @@ class ExplorerTrainingPipeline:
         self.logger.info(f"Random seed set to {seed}")
     
     def load_models(self):
-        """Load F1-VLA policy with Explorer actor and VAE."""
-        self.logger.info("Loading models...")
-        self.logger.info(f"  Policy path: {self.config.pretrained_path}")
-        self.logger.info(f"  VAE path: {self.config.vae_checkpoint}")
+        """
+        Load F1-VLA policy with Explorer actor and VAE.
         
-        # Try to load actual F1-VLA policy
-        use_mock = False
+        模仿 train_hf.py 的加载方式：
+        1. 直接从一个 checkpoint 加载完整模型（包含 VAE 和 WM）
+        2. 不分块加载
+        3. Explorer actor 加载顺序（可配置）：
+           - "auto": explorer checkpoint -> actor checkpoint -> gemma_expert
+           - "explorer": 仅从 explorer checkpoint
+           - "actor": 仅从 actor checkpoint
+           - "gemma_expert": 从预训练权重复制
+           - "random": 随机初始化
+        """
+        self.logger.info("Loading models (train_hf.py style)...")
+        self.logger.info(f"  Checkpoint path: {self.config.ckpt_path}")
+        self.logger.info(f"  Explorer init from: {self.config.explorer_init_from}")
+        self.logger.info(f"  Explorer checkpoint: {self.config.explorer_checkpoint}")
+        self.logger.info(f"  Actor checkpoint: {self.config.actor_checkpoint}")
         
-        if self.config.pretrained_path and os.path.exists(self.config.pretrained_path):
-            try:
-                self.policy, self.vae = load_f1_vla_policy(
-                    config_path=self.config.pretrained_path,
-                    checkpoint_path=self.config.pretrained_path,
-                    vae_path=self.config.vae_checkpoint,
-                    device=str(self.device),
-                    add_explorer=True,
-                    train_act_expert_only=True,  # Only train explorer actor
-                )
-                self.logger.info("  Loaded actual F1-VLA policy")
-                self.logger.info(f"  Available actors: {self.policy.list_actors()}")
-            except Exception as e:
-                import traceback
-                self.logger.warning(f"  Failed to load F1-VLA: {e}")
-                self.logger.warning(f"  Traceback: {traceback.format_exc()}")
-                use_mock = True
-        else:
-            self.logger.info("  No pretrained path provided, using mock policy")
-            use_mock = True
+        if not self.config.ckpt_path or not os.path.exists(self.config.ckpt_path):
+            raise ValueError(
+                f"ckpt_path is required for Explorer training. "
+                f"Got: {self.config.ckpt_path}"
+            )
         
-        if use_mock:
-            self.logger.info("  Using mock policy and VAE for testing")
-            self.policy = self._create_mock_policy()
-            self.vae = self._load_mock_vae()
+        try:
+            # Load F1-VLA policy with flexible explorer initialization
+            self.policy, self.vae = load_f1_vla_policy(
+                ckpt_path=self.config.ckpt_path,
+                device=str(self.device),
+                add_explorer=True,  # Add explorer actor
+                train_act_expert_only=True,  # Only train explorer actor
+                explorer_checkpoint_path=self.config.explorer_checkpoint,
+                actor_checkpoint_path=self.config.actor_checkpoint,
+                explorer_init_from=self.config.explorer_init_from,
+            )
+            self.logger.info("  Loaded F1-VLA policy successfully")
+            self.logger.info(f"  Available actors: {self.policy.list_actors()}")
+            self.logger.info(f"  Active actor: {self.policy.active_actor}")
+            
+        except Exception as e:
+            import traceback
+            self.logger.error(f"  Failed to load F1-VLA: {e}")
+            self.logger.error(f"  Traceback: {traceback.format_exc()}")
+            raise RuntimeError(
+                f"Failed to load F1-VLA policy from {self.config.pretrained_path}. "
+                f"Explorer training requires a valid pretrained model."
+            ) from e
         
         # Initialize embedding extractor (use vae_extractor for consistency with rest of code)
+        # Get embedding dim from VAE's z_channels config
+        vae_z_channels = getattr(self.vae, 'z_channels', 32)
         self.vae_extractor = VAEEmbeddingExtractor(
             vae=self.vae,
-            embedding_dim=self.config.vae_z_channels,
+            embedding_dim=vae_z_channels,
         )
         
         self.logger.info("Models loaded successfully")
-    
-    def _create_mock_policy(self) -> nn.Module:
-        """Create mock policy for testing."""
-        # This should be replaced with actual F1-VLA policy loading
-        
-        class MockPolicy(nn.Module):
-            def __init__(self, action_dim, hidden_dim=256):
-                super().__init__()
-                self.action_dim = action_dim
-                self.hidden_dim = hidden_dim
-                self.active_actor = 'explorer'
-                
-                # Mock state projection
-                self.model = nn.Module()
-                self.model.state_proj = nn.Linear(14, hidden_dim)  # state_dim -> hidden_dim
-                
-                # Mock explorer actor
-                self.actors = nn.ModuleDict({
-                    'explorer': nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim),
-                        nn.ReLU(),
-                        nn.Linear(hidden_dim, action_dim)
-                    )
-                })
-                
-                # Mock world model (for embedding generation)
-                self.world_model = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim)
-                )
-                
-            def forward(self, x, actor_name='explorer'):
-                return self.actors[actor_name](x)
-            
-            def get_actor(self, name):
-                if name in self.actors:
-                    return self.actors[name]
-                return None
-            
-            def list_actors(self):
-                return list(self.actors.keys())
-            
-            def set_trainable_actors(self, actor_names):
-                # For mock, just pass
-                pass
-            
-            def forward_with_actor(self, batch, actor_name='explorer', **kwargs):
-                """Forward pass with specific actor."""
-                if 'state_emb' in batch:
-                    state_emb = batch['state_emb']
-                elif 'observation.state' in batch:
-                    state = batch['observation.state']
-                    state_emb = self.model.state_proj(state)
-                else:
-                    raise ValueError(f"batch missing 'state_emb' or 'observation.state'. Got keys: {list(batch.keys())}")
-                
-                action = self.actors[actor_name](state_emb)
-                return {'action': action, 'state_emb': state_emb}
-        
-        policy = MockPolicy(self.config.action_dim)
-        policy.to(self.device)
-        return policy
-    
-    def _load_mock_vae(self) -> Optional[nn.Module]:
-        """Load mock VAE model for testing."""
-        
-        class MockVAE(nn.Module):
-            def __init__(self, embed_dim=1280, vocab_size=4096, z_channels=32):
-                super().__init__()
-                self.embed_dim = embed_dim
-                self.vocab_size = vocab_size
-                self.z_channels = z_channels
-                self.codebook = nn.Embedding(vocab_size, embed_dim)
-                
-                # Mock encoder and quant_conv for VAEEmbeddingExtractor compatibility
-                self.encoder = nn.Sequential(
-                    nn.Conv2d(3, 64, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(64, 128, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(128, z_channels, 4, stride=2, padding=1),
-                )
-                self.quant_conv = nn.Conv2d(z_channels, z_channels, 1)
-                
-            def encode(self, x):
-                # Mock encoding: return random embedding
-                B = x.shape[0] if len(x.shape) > 1 else 1
-                return torch.randn(B, self.embed_dim, device=x.device)
-            
-            def get_codebook_embedding(self):
-                return self.codebook.weight
-        
-        vae = MockVAE(
-            embed_dim=1280,
-            vocab_size=self.config.vae_vocab_size,
-            z_channels=self.config.vae_z_channels
-        )
-        vae.to(self.device)
-        
-        # Load checkpoint if exists
-        if self.config.vae_checkpoint and os.path.exists(self.config.vae_checkpoint):
-            self.logger.info(f"  Loading VAE checkpoint: {self.config.vae_checkpoint}")
-            # Note: mock VAE won't match actual checkpoint structure
-        
-        return vae
     
     def setup_environment(self):
         """Setup training environment and data source."""
@@ -1459,14 +1372,31 @@ class ExplorerTrainingPipeline:
                 emb_var = target_emb.var(dim=-1)
             
             # Combine signals: normalize both to [0, 1] and average
-            mag_normalized = (emb_magnitude - emb_magnitude.min()) / (emb_magnitude.max() - emb_magnitude.min() + 1e-8)
-            var_normalized = (emb_var - emb_var.min()) / (emb_var.max() - emb_var.min() + 1e-8)
+            # Use batch-level normalization to preserve relative differences
+            mag_min, mag_max = emb_magnitude.min(), emb_magnitude.max()
+            var_min, var_max = emb_var.min(), emb_var.max()
+            
+            # Prevent division by zero and maintain signal
+            mag_range = mag_max - mag_min
+            var_range = var_max - var_min
+            
+            if mag_range > 1e-6:
+                mag_normalized = (emb_magnitude - mag_min) / (mag_range + 1e-8)
+            else:
+                mag_normalized = torch.ones_like(emb_magnitude) * 0.5  # Default to mid-range
+            
+            if var_range > 1e-6:
+                var_normalized = (emb_var - var_min) / (var_range + 1e-8)
+            else:
+                var_normalized = torch.ones_like(emb_var) * 0.5
             
             # Weight: 0.6 magnitude + 0.4 variance
+            # This provides a reasonable uncertainty proxy when actual WM logits aren't available
             uncertainty = 0.6 * mag_normalized + 0.4 * var_normalized
             
-            # Add small random noise to encourage exploration
-            uncertainty = uncertainty + 0.1 * torch.rand_like(uncertainty)
+            # Scale uncertainty to reasonable reward range [0, 1]
+            # Don't add random noise during actual training - it can destabilize learning
+            # uncertainty = uncertainty + 0.1 * torch.rand_like(uncertainty)  # Removed: causes instability
             
             # Cleanup
             del gt_indices_per_scale, gt_emb
@@ -1609,6 +1539,10 @@ class ExplorerTrainingPipeline:
         
         advantages = torch.tensor(advantages, device=self.device, dtype=torch.float32)
         returns = torch.tensor(returns, device=self.device, dtype=torch.float32)
+        
+        # Normalize advantages for stable training (critical for convergence)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # Detach all tensors to allow multiple PPO epochs over same data
         ppo_batch = {

@@ -27,7 +27,7 @@ set -e
 # ============================================
 # Default values
 # ============================================
-CONFIG_FILE="/mnt/data2/ty/F1-VLA/f1_vla/config/memory_bptt.yaml"
+CONFIG_FILE="/mnt/data2/ty/F1-VLA/f1_vla/config/no_memory_head_and_wrist.yaml"
 GPU_IDS=""
 NUM_GPUS=""
 AUTO_MODE=false
@@ -140,7 +140,8 @@ fi
 # Setup environment
 # ============================================
 source ~/.bashrc
-conda activate f1 2>/dev/null || source ~/miniconda3/etc/profile.d/conda.sh && conda activate f1
+# Activate env, fall back to sourcing conda.sh if direct activation fails
+conda activate f1 2>/dev/null || { source ~/miniconda3/etc/profile.d/conda.sh && conda activate f1; }
 
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 export TOKENIZERS_PARALLELISM=false
@@ -183,10 +184,15 @@ if [ -n "$RESUME_CKPT" ]; then
         # echo "Available checkpoints in outputs/memory_wm_clean_only/:"
         # ls -d outputs/memory_wm_clean_only/checkpoint-* 2>/dev/null || echo "  (none)"
         echo ""
-        read -p "Continue without resuming? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [ -t 0 ]; then
+            read -p "Continue without resuming? (y/n) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        else
+             echo "Non-interactive mode detected. Aborting because resume checkpoint was not found."
+             exit 1
         fi
         RESUME_CKPT=""
     else
@@ -195,7 +201,6 @@ if [ -n "$RESUME_CKPT" ]; then
         echo "Checkpoint verified: $RESUME_CKPT"
     fi
 fi
-
 # ============================================
 # Run training with torchrun
 # ============================================

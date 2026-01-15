@@ -677,8 +677,25 @@ class F1_VLA(nn.Module):
         loss_dict["wm_acc_mean"] = (gen_logits.argmax(dim=-1) == gt_world_model_indices).float().mean()
         loss_dict["wm_loss_ce"] = gen_loss_ce.mean()  # Cross-entropy loss
         loss_dict["wm_loss_pixel"] = pixel_loss  # Pixel reconstruction loss
-        last_resolution_token_len = self.model.num_resolutions * self.model.num_resolutions
-        loss_dict["wm_acc_tail"] = (gen_logits[:, -last_resolution_token_len:].argmax(dim=-1) == gt_world_model_indices[:, -last_resolution_token_len:]).float().mean()
+        # wm_acc_tail: accuracy on the last (highest resolution) tokens
+        # patch_nums[-1] is the last resolution's patch count (e.g., 16 for pn="1_2_3_4_5_6_8_10_13_16")
+        last_patch_n = self.model.patch_nums[-1] if hasattr(self.model, 'patch_nums') and self.model.patch_nums else 16
+        last_resolution_token_len = last_patch_n * last_patch_n  # e.g., 16*16 = 256 tokens
+        # Make sure we don't exceed the actual token length
+        actual_tail_len = min(last_resolution_token_len, gen_token_len)
+        
+        # Compute wm_acc_tail
+        tail_logits = gen_logits[:, -actual_tail_len:]
+        tail_gt = gt_world_model_indices[:, -actual_tail_len:]
+        tail_preds = tail_logits.argmax(dim=-1)
+        tail_correct = (tail_preds == tail_gt).float()
+        loss_dict["wm_acc_tail"] = tail_correct.mean()
+        
+        # Debug: log detailed info occasionally (every ~1000 steps)
+        if torch.rand(1).item() < 0.001:  # ~0.1% chance to log
+            logger.info(f"[wm_acc_tail debug] gen_token_len={gen_token_len}, actual_tail_len={actual_tail_len}, "
+                        f"last_patch_n={last_patch_n}, tail_correct_sum={tail_correct.sum().item():.0f}/{tail_correct.numel()}, "
+                        f"wm_acc_tail={loss_dict['wm_acc_tail'].item():.4f}")
 
         if train_gen_expert_only:
             loss_dict["loss"] = gen_loss

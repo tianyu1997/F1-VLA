@@ -228,8 +228,9 @@ class SequentialMEKVMDataset(Dataset):
         return self.task_descriptions[dir_idx]
     
     def _load_episode(self, ep_idx: int):
-        """Load episode with caching"""
+        """Load episode with LRU caching."""
         if ep_idx not in self._cache:
+            # Evict oldest if cache is full
             if len(self._cache) >= self._cache_max_size:
                 oldest_key = next(iter(self._cache))
                 del self._cache[oldest_key]
@@ -269,9 +270,10 @@ class SequentialMEKVMDataset(Dataset):
         Get a single frame with all necessary data.
         
         Returns dict with:
-            - observation.images.image{i}: current frame for each camera
-            - observation.images.image{i}_history: history frames for each camera
-            - observation.images.image0_history: history + prediction frames for WM
+            - observation.images.{cam_key}: current frame for each camera (e.g., observation.images.wrist_rgb)
+            - observation.images.{cam_key}_history: history frames for each camera
+            - observation.images.{wm_cam_key}_history: history frames for world model camera
+            - observation.images.{wm_cam_key}_target: prediction target frames for world model
             - observation.state: state vector
             - observation.state_history: state history (n_obs_img_steps)
             - action: action chunk
@@ -392,33 +394,27 @@ class SequentialMEKVMDataset(Dataset):
             "action_history": action_history,
             # Task
             "task": self._get_task_description(ep_idx),
-            # World model specific (always use image0 naming for WM)
-            "observation.images.image0_history": history_only,
-            "observation.images.image0_target": pred_images,
+            # World model specific - use actual camera name from config
+            f"observation.images.{wm_cam_key}_history": history_only,
+            f"observation.images.{wm_cam_key}_target": pred_images,
             # Memory indices
             "dataset_idx": torch.tensor(self.dataset_idx, dtype=torch.int64),
             "episode_idx": torch.tensor(self.global_episode_idx[ep_idx], dtype=torch.int64),
             "frame_idx": torch.tensor(frame_idx, dtype=torch.int64),
         }
         
-        # Add each camera's images with standard naming
-        for i, cam_key in enumerate(self.camera_keys):
+        # Add each camera's images using actual camera names (e.g., observation.images.wrist_rgb)
+        for cam_key in self.camera_keys:
             if cam_key in camera_images:
                 cam_data = camera_images[cam_key]
-                sample[f"observation.images.image{i}"] = cam_data[-1]  # Current frame
-                sample[f"observation.images.image{i}_mask"] = torch.tensor(True)
-                sample[f"observation.images.image{i}_history"] = cam_data  # All history frames
+                sample[f"observation.images.{cam_key}"] = cam_data[-1]  # Current frame
+                sample[f"observation.images.{cam_key}_mask"] = torch.tensor(True)
+                sample[f"observation.images.{cam_key}_history"] = cam_data  # All history frames
             else:
                 # Empty placeholder
-                sample[f"observation.images.image{i}"] = torch.zeros(3, 256, 256)
-                sample[f"observation.images.image{i}_mask"] = torch.tensor(False)
-                sample[f"observation.images.image{i}_history"] = torch.zeros(self.n_obs_img_steps, 3, 256, 256)
-        
-        # Add empty image2 slot for compatibility if only 2 cameras
-        if len(self.camera_keys) < 3:
-            for i in range(len(self.camera_keys), 3):
-                sample[f"observation.images.image{i}"] = torch.zeros(3, 256, 256)
-                sample[f"observation.images.image{i}_mask"] = torch.tensor(False)
+                sample[f"observation.images.{cam_key}"] = torch.zeros(3, 256, 256)
+                sample[f"observation.images.{cam_key}_mask"] = torch.tensor(False)
+                sample[f"observation.images.{cam_key}_history"] = torch.zeros(self.n_obs_img_steps, 3, 256, 256)
         
         return sample
     
@@ -428,6 +424,67 @@ class SequentialMEKVMDataset(Dataset):
     def __getitem__(self, idx) -> Dict[str, Any]:
         ep_idx, frame_idx = self.sample_index[idx]
         return self.get_frame(ep_idx, frame_idx)
+
+
+class EpisodeSequentialSampler(Sampler):
+    """
+    Sampler that loads samples in episode-sequential order for better disk I/O.
+    
+    Unlike SequentialBatchSampler (designed for memory-based training), this sampler:
+    - Yields individual sample indices (not batched)
+    - Frames are returned in episode order (all frames from episode 0, then episode 1, etc.)
+    - Episodes can be shuffled, but frames within episodes are always sequential
+    - This enables sequential disk reads and efficient caching
+    
+    For no-memory training where we want random batches but sequential I/O:
+    - Use this sampler to create epoch order
+    - DataLoader will batch samples from consecutive positions
+    - Result: each batch mostly contains frames from same/nearby episodes
+    """
+    
+    def __init__(
+        self,
+        dataset: SequentialMEKVMDataset,
+        shuffle_episodes: bool = True,
+        seed: int = 42,
+    ):
+        self.dataset = dataset
+        self.shuffle_episodes = shuffle_episodes
+        self.seed = seed
+        self._epoch = 0
+        
+        # Build episode to sample mapping
+        self.episode_samples: Dict[int, List[int]] = {}
+        for global_idx, (ep_idx, frame_idx) in enumerate(dataset.sample_index):
+            if ep_idx not in self.episode_samples:
+                self.episode_samples[ep_idx] = []
+            self.episode_samples[ep_idx].append(global_idx)
+        
+        self.episode_ids = list(self.episode_samples.keys())
+        self.num_episodes = len(self.episode_ids)
+        self.total_samples = len(dataset)
+        
+        print(f"[EpisodeSequentialSampler] {self.num_episodes} episodes, {self.total_samples} samples", flush=True)
+    
+    def __iter__(self) -> Iterator[int]:
+        """Yield sample indices in episode-sequential order."""
+        episode_order = self.episode_ids.copy()
+        
+        if self.shuffle_episodes:
+            rng = random.Random(self.seed + self._epoch)
+            rng.shuffle(episode_order)
+        
+        # Yield all frames from each episode in sequence
+        for ep_id in episode_order:
+            for sample_idx in self.episode_samples[ep_id]:
+                yield sample_idx
+    
+    def __len__(self) -> int:
+        return self.total_samples
+    
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch for deterministic shuffling."""
+        self._epoch = epoch
 
 
 class SequentialBatchSampler(Sampler):

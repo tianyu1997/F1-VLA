@@ -339,12 +339,14 @@ class AdversarialExplorerTrainer:
         proj_width = getattr(policy.model.config, 'proj_width', 1024)
         self.value_head = nn.Linear(proj_width, 1).to(device)
         
-        # Action log std
+        # Action log std - use action_dim (7) not mini_batch_size
+        # This is critical: each action dimension should have its own exploration std
+        action_dim = getattr(policy.model.config, 'action_dim', 7)
         
         # Step counter
         self.global_step = 0
         self.log_std = nn.Parameter(
-            torch.zeros(config.mini_batch_size, device=device) - 1.0
+            torch.zeros(action_dim, device=device) - 1.0
         )
         
         # Optimizer
@@ -455,7 +457,17 @@ class AdversarialExplorerTrainer:
         )
         
         action_mean = output['action']
-        std = torch.exp(self.log_std[:action_mean.shape[-1]])
+        # Use full log_std (now correctly sized to action_dim)
+        std = torch.exp(self.log_std)
+        # Ensure std matches action_mean dimension
+        if std.shape[0] != action_mean.shape[-1]:
+            # Fallback: expand or truncate
+            actual_dim = action_mean.shape[-1]
+            if std.shape[0] > actual_dim:
+                std = std[:actual_dim]
+            else:
+                std = torch.cat([std, torch.zeros(actual_dim - std.shape[0], device=std.device) - 1.0])
+                std = torch.exp(std)
         dist = torch.distributions.Normal(action_mean, std)
         
         # New log probs
@@ -734,8 +746,17 @@ class AdversarialTrainingManager:
                 )
                 
                 action_mean = explorer_output['action']
-                # Sample actions
-                std = torch.exp(self.explorer_trainer.log_std[:action_mean.shape[-1]])
+                # Sample actions - use full log_std (now correctly sized)
+                log_std = self.explorer_trainer.log_std
+                actual_dim = action_mean.shape[-1]
+                # Ensure log_std matches action dimension
+                if log_std.shape[0] >= actual_dim:
+                    std = torch.exp(log_std[:actual_dim])
+                else:
+                    # Pad if needed
+                    padded_log_std = torch.full((actual_dim,), -1.0, device=log_std.device)
+                    padded_log_std[:log_std.shape[0]] = log_std
+                    std = torch.exp(padded_log_std)
                 dist = torch.distributions.Normal(action_mean, std)
                 actions = dist.sample()
                 log_probs = dist.log_prob(actions).sum(dim=-1)

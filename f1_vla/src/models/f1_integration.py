@@ -26,25 +26,35 @@ sys.path.insert(0, str(project_root))
 # =============================================================================
 
 def load_f1_vla_policy(
-    config_path: str,
-    checkpoint_path: Optional[str] = None,
-    vae_path: Optional[str] = None,
+    ckpt_path: str,
     device: str = "cuda",
     add_explorer: bool = True,
     train_act_expert_only: bool = False,
+    explorer_checkpoint_path: Optional[str] = None,
+    actor_checkpoint_path: Optional[str] = None,
+    explorer_init_from: str = "auto",
 ) -> Tuple[nn.Module, nn.Module]:
     """
     Load F1-VLA policy with Explorer actor.
     
-    参考 train_hf.py 中的模型加载方式，使用 F1_VLA 类。
+    模仿 train_hf.py 的加载方式：
+    1. 直接从一个 checkpoint 加载完整模型（包含 VAE 和 WM）
+    2. 不分块加载
+    3. Explorer actor 加载顺序（可配置）：
+       - "explorer": 优先加载已保存的 explorer checkpoint
+       - "actor": 从 actor checkpoint 初始化
+       - "gemma_expert": 从预训练的 gemma_expert 复制 (random_init=False)
+       - "random": 随机初始化 (random_init=True)
+       - "auto": 自动选择（explorer -> actor -> gemma_expert）
     
     Args:
-        config_path: Path to F1-VLA config (e.g., F1_pretrain directory)
-        checkpoint_path: Path to pretrained checkpoint (optional, same as config_path for safetensors)
-        vae_path: Path to VAE checkpoint (optional, will use config default if not provided)
+        ckpt_path: Path to F1-VLA checkpoint directory (包含完整模型)
         device: Device to load model on
         add_explorer: Whether to add Explorer actor
         train_act_expert_only: Whether to train only the action expert (for explorer training)
+        explorer_checkpoint_path: Path to saved explorer weights (optional)
+        actor_checkpoint_path: Path to saved actor weights (optional)
+        explorer_init_from: How to initialize explorer ["auto", "explorer", "actor", "gemma_expert", "random"]
         
     Returns:
         policy: F1_VLA policy with Explorer actor
@@ -53,20 +63,15 @@ def load_f1_vla_policy(
     from f1_vla.src.models.configuration_f1 import F1Config
     from f1_vla.src.policies.f1_policy import F1_VLA
     from f1_vla.src.processors.train_processors.policy_trainer import PolicyTrainingArguments
+    from f1_vla.src.utils.utils import load_ckpt
+    from omegaconf import OmegaConf
     
     logger = logging.getLogger(__name__)
     
-    # 使用 F1_VLA.from_pretrained 加载模型（参考 train_hf.py）
-    # 这会自动处理 config、VAE、checkpoint 的加载
-    logger.info(f"Loading F1-VLA from {config_path}")
+    logger.info(f"Loading F1-VLA from {ckpt_path} (train_hf.py style)")
     
-    # Load config first to potentially override paths
-    config = F1Config.from_pretrained(config_path)
-    
-    # Override VAE path if provided
-    if vae_path and os.path.exists(vae_path):
-        config.gen_expert_config.vae.vae_ckpt = vae_path
-        logger.info(f"Using VAE checkpoint: {vae_path}")
+    # Step 1: Load config from checkpoint path (same as train_hf.py)
+    config = F1Config.from_pretrained(ckpt_path)
     
     # Fix tokenizer path to local path if the original doesn't exist
     local_tokenizer_path = str(project_root / "paligemma-3b-pt-224")
@@ -74,8 +79,7 @@ def load_f1_vla_policy(
         config.language_tokenizer_path = local_tokenizer_path
         logger.info(f"Using local tokenizer: {local_tokenizer_path}")
     
-    # Create training_args to control freezing behavior
-    # This is needed for explorer training where only actor should be trainable
+    # Step 2: Create training_args to control freezing behavior
     training_args = PolicyTrainingArguments(
         output_dir="./outputs",  # Dummy path, not used for inference
         train_act_expert_only=train_act_expert_only,
@@ -83,23 +87,82 @@ def load_f1_vla_policy(
         freeze_gen_expert=True,  # Freeze generation expert for explorer training
     )
     
-    # Load policy using from_pretrained (handles model.safetensors automatically)
-    policy = F1_VLA.from_pretrained(
-        pretrained_name_or_path=config_path,
-        config=config,
-        strict=False,  # Allow missing keys for flexibility
-        training_args=training_args,  # Pass training_args to control freezing
-    )
+    # Step 3: Create policy model (same as train_hf.py: policy = F1_VLA(**kwargs))
+    kwargs = {"config": config, "training_args": training_args}
+    policy = F1_VLA(**kwargs)
     
-    # Add Explorer actor
+    # Step 4: Load weights from checkpoint using load_ckpt (same as train_hf.py)
+    # Create a minimal OmegaConf config with load_ckpt path
+    load_config = OmegaConf.create({
+        "exp": {
+            "load_ckpt": ckpt_path  # Load from checkpoint directory
+        }
+    })
+    policy = load_ckpt(policy, load_config)
+    
+    logger.info("  Loaded F1-VLA weights from checkpoint")
+    
+    # Step 5: Add Explorer actor with flexible initialization options
     if add_explorer:
-        # Initialize Explorer from existing actor weights for better stability
-        # Random init can cause NaN issues during RL training
-        logger.info("Adding Explorer actor by copying from 'actor' weights")
-        policy.add_actor('explorer', random_init=False)
+        explorer_loaded = False
+        
+        # Option 1: Try to load existing explorer checkpoint
+        if explorer_init_from in ["auto", "explorer"] and explorer_checkpoint_path:
+            if os.path.exists(explorer_checkpoint_path):
+                try:
+                    # First add actor with random init, then load weights
+                    logger.info(f"Loading Explorer from checkpoint: {explorer_checkpoint_path}")
+                    policy.add_actor('explorer', random_init=True)
+                    policy.load_actor('explorer', explorer_checkpoint_path)
+                    explorer_loaded = True
+                    logger.info("  ✓ Explorer loaded from saved checkpoint")
+                except Exception as e:
+                    logger.warning(f"  ✗ Failed to load explorer checkpoint: {e}")
+                    # Remove the failed actor
+                    if 'explorer' in policy.list_actors():
+                        del policy.model.gemma_experts['explorer']
+        
+        # Option 2: Try to load from actor checkpoint
+        if not explorer_loaded and explorer_init_from in ["auto", "actor"] and actor_checkpoint_path:
+            if os.path.exists(actor_checkpoint_path):
+                try:
+                    logger.info(f"Initializing Explorer from actor checkpoint: {actor_checkpoint_path}")
+                    policy.add_actor('explorer', random_init=True)
+                    policy.load_actor('explorer', actor_checkpoint_path)
+                    explorer_loaded = True
+                    logger.info("  ✓ Explorer initialized from actor checkpoint")
+                except Exception as e:
+                    logger.warning(f"  ✗ Failed to load actor checkpoint: {e}")
+                    if 'explorer' in policy.list_actors():
+                        del policy.model.gemma_experts['explorer']
+        
+        # Option 3: Copy from gemma_expert (default fallback)
+        if not explorer_loaded and explorer_init_from in ["auto", "gemma_expert"]:
+            logger.info("Initializing Explorer by copying from gemma_expert weights")
+            policy.add_actor('explorer', random_init=False)
+            explorer_loaded = True
+            logger.info("  ✓ Explorer initialized from gemma_expert (random_init=False)")
+        
+        # Option 4: Random initialization
+        if not explorer_loaded and explorer_init_from == "random":
+            logger.info("Initializing Explorer with random weights")
+            policy.add_actor('explorer', random_init=True)
+            explorer_loaded = True
+            logger.info("  ✓ Explorer initialized randomly")
+        
+        # Final check
+        if not explorer_loaded:
+            raise ValueError(
+                f"Failed to initialize Explorer actor. "
+                f"explorer_init_from={explorer_init_from}, "
+                f"explorer_checkpoint_path={explorer_checkpoint_path}, "
+                f"actor_checkpoint_path={actor_checkpoint_path}"
+            )
+        
         policy.active_actor = 'explorer'
+        logger.info(f"  Available actors: {policy.list_actors()}")
     
-    # Move to device
+    # Step 6: Move to device
     policy.to(device)
     
     # Return policy and its VAE
@@ -638,7 +701,7 @@ class ExplorerEnvWrapper:
                     return pred_emb, uncertainty
                     
             except Exception as e:
-                logger.warning(f"WM forward failed in _run_world_model: {e}")
+                logging.getLogger(__name__).warning(f"WM forward failed in _run_world_model: {e}")
         
         # Fallback to mock WM output
         pred_emb = torch.randn(1, emb_dim, device=self.device) * 0.1
