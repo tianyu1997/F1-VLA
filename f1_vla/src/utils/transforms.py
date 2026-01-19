@@ -148,6 +148,39 @@ class TransformGenObservation:
         return data
 
 
+@dataclasses.dataclass
+class SplitGenObservation:
+    n_obs_img_steps: int
+    n_pred_img_steps: int
+    obs_img_stride: int
+    history_suffix: str = "history"
+    target_suffix: str = "target"
+    
+    def __post_init__(self):
+        self.cur_n_obs = self.n_obs_img_steps // self.obs_img_stride
+        self.cur_n_pred = self.n_pred_img_steps // self.obs_img_stride
+
+    def __call__(self, data: Dict) -> Dict:
+        # iterate keys to find history keys and split them into history and target
+        keys_to_split = [k for k in data.keys() if k.endswith(self.history_suffix)]
+        
+        for k in keys_to_split:
+            full_seq = data[k] # (T, ...)
+            
+            # history: first cur_n_obs frames
+            hist_seq = full_seq[:self.cur_n_obs]
+            
+            # target: last cur_n_pred frames
+            target_seq = full_seq[-self.cur_n_pred:]
+            
+            data[k] = hist_seq
+            
+            target_key = k.replace(self.history_suffix, self.target_suffix)
+            data[target_key] = target_seq
+            
+        return data
+
+
 class ConsistentRandomCrop(torch.nn.Module):
     def __init__(self, size):
         super().__init__()
@@ -374,5 +407,10 @@ class ModelTransformGroup(Group):
                     ),
                     TransformGenObservation(
                         gen_obs_transforms=gen_obs_transforms,
+                    ),
+                    SplitGenObservation(
+                        n_obs_img_steps=n_obs_img_steps,
+                        n_pred_img_steps=n_pred_img_steps,
+                        obs_img_stride=obs_img_stride,
                     ),
                 ]

@@ -213,11 +213,12 @@ class SequentialMEKVMDataset(Dataset):
                     episode_lengths.append(cache[ep_num])
                     continue
             
-            # Fallback: assume constant length 50 to skip slow loading
+            # Fallback: assume constant length 200 to skip slow loading
+            # (loop trajectory episodes are typically ~200 steps)
             # episode = torch.load(ep_file, weights_only=False)
             # episode_lengths.append(len(episode))
             # del episode
-            episode_lengths.append(50)
+            episode_lengths.append(200)
 
         
         return episode_lengths
@@ -691,8 +692,19 @@ def create_sequential_mekvm_data(
     stage: str,
     rank: int = 0,
     world_size: int = 1,
+    data_dirs_override: list = None,  # Override data_dirs for test dataset
 ):
-    """Create sequential dataset for memory-based training with distributed support."""
+    """Create sequential dataset for memory-based training with distributed support.
+    
+    Args:
+        policy_config: Policy configuration
+        dataset_config: Dataset configuration
+        training_args: Training arguments
+        stage: Training stage
+        rank: Current rank for distributed training
+        world_size: Total number of processes
+        data_dirs_override: Optional override for data directories (e.g., for test set)
+    """
     from lerobot.datasets.transforms import (
         ImageTransforms, ImageTransformsConfig
     )
@@ -710,8 +722,8 @@ def create_sequential_mekvm_data(
     img_trans_cfg.tfs = filtered_tfs
     image_transforms = ImageTransforms(img_trans_cfg)
     
-    # Get config
-    data_dirs = dataset_config.get('mekvm_data_dirs', [])
+    # Get config - use override if provided
+    data_dirs = data_dirs_override if data_dirs_override is not None else dataset_config.get('mekvm_data_dirs', [])
     task_descriptions = dataset_config.get('mekvm_task_descriptions', None)
     n_obs_img_steps = dataset_config.get('n_obs_img_steps', 4)
     n_pred_img_steps = dataset_config.get('n_pred_img_steps', 1)

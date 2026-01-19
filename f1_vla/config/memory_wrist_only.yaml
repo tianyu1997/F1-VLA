@@ -1,23 +1,17 @@
 dataset:
-  # Use ME_KVM data format - clean data only
+  # Use ME_KVM data format - loop trajectory data for Memory validation
   use_mekvm_format: True
   mekvm_data_dirs:
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu0
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu1
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu2
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu3
+    - /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory
 
   mekvm_task_descriptions:
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "机械臂在两点间往返运动,根据历史轨迹和当前动作预测下一帧观测。"
     
   mekvm_weights:
-    - 0.25
-    - 0.25
-    - 0.25
-    - 0.25
+    - 1.0
+
+  # Test dataset for evaluation
+  mekvm_test_data_dir: /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory_test
     
   n_obs_img_steps: 4
   n_pred_img_steps: 1
@@ -37,7 +31,8 @@ dataset:
 exp:
   stage: stage1_pretrain_wm
   # Load from specific memory pretraining checkpoint
-  load_ckpt: /mnt/data2/ty/F1-VLA/F1_pretrain/model.safetensors
+  # Use an existing checkpoint as a starting point; fallback to no_memory checkpoint
+  load_ckpt: /mnt/data2/ty/F1-VLA/outputs/memory_wrist_only/checkpoint-episode-clean
   
   # Memory configuration - ENABLED (fresh training from F1_pretrain)
   use_memory: True
@@ -59,8 +54,8 @@ exp:
     dropout: 0.0              # No dropout
 
   training_args:
-    output_dir: outputs/memory_from_f1pretrain_v3
-    run_name: memory_from_f1pretrain_v3
+    output_dir: outputs/memory_wrist_only
+    run_name: memory_wrist_only
     # Resume from specific checkpoint
     # resume_from_checkpoint: null
     do_train: True
@@ -82,8 +77,8 @@ exp:
     adam_epsilon: !!float 1e-8
     lr_scheduler_type: cosine
 
-    max_steps: 50000             # Fine-tune for additional 20k steps
-    warmup_steps: 2000           # Short warmup for fine-tuning
+    max_steps: 10000             # Fine-tune for additional 20k steps
+    warmup_steps: 100           # Short warmup for fine-tuning
     log_level: info
     log_level_replica: error
 
@@ -107,9 +102,9 @@ exp:
     remove_unused_columns: False
 
     # Episode-based logging/saving/eval
-    logging_episodes: 50
-    save_episodes: 512  # 每个epoch保存一次，释放显存
-    eval_episodes: 50
+    logging_episodes: 10
+    save_episodes: 30  # 每个epoch保存一次，释放显存
+    eval_episodes: 30
 
     label_names: 
       - action
@@ -145,15 +140,14 @@ exp:
   
   camera_config:
     und_camera_keys:
-      - head_rgb
       - wrist_rgb
     wm_camera_key: wrist_rgb
 
 policy:
   model_name: f1
-  path: /mnt/data2/ty/F1-VLA/pi0
+  path: /mnt/data2/ty/F1-VLA/F1_pretrain/pi0
   ckpt_path: f1_vla/config/f1_config.json
-  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/F1_pretrain/paligemma-3b-pt-224
   mwm_pretrained_path: null
   chunk_size: 4
 
@@ -167,7 +161,7 @@ policy:
   temporal_conv_stride: 4
   vocab_size: 4096
   vae_dim: 32
-  num_resolutions: 10
+  num_resolutions: 9
 
   resize_imgs_with_padding: "(224, 224)"
   attention_implementation: flash_attention_2

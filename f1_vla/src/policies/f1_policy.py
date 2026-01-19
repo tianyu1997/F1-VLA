@@ -40,6 +40,7 @@ class F1_VLA(nn.Module):
         self,
         config: F1Config,
         device: Optional[torch.device] = None,
+        tokenizer_path_override: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -51,7 +52,9 @@ class F1_VLA(nn.Module):
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._init_device = device
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained(config.language_tokenizer_path)
+        # Use override tokenizer path if provided, otherwise fall back to config
+        tokenizer_path = tokenizer_path_override or config.language_tokenizer_path
+        self.language_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         pn = config.gen_expert_config.pn
         patch_nums = tuple(map(int, pn.replace('-', '_').split('_')))
@@ -530,6 +533,14 @@ class F1_VLA(nn.Module):
         
         world_model_image_indices = self.model.vae.img_to_idxBl(world_model_images)
         
+        # num_resolutions controls how many VAR layers are computed (skip high-freq layers like 16x16)
+        num_resolutions = getattr(self.config.gen_expert_config, 'num_resolutions', len(world_model_image_indices))
+        # Compute token count for the first num_resolutions layers
+        patch_nums = self.model.patch_nums
+        num_resolutions_tokens = sum(pn ** 2 for pn in patch_nums[:num_resolutions])
+        # Truncate indices to only include first num_resolutions layers
+        world_model_image_indices_for_gt = world_model_image_indices[:num_resolutions]
+        
         # DEBUG: Check indices after VAE encoding
         for i, idx in enumerate(world_model_image_indices):
             if torch.isnan(idx.float()).any() or torch.isinf(idx.float()).any():
@@ -537,8 +548,8 @@ class F1_VLA(nn.Module):
             if (idx < 0).any() or (idx >= self.config.gen_expert_config.vae.vocab_size).any():
                 logger.error(f"[F1_VLA] world_model_image_indices[{i}] out of range! min={idx.min()}, max={idx.max()}")
         
-        # prepare the output of world model
-        gt_world_model_indices = torch.cat(world_model_image_indices, dim=1).reshape(B, T, -1)[:, cur_n_obs_img_steps: cur_n_obs_img_steps + cur_n_pred_img_steps].contiguous()
+        # prepare the output of world model (use truncated indices based on num_resolutions)
+        gt_world_model_indices = torch.cat(world_model_image_indices_for_gt, dim=1).reshape(B, T, -1)[:, cur_n_obs_img_steps: cur_n_obs_img_steps + cur_n_pred_img_steps].contiguous()
         # prepare the input of world model
         world_model_embs = self.model.vae.quantize.idxBl_to_var_input(world_model_image_indices)
         
@@ -552,6 +563,7 @@ class F1_VLA(nn.Module):
         world_model_output_embs = world_model_embs[:, cur_n_obs_img_steps:cur_n_obs_img_steps + cur_n_pred_img_steps]
         if len(world_model_output_embs.shape) == 4:
             world_model_output_embs = world_model_output_embs.reshape(B, -1, world_model_output_embs.shape[3])
+        # Keep full world_model_output_embs for teacher-forcing (model will truncate output logits)
 
         #########################################################
         # Get memory state if enabled
@@ -633,6 +645,7 @@ class F1_VLA(nn.Module):
                         f"min={gt_world_model_indices.min()}, max={gt_world_model_indices.max()}, "
                         f"vocab_size={vocab_size}")
         
+        # Cross-entropy loss (gen_logits and gt already truncated to num_resolutions layers)
         gen_loss_ce = self.gen_loss_fct(gen_logits.reshape(-1, gen_logits.shape[-1]), gt_world_model_indices.reshape(-1)).view(B, -1)
         
         # Pixel-level reconstruction loss
@@ -674,28 +687,39 @@ class F1_VLA(nn.Module):
         loss_dict = {}
         # Store past_key_values for memory distillation (student needs gradients)
         loss_dict["past_key_values"] = past_key_values
+        # gen_logits and gt_world_model_indices are already truncated to num_resolutions layers
         loss_dict["wm_acc_mean"] = (gen_logits.argmax(dim=-1) == gt_world_model_indices).float().mean()
         loss_dict["wm_loss_ce"] = gen_loss_ce.mean()  # Cross-entropy loss
         loss_dict["wm_loss_pixel"] = pixel_loss  # Pixel reconstruction loss
-        # wm_acc_tail: accuracy on the last (highest resolution) tokens
-        # patch_nums[-1] is the last resolution's patch count (e.g., 16 for pn="1_2_3_4_5_6_8_10_13_16")
-        last_patch_n = self.model.patch_nums[-1] if hasattr(self.model, 'patch_nums') and self.model.patch_nums else 16
-        last_resolution_token_len = last_patch_n * last_patch_n  # e.g., 16*16 = 256 tokens
+        # wm_acc_tail: accuracy on the last layer (within num_resolutions)
+        # For num_resolutions=9, this is layer 9 (13x13=169 tokens)
+        last_patch_n = self.model.patch_nums[num_resolutions - 1] if num_resolutions > 0 else 16
+        last_resolution_token_len = last_patch_n * last_patch_n
         # Make sure we don't exceed the actual token length
         actual_tail_len = min(last_resolution_token_len, gen_token_len)
         
-        # Compute wm_acc_tail
+        # Compute wm_acc_tail (last layer within num_resolutions)
         tail_logits = gen_logits[:, -actual_tail_len:]
         tail_gt = gt_world_model_indices[:, -actual_tail_len:]
         tail_preds = tail_logits.argmax(dim=-1)
         tail_correct = (tail_preds == tail_gt).float()
         loss_dict["wm_acc_tail"] = tail_correct.mean()
         
+        # Compute wm_acc_no_tail: accuracy excluding the last layer
+        no_tail_len = gen_token_len - actual_tail_len
+        if no_tail_len > 0:
+            no_tail_logits = gen_logits[:, :no_tail_len]
+            no_tail_gt = gt_world_model_indices[:, :no_tail_len]
+            no_tail_preds = no_tail_logits.argmax(dim=-1)
+            loss_dict["wm_acc_no_tail"] = (no_tail_preds == no_tail_gt).float().mean()
+        else:
+            loss_dict["wm_acc_no_tail"] = loss_dict["wm_acc_mean"]
+        
         # Debug: log detailed info occasionally (every ~1000 steps)
         if torch.rand(1).item() < 0.001:  # ~0.1% chance to log
-            logger.info(f"[wm_acc_tail debug] gen_token_len={gen_token_len}, actual_tail_len={actual_tail_len}, "
-                        f"last_patch_n={last_patch_n}, tail_correct_sum={tail_correct.sum().item():.0f}/{tail_correct.numel()}, "
-                        f"wm_acc_tail={loss_dict['wm_acc_tail'].item():.4f}")
+            logger.info(f"[wm_acc debug] num_resolutions={num_resolutions}, num_resolutions_tokens={num_resolutions_tokens}, "
+                        f"gen_token_len={gen_token_len}, tail_len={actual_tail_len}, no_tail_len={no_tail_len}, "
+                        f"wm_acc_mean={loss_dict['wm_acc_mean'].item():.4f}, wm_acc_tail={loss_dict['wm_acc_tail'].item():.4f}")
 
         if train_gen_expert_only:
             loss_dict["loss"] = gen_loss
@@ -788,20 +812,32 @@ class F1_VLA(nn.Module):
         try:
             # VAE uses multi-scale patches: v_patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
             # tokens_per_scale = [1, 4, 9, 16, 25, 36, 64, 100, 169, 256] = 680 total per frame
-            v_patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
-            tokens_per_scale = [pn**2 for pn in v_patch_nums]
-            tokens_per_frame = sum(tokens_per_scale)  # 680
+            v_patch_nums_full = self.model.patch_nums
+            num_resolutions = getattr(self.config.gen_expert_config, 'num_resolutions', len(v_patch_nums_full))
             
-            # Reshape indices for each frame: [B, T*680] -> [B*T, 680]
+            # Compute tokens for the layers we have
+            v_patch_nums_used = v_patch_nums_full[:num_resolutions]
+            tokens_per_scale_used = [pn**2 for pn in v_patch_nums_used]
+            tokens_per_frame = sum(tokens_per_scale_used)  # e.g., 424 for 9 layers
+            
+            # Reshape indices for each frame: [B, T*tokens] -> [B*T, tokens]
             indices = indices.view(batch_size * num_frames, tokens_per_frame)
             
-            # Split into multi-scale list for idxBl_to_img
-            # idxBl_to_img expects: List[Tensor] where each tensor is [B, l] and l = pn^2
+            # Split into multi-scale list
             ms_idx_Bl = []
             start_idx = 0
-            for num_tokens in tokens_per_scale:
+            for num_tokens in tokens_per_scale_used:
                 ms_idx_Bl.append(indices[:, start_idx:start_idx + num_tokens])
                 start_idx += num_tokens
+            
+            # If num_resolutions < 10, pad with zeros for missing layers (VAE needs all 10 layers)
+            if num_resolutions < len(v_patch_nums_full):
+                for si in range(num_resolutions, len(v_patch_nums_full)):
+                    pn = v_patch_nums_full[si]
+                    # Pad with index 0 (will decode to some default/average pattern)
+                    padding_indices = torch.zeros(batch_size * num_frames, pn * pn, 
+                                                 dtype=indices.dtype, device=indices.device)
+                    ms_idx_Bl.append(padding_indices)
             
             # Decode using VAE
             with torch.no_grad():
@@ -1099,5 +1135,8 @@ class F1_VLA(nn.Module):
 
     def _save_pretrained(self, save_directory: Path) -> None:
         self.config.save_pretrained(save_directory)
+        # Save tokenizer to checkpoint directory for self-contained checkpoints
+        if hasattr(self, 'language_tokenizer'):
+            self.language_tokenizer.save_pretrained(save_directory)
         model_to_save = self.module if hasattr(self, "module") else self
         save_model_as_safetensor(model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE))

@@ -156,9 +156,9 @@ exp:
 
 policy:
   model_name: f1_teacher_student
-  path: /mnt/data2/ty/F1-VLA/pi0
+  path: /mnt/data2/ty/F1-VLA/F1_pretrain/pi0
   ckpt_path: f1_vla/config/f1_config.json
-  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/F1_pretrain/paligemma-3b-pt-224
   mwm_pretrained_path: null
   chunk_size: 4
 

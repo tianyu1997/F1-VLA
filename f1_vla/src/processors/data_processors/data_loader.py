@@ -126,6 +126,14 @@ class CollateFn:
         for item in items:
             gen_obs.append(item[gen_obs_key])
         batch[gen_obs_key] = torch.stack(gen_obs)
+
+        # generation target inputs (from SplitGenObservation)
+        gen_target_key = f"observation.images.image0_target"
+        if len(items) > 0 and gen_target_key in items[0]:
+            gen_target = []
+            for item in items:
+                gen_target.append(item[gen_target_key])
+            batch[gen_target_key] = torch.stack(gen_target)
         
         # task instruction
         batch["task"] = [x["task"] for x in items]
@@ -138,7 +146,7 @@ class CollateFn:
         for item in items:
             num = 0
             for key in item.keys():
-                if key.startswith(prefix) and not key.endswith(suffix) and not key.endswith("pad"):
+                if key.startswith(prefix) and not key.endswith(suffix) and not key.endswith("pad") and not key.endswith("target"):
                     if key in image_shapes:
                         assert image_shapes[key] == item[key].shape
                     else:

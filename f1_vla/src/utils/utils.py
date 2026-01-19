@@ -119,20 +119,49 @@ def load_ckpt(policy, config):
                 # for k in sorted(other_missing)[:5]:
                 #     logger.info(f"    - {k}")
         
-        # Check for shape mismatch in keys that might change (memory_info_proj, temporal_conv, etc.)
-        mismatch_check_patterns = ['memory_info_proj', 'temporal_conv']
-        keys_to_check = [k for k in model_keys if any(p in k for p in mismatch_check_patterns)]
+        # Check for shape mismatch and do partial loading when possible
+        # This allows loading partial weights when num_resolutions changes
+        partial_loaded_keys = []
         skip_keys = []
-        if keys_to_check:
-            model_state = policy.state_dict()
-            for key in keys_to_check:
-                if key in state_dict:
-                    model_shape = model_state[key].shape
-                    ckpt_shape = state_dict[key].shape
-                    if model_shape != ckpt_shape:
+        model_state = policy.state_dict()
+        for key in list(state_dict.keys()):
+            if key in model_state:
+                model_shape = model_state[key].shape
+                ckpt_shape = state_dict[key].shape
+                if model_shape != ckpt_shape:
+                    # Try partial loading: load the intersection of shapes
+                    model_tensor = model_state[key]
+                    ckpt_tensor = state_dict[key]
+                    
+                    if len(model_shape) == len(ckpt_shape):
+                        # Same number of dimensions, try to slice
+                        slices = []
+                        can_partial_load = True
+                        for m_dim, c_dim in zip(model_shape, ckpt_shape):
+                            if m_dim <= c_dim:
+                                slices.append(slice(0, m_dim))
+                            else:
+                                # Model needs more than checkpoint has - can't partial load
+                                can_partial_load = False
+                                break
+                        
+                        if can_partial_load:
+                            # Extract the portion we need from checkpoint
+                            partial_tensor = ckpt_tensor[tuple(slices)]
+                            state_dict[key] = partial_tensor
+                            partial_loaded_keys.append(key)
+                            logger.info(f"  PARTIAL {key}: loaded {model_shape} from ckpt {ckpt_shape}")
+                        else:
+                            skip_keys.append(key)
+                            logger.warning(f"  SKIP {key}: model needs {model_shape} but ckpt only has {ckpt_shape}")
+                    else:
                         skip_keys.append(key)
-                        logger.warning(f"  SKIP {key}: shape mismatch (model={model_shape} vs ckpt={ckpt_shape})")
-                        logger.warning(f"    -> Will randomly initialize this layer")
+                        logger.warning(f"  SKIP {key}: dimension count mismatch (model={len(model_shape)}D vs ckpt={len(ckpt_shape)}D)")
+        
+        if partial_loaded_keys:
+            logger.info(f"  Total {len(partial_loaded_keys)} keys partially loaded (truncated to fit model)")
+        if skip_keys:
+            logger.warning(f"  Total {len(skip_keys)} keys skipped (will be randomly initialized)")
         
         # Remove skipped keys from state_dict
         for key in skip_keys:
@@ -181,6 +210,9 @@ def set_policy_config(policy_config, src_config):
         policy_config.gen_expert_config.temporal_conv_stride = src_config.temporal_conv_stride
         policy_config.gen_expert_config.num_resolutions = src_config.num_resolutions
         policy_config.gen_expert_config.vae.vae_ckpt = src_config.vae_ckpt
+        # Skip last resolution for generation (only compute first N-1 layers)
+        if hasattr(src_config, 'skip_last_resolution'):
+            policy_config.gen_expert_config.skip_last_resolution = src_config.skip_last_resolution
 
     policy_config.resize_imgs_with_padding = eval(src_config.resize_imgs_with_padding)
 

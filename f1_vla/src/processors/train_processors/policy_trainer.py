@@ -429,6 +429,7 @@ class PolicyTrainer(Trainer):
         save_interval=100,  # Memory: episodes, No-memory: steps
         eval_interval=50,  # Memory: episodes, No-memory: steps
         eval_dataset=None,  # Dataset for evaluation
+        eval_collate_fn=None,  # Collate function for eval dataset
         *args, 
         **kwargs
     ):
@@ -440,6 +441,7 @@ class PolicyTrainer(Trainer):
         self.episode_sampler = episode_sampler
         self.num_episodes = num_episodes
         self.eval_dataset = eval_dataset
+        self.eval_collate_fn = eval_collate_fn
         logger.info(f"[PolicyTrainer] eval_dataset received: {eval_dataset is not None}, type: {type(eval_dataset)}")
         # TODO: make this configurable
         self.pred_img_keys = ["observation.images.image0_history"]
@@ -892,6 +894,7 @@ class PolicyTrainer(Trainer):
                         "wm_out_loss": outputs.get("wm_loss", torch.tensor(0)).cpu().item(),
                         "wm_acc_mean": outputs.get("wm_acc_mean", torch.tensor(0)).cpu().item(),
                         "wm_acc_tail": outputs.get("wm_acc_tail", torch.tensor(0)).cpu().item(),
+                        "wm_acc_no_tail": outputs.get("wm_acc_no_tail", torch.tensor(0)).cpu().item(),
                     }
                     # Add learning rate logging if optimizer has enough param groups
                     if len(self.optimizer.param_groups) > 4:
@@ -1129,20 +1132,116 @@ class PolicyTrainer(Trainer):
                 logger.info(f"Saved checkpoint at episode {episode_count}")
             self.episode_progress_callback.mark_saved()
         
-        # Episode-based evaluation with video generation
+        # Episode-based evaluation with test set loss computation
         if hasattr(self, 'episode_progress_callback') and self.episode_progress_callback.should_eval():
             logger.info(f"[Eval] Triggering evaluation at episode {self.episode_progress_callback.total_episode_count}")
             if self.state.is_world_process_zero and self.eval_dataset is not None:
                 episode_count = self.episode_progress_callback.total_episode_count
                 try:
+                    # Compute test set loss
+                    eval_metrics = self._compute_test_loss()
+                    
+                    # Log eval metrics
+                    eval_log = {
+                        "eval_episode": episode_count,
+                        "eval_loss": eval_metrics.get("eval_loss", 0.0),
+                        "eval_wm_loss": eval_metrics.get("eval_wm_loss", 0.0),
+                        "eval_wm_acc": eval_metrics.get("eval_wm_acc", 0.0),
+                    }
+                    self.log(eval_log)
+                    logger.info(f"[Eval] Test loss: {eval_metrics.get('eval_loss', 0.0):.6f}, "
+                               f"WM loss: {eval_metrics.get('eval_wm_loss', 0.0):.6f}, "
+                               f"WM acc: {eval_metrics.get('eval_wm_acc', 0.0):.4f}")
+                    
+                    # Also generate comparison video
                     self._run_eval_with_video(episode_count)
                 except Exception as e:
-                    logger.warning(f"[Eval] Error during video generation: {e}")
+                    logger.warning(f"[Eval] Error during evaluation: {e}")
                     import traceback
                     traceback.print_exc()
             elif self.eval_dataset is None:
-                logger.warning("[Eval] eval_dataset is None, skipping video generation")
+                logger.warning("[Eval] eval_dataset is None, skipping evaluation")
             self.episode_progress_callback.mark_evaled()
+
+    @torch.no_grad()
+    def _compute_test_loss(self, max_samples: int = 200):
+        """Compute loss on test dataset.
+        
+        Args:
+            max_samples: Maximum number of samples to evaluate. Default 200 for speed.
+        
+        Returns:
+            Dictionary with eval metrics (eval_loss, eval_wm_loss, eval_wm_acc)
+        """
+        if self.eval_dataset is None:
+            return {"eval_loss": 0.0, "eval_wm_loss": 0.0, "eval_wm_acc": 0.0}
+        
+        eval_size = min(len(self.eval_dataset), max_samples) if max_samples else len(self.eval_dataset)
+        logger.info(f"[Eval] Computing test loss on {eval_size}/{len(self.eval_dataset)} samples")
+        
+        self.policy.eval()
+        
+        total_loss = 0.0
+        total_wm_loss = 0.0
+        total_wm_acc = 0.0
+        num_samples = 0
+        
+        # Use eval_collate_fn if available, otherwise use data_collator
+        collate_fn = self.eval_collate_fn if self.eval_collate_fn is not None else self.data_collator
+        
+        # Create simple dataloader for evaluation (no sampling tricks)
+        eval_dataloader = torch.utils.data.DataLoader(
+            self.eval_dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,  # Single worker for eval
+            pin_memory=False,
+        )
+        
+        # Limit samples if specified
+        max_batches = None
+        if max_samples is not None:
+            max_batches = max_samples // self.args.per_device_eval_batch_size + 1
+        
+        for batch_idx, batch in enumerate(eval_dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            
+            # Move to device
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(self.args.device)
+            
+            # Forward pass (no image transforms during eval)
+            outputs = self.policy.forward_with_world_model(
+                batch,
+                cur_n_obs_img_steps=self.cur_n_obs_img_steps,
+                cur_n_pred_img_steps=self.cur_n_pred_img_steps,
+                train_gen_expert_only=self.args.train_gen_expert_only,
+                gen_out_loss_ratio=self.args.gen_out_loss_ratio,
+            )
+            
+            batch_size = list(batch.values())[0].shape[0]
+            total_loss += outputs["loss"].item() * batch_size
+            total_wm_loss += outputs.get("wm_loss", torch.tensor(0.0)).item() * batch_size
+            total_wm_acc += outputs.get("wm_acc_mean", torch.tensor(0.0)).item() * batch_size
+            num_samples += batch_size
+        
+        self.policy.train()
+        
+        avg_loss = total_loss / max(num_samples, 1)
+        avg_wm_loss = total_wm_loss / max(num_samples, 1)
+        avg_wm_acc = total_wm_acc / max(num_samples, 1)
+        
+        logger.info(f"[Eval] Evaluated {num_samples} samples")
+        
+        return {
+            "eval_loss": avg_loss,
+            "eval_wm_loss": avg_wm_loss,
+            "eval_wm_acc": avg_wm_acc,
+            "eval_samples": num_samples,
+        }
 
     def _fallback_compute_loss(self, model, inputs, return_outputs: bool = False):
         """当 batch 包含多个 episode 时的回退路径，逐帧处理。"""
@@ -1223,9 +1322,16 @@ class PolicyTrainer(Trainer):
                 break
             end_idx += 1
         
-        # Get all indices for this episode
-        indices = list(range(start_idx, end_idx + 1))
-        logger.info(f"[Eval] Sampling full episode {target_episode}: {len(indices)} frames (indices {start_idx} to {end_idx})")
+        # Get all indices for this episode, but limit to 200 frames for speed
+        all_indices = list(range(start_idx, end_idx + 1))
+        max_video_frames = 200
+        if len(all_indices) > max_video_frames:
+            # Sample evenly spaced frames
+            step = len(all_indices) // max_video_frames
+            indices = all_indices[::step][:max_video_frames]
+        else:
+            indices = all_indices
+        logger.info(f"[Eval] Sampling episode {target_episode}: {len(indices)}/{len(all_indices)} frames (indices {start_idx} to {end_idx})")
         
         self.policy.eval()
         frames_list = []  # List of (gt_frames, pred_frames) tuples

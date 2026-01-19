@@ -87,6 +87,7 @@ class F1FlowMatching(nn.Module):
             self.wm_out_proj = nn.Linear(self.config.proj_width, self.vocab_size)
 
             self.vae = vae
+            # num_resolutions controls how many VAR levels to compute (can be < len(patch_nums))
             self.num_resolutions = config.gen_expert_config.num_resolutions
 
         # Projections are float32
@@ -382,6 +383,10 @@ class F1FlowMatching(nn.Module):
             wm_output_pos_embs = torch.cat([padding_pos_embs, self.wm_output_position_embedding], dim=1)
             padding_lvl_embs = torch.zeros(1, self.first_l - 1, self.wm_expert_hidden_size).to(world_model_embs.device)
             wm_output_lvl_embs = torch.cat([padding_lvl_embs, self.lvl_embed(self.lvl_1L)], dim=1)
+            # Truncate pos/lvl embeddings to match world_model_embs length (for num_resolutions < 10)
+            embs_len = world_model_embs.shape[1]
+            wm_output_pos_embs = wm_output_pos_embs[:, :embs_len, :]
+            wm_output_lvl_embs = wm_output_lvl_embs[:, :embs_len, :]
             world_model_embs += wm_output_pos_embs + wm_output_lvl_embs
 
         embs = world_model_embs
@@ -503,7 +508,13 @@ class F1FlowMatching(nn.Module):
                 gen_out = gen_out[:, 1:, :]
             
             gen_out = gen_out.to(dtype=torch.float32)
-            gen_out = self.wm_out_proj(self.wm_out_layer_norm(gen_out))[:, -self.L:]
+            # First extract the full world model output (last L=680 tokens)
+            gen_out = gen_out[:, -self.L:]
+            # Then compute logits for all tokens
+            gen_out = self.wm_out_proj(self.wm_out_layer_norm(gen_out))
+            # Finally, truncate to only first num_resolutions layers for loss computation
+            num_resolutions_tokens = sum(pn ** 2 for pn in self.patch_nums[:self.num_resolutions])
+            gen_out = gen_out[:, :num_resolutions_tokens]
 
             return 0, gen_out, memory_info, past_key_values
 

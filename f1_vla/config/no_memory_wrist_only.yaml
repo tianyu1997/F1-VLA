@@ -1,23 +1,17 @@
 dataset:
-  # Use ME_KVM data format - clean data only
+  # Use ME_KVM data format - loop trajectory data for Memory validation
   use_mekvm_format: True
   mekvm_data_dirs:
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu0
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu1
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu2
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu3
+    - /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory
 
   mekvm_task_descriptions:
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "机械臂在两点间往返运动,根据历史轨迹和当前动作预测下一帧观测。"
     
   mekvm_weights:
-    - 0.25
-    - 0.25
-    - 0.25
-    - 0.25
+    - 1.0
+
+  # Test dataset for evaluation
+  mekvm_test_data_dir: /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory_test
     
   n_obs_img_steps: 4
   n_pred_img_steps: 1
@@ -55,8 +49,8 @@ exp:
     do_train: True
     do_eval: False
     num_train_epochs: 500
-    per_device_train_batch_size: 12
-    per_device_eval_batch_size: 1
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 8
     gradient_accumulation_steps: 1
     gradient_checkpointing: False
 
@@ -70,8 +64,8 @@ exp:
     adam_epsilon: !!float 1e-8
     lr_scheduler_type: cosine
 
-    max_steps: 50000
-    warmup_steps: 200
+    max_steps: 10000
+    warmup_steps: 100
     log_level: info
     log_level_replica: error
 
@@ -82,16 +76,16 @@ exp:
 
     save_total_limit: 5
     overwrite_output_dir: True
-    dataloader_num_workers: 8
+    dataloader_num_workers: 4
     dataloader_pin_memory: False
-    dataloader_persistent_workers: True
-    dataloader_prefetch_factor: 8
+    dataloader_persistent_workers: False
+    dataloader_prefetch_factor: 2
     remove_unused_columns: False
 
     # Episode-based intervals (custom EpisodeProgressCallback)
-    logging_episodes: 100   # Log every 100 episodes
-    save_episodes: 500     # Save checkpoint every 500 episodes
-    eval_episodes: 100      # Eval every 100 episodes (if enabled)
+    logging_episodes: 10   # Log every 100 episodes
+    save_episodes: 30     # Save checkpoint every 200 episodes
+    eval_episodes: 10      # Eval every 100 episodes (if enabled)
     
     # HF Trainer fallback settings (disable step-based saving, only use episode-based)
     logging_strategy: "steps"
@@ -127,7 +121,7 @@ exp:
     vision_encoder_lr: !!float 0
     gen_expert_lr: !!float 5e-5
 
-  max_eval_samples: 1000
+  max_eval_samples: 200
   
   camera_config:
     und_camera_keys:
@@ -136,9 +130,9 @@ exp:
 
 policy:
   model_name: f1
-  path: /mnt/data2/ty/F1-VLA/pi0
+  path: /mnt/data2/ty/F1-VLA/F1_pretrain/pi0
   ckpt_path: f1_vla/config/f1_config.json
-  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/F1_pretrain/paligemma-3b-pt-224
   mwm_pretrained_path: null
   chunk_size: 4
 
@@ -150,7 +144,7 @@ policy:
   temporal_conv_stride: 4
   vocab_size: 4096
   vae_dim: 32
-  num_resolutions: 10
+  num_resolutions: 9  # Only compute first 9 layers (skip 16x16 layer)
 
   resize_imgs_with_padding: "(224, 224)"
   attention_implementation: flash_attention_2

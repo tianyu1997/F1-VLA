@@ -1,23 +1,17 @@
 dataset:
-  # Use ME_KVM data format - clean data only
+  # Use ME_KVM data format - loop trajectory data for Memory validation
   use_mekvm_format: True
   mekvm_data_dirs:
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu0
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu1
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu2
-    - /mnt/data2/ty/F1-VLA/data/clean_teacher_offline/part_gpu3
+    - /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory
 
   mekvm_task_descriptions:
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
-    - "在干净环境中,探索环境,根据动作和状态预测下一帧观测。"
+    - "机械臂在两点间往返运动,根据历史轨迹和当前动作预测下一帧观测。"
     
   mekvm_weights:
-    - 0.25
-    - 0.25
-    - 0.25
-    - 0.25
+    - 1.0
+
+  # Test dataset for evaluation
+  mekvm_test_data_dir: /mnt/data2/ty/F1-VLA/RoboTwin/data/loop_trajectory_test
     
   n_obs_img_steps: 4
   n_pred_img_steps: 1
@@ -41,7 +35,7 @@ dataset:
 exp:
   stage: stage1_pretrain_wm
   # Load from F1_pretrain (same starting point as memory version)
-  load_ckpt:  /mnt/data2/ty/F1-VLA/outputs/no_memory_head_and_wrist/checkpoint-episode-512
+  load_ckpt: /mnt/data2/ty/F1-VLA/outputs/no_memory_head_and_wrist/checkpoint-episode-350
   
   # Memory configuration - DISABLED for control group
   use_memory: False
@@ -95,9 +89,9 @@ exp:
 
     # Episode-based intervals (same as memory mode for consistency)
     # These control our custom EpisodeProgressCallback
-    logging_episodes: 50   # Log every 50 episodes
-    save_episodes: 350     # Save checkpoint every 256 episodes
-    eval_episodes: 500     # Eval every 500 episodes (if enabled)
+    logging_episodes: 10   # Log every 50 episodes
+    save_episodes: 30     # Save checkpoint every 256 episodes
+    eval_episodes: 10     # Eval every 500 episodes (if enabled)
     
     # HF Trainer fallback settings (our callback handles actual logging/saving)
     logging_strategy: "steps"
@@ -143,9 +137,9 @@ exp:
 
 policy:
   model_name: f1
-  path: /mnt/data2/ty/F1-VLA/pi0
+  path: /mnt/data2/ty/F1-VLA/F1_pretrain/pi0
   ckpt_path: f1_vla/config/f1_config.json
-  language_tokenizer_path: /mnt/data2/ty/F1-VLA/paligemma-3b-pt-224
+  language_tokenizer_path: /mnt/data2/ty/F1-VLA/F1_pretrain/paligemma-3b-pt-224
   mwm_pretrained_path: null
   chunk_size: 4
 

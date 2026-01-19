@@ -212,6 +212,39 @@ def main(args: argparse.Namespace, overrides: list):
     logger.info(f"len(training_dataset): {len(training_dataset)}")
 
     #########################################################
+    # Create test dataset for evaluation
+    #########################################################
+    test_dataset = None
+    test_collate_fn = None
+    if use_mekvm_format and config.dataset.get('mekvm_test_data_dir'):
+        test_data_dir = config.dataset.get('mekvm_test_data_dir')
+        if os.path.exists(test_data_dir):
+            logger.info(f"Creating test dataset from: {test_data_dir}")
+            from f1_vla.src.processors.data_processors.sequential_dataset import (
+                create_sequential_mekvm_data, SequentialCollateFn
+            )
+            # Test dataset: single rank, no sharding
+            (
+                test_dataset,
+                _,  # image_transforms not needed for test
+                _,  # sample_weights not needed for test
+                _,  # cur_n_obs_img_steps already set from training
+                _,  # cur_n_pred_img_steps already set from training
+            ) = create_sequential_mekvm_data(
+                policy_config=policy_config,
+                dataset_config=config.dataset,
+                training_args=training_args,
+                stage=config.exp.stage,
+                rank=0,
+                world_size=1,
+                data_dirs_override=[test_data_dir],  # Override to use test dir
+            )
+            test_collate_fn = SequentialCollateFn(policy_config.max_state_dim, policy_config.max_action_dim)
+            logger.info(f"Test dataset size: {len(test_dataset)}")
+        else:
+            logger.warning(f"Test data directory not found: {test_data_dir}")
+
+    #########################################################
     # Resume from checkpoint
     #########################################################   
     last_checkpoint = None
@@ -237,7 +270,19 @@ def main(args: argparse.Namespace, overrides: list):
 
     # Verify if we are resuming from a checkpoint
     is_resuming = training_args.resume_from_checkpoint is not None or last_checkpoint is not None
+    checkpoint_dir = training_args.resume_from_checkpoint or last_checkpoint
 
+    # Optimize tokenizer loading: use checkpoint directory if resuming
+    if is_resuming and checkpoint_dir:
+        # Check if tokenizer exists in checkpoint directory
+        tokenizer_files = ['tokenizer_config.json', 'tokenizer.json', 'tokenizer.model']
+        has_tokenizer = any(os.path.exists(os.path.join(checkpoint_dir, f)) for f in tokenizer_files)
+        if has_tokenizer:
+            logger.info(f"Loading tokenizer from checkpoint: {checkpoint_dir}")
+            kwargs["tokenizer_path_override"] = checkpoint_dir
+        else:
+            logger.info(f"Tokenizer not found in checkpoint, using config path: {policy_config.language_tokenizer_path}")
+    
     # Simplified loading: directly create model and load from load_ckpt (F1_pretrain)
     # F1_pretrain contains: PaliGemma + VAE + Gen Expert weights
     # No need to load from pi0 separately
@@ -285,7 +330,8 @@ def main(args: argparse.Namespace, overrides: list):
         logging_interval=logging_interval,  # Episodes interval for logging
         save_interval=save_interval,  # Episodes interval for saving
         eval_interval=eval_interval,  # Episodes interval for evaluation
-        eval_dataset=training_dataset,  # Use same dataset for eval (can be changed)
+        eval_dataset=test_dataset if test_dataset is not None else training_dataset,  # Use test dataset if available
+        eval_collate_fn=test_collate_fn if test_collate_fn is not None else collate_fn,
     )
 
     #########################################################   
